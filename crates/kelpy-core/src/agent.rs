@@ -106,8 +106,8 @@ impl Agent {
             tasks.clone(),
             events.clone(),
             home.memory_dir().join("MEMORY.md"),
-            // Kelpy's own data holds credentials and every conversation: never read for the model.
-            Executor::local(vec![home.data_dir()]),
+            // Kelpy's own data holds credentials and every conversation: never read or changed for the model.
+            Executor::local(vec![home.data_dir()], home.data_dir().join("backups")),
         );
         Ok(Self {
             store,
@@ -1005,10 +1005,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_auto_a_file_change_runs_backed_up_and_its_result_goes_to_the_model() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let path = folder.path().join("app.ini");
+        fs::write(&path, "debug = true\n").unwrap();
+        let server = model("Debugging is off.").await;
+        let edit = json!({ "reason": "To turn debugging off", "path": path, "old": "true", "new": "false" });
+        server.respond_once(CHAT, "200 OK", calling("edit_file", &edit));
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let modes = Modes {
+            access: Access::Full,
+            approval: Approval::Auto,
+            ..Modes::default()
+        };
+        let session = agent.create_session(None, modes).await.unwrap();
+
+        let events = collect(
+            agent
+                .send(session.id, "Turn debugging off", ())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let actions: Vec<&Action> = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::Action { action } => Some(action),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.state != ActionState::Waiting)
+        );
+        let done = actions.last().unwrap();
+        assert_eq!(done.state, ActionState::Done, "{:?}", done.error);
+        let change = done.change.as_ref().unwrap();
+        assert!(
+            change.diff.contains("-debug = true\n+debug = false"),
+            "{}",
+            change.diff
+        );
+        assert_eq!(change.floor, None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "debug = false\n");
+        let backups = dir.path().join("data").join("backups");
+        assert_eq!(fs::read_dir(backups).unwrap().count(), 1);
+        let requests = chat_requests(&server);
+        assert!(requests[0].contains("\"edit_file\""));
+        assert!(requests[1].contains("Backed up to"));
+    }
+
+    #[tokio::test]
+    async fn read_only_offers_no_change_and_refuses_one_asked_for() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let path = folder.path().join("new.txt");
+        let server = model("I cannot.").await;
+        let write = json!({ "reason": "To create it", "path": path, "content": "hello" });
+        server.respond_once(CHAT, "200 OK", calling("write_file", &write));
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let modes = Modes {
+            approval: Approval::Auto,
+            ..Modes::default()
+        };
+        let session = agent.create_session(None, modes).await.unwrap();
+
+        let mut answer = agent.send(session.id, "Create it", ()).await.unwrap();
+        let denied = until(&mut answer, ActionState::Denied).await;
+        assert!(
+            denied
+                .error
+                .unwrap()
+                .contains("changing the system needs Full")
+        );
+        collect(answer).await;
+        assert!(!path.exists());
+        let request = &chat_requests(&server)[0];
+        assert!(request.contains("\"read_file\"") && !request.contains("\"write_file\""));
+    }
+
+    #[tokio::test]
+    async fn a_change_where_a_mistake_could_lock_the_administrator_out_asks_even_in_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = if cfg!(windows) {
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("kelpy-test.txt")
+        } else {
+            std::path::PathBuf::from("/etc/fstab")
+        };
+        let server = model("Left as it is.").await;
+        let write = json!({ "reason": "A test", "path": path, "content": "kelpy test\n" });
+        server.respond_once(CHAT, "200 OK", calling("write_file", &write));
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let modes = Modes {
+            access: Access::Full,
+            approval: Approval::Auto,
+            ..Modes::default()
+        };
+        let session = agent.create_session(None, modes).await.unwrap();
+
+        let mut answer = agent.send(session.id, "Change it", ()).await.unwrap();
+        let waiting = until(&mut answer, ActionState::Waiting).await;
+        assert!(
+            waiting
+                .change
+                .unwrap()
+                .floor
+                .unwrap()
+                .contains("always asks")
+        );
+        agent
+            .decide(session.id, waiting.id, false, None)
+            .await
+            .unwrap();
+        until(&mut answer, ActionState::Denied).await;
+        collect(answer).await;
+        if cfg!(windows) {
+            assert!(!path.exists());
+        }
+    }
+
+    #[tokio::test]
     async fn a_command_the_model_wrote_waits_for_approval_even_in_auto() {
         let dir = tempfile::tempdir().unwrap();
         let server = model("It printed hello.").await;
-        let command = json!({ "reason": "To check the shell", "command": "echo hello" });
+        let command = json!({ "reason": "To check the shell", "command": "echo hello", "directory": dir.path() });
         server.respond_once(CHAT, "200 OK", calling("run_command", &command));
         let agent = agent(&dir, format!("{}/v1", server.url));
         let modes = Modes {
@@ -1021,8 +1141,11 @@ mod tests {
         let mut answer = agent.send(session.id, "Say hello", ()).await.unwrap();
         let waiting = until(&mut answer, ActionState::Waiting).await;
         assert_eq!(
-            (waiting.summary.as_str(), waiting.command.as_deref()),
-            ("Run a command", Some("echo hello"))
+            (waiting.summary, waiting.command.as_deref()),
+            (
+                format!("Run a command in {}", dir.path().display()),
+                Some("echo hello")
+            )
         );
         agent
             .decide(session.id, waiting.id, true, None)
@@ -1045,7 +1168,8 @@ mod tests {
         } else {
             "echo Copying; sleep 120"
         };
-        let command = json!({ "reason": "A long backup", "command": long });
+        let command =
+            json!({ "reason": "A long backup", "command": long, "directory": dir.path() });
         server.respond_once(CHAT, "200 OK", calling("run_command", &command));
         let agent = agent(&dir, format!("{}/v1", server.url));
         let session = agent.create_session(None, Modes::default()).await.unwrap();

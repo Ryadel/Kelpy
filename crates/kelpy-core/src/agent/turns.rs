@@ -12,7 +12,6 @@ mod actions;
 mod fitting;
 mod interface;
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
@@ -72,11 +71,12 @@ not ask for it again unless they say so: go on with what you know. If something 
 
 /// What the model is told about acting on the system with System access Full.
 pub(super) const CHANGING: &str = "You can look at this system and change it with the tools provided. Prefer the \
-built-in tools to look, as they only read. `run_command` runs the commands you write, to look further or to change \
-the system; the administrator approves each one after reading it and its `reason`. Never use a command to read files \
-that may hold secrets. Look before you answer or change anything rather than guessing. Before a change, say what will \
-change, what could go wrong and how to undo it, and back up a file before you edit it. Keep each command to one \
-change, so that each is approved on its own, and check afterwards that it worked. Say plainly before asking for \
+built-in tools to look, as they only read. Change files with `edit_file` and `write_file`: Kelpy shows the change \
+as a diff, backs the file up and checks it, so do not back files up yourself. `run_command` runs the commands you \
+write, to look further or for changes no other tool makes; the administrator approves each one after reading it and \
+its `reason`. Never use a command to read files that may hold secrets. Look before you answer or change anything \
+rather than guessing. Before a change, say what will change, what could go wrong and how to undo it. Keep each \
+command to one change, so that each is approved on its own, and check afterwards that it worked. Say plainly before asking for \
 anything risky or irreversible: deleting data, firewall, SSH or network changes that could lock the administrator \
 out, reboots and outages. Prefer the distribution's own packages and tools. If the administrator denies an action, \
 do not ask for it again unless they say so: go on with what you know. If something is unclear, ask.";
@@ -450,7 +450,7 @@ impl Turns {
                 .write_answer(
                     settings,
                     turn.session,
-                    &turn.history,
+                    turn.history,
                     turn.summary,
                     &answer,
                     stop,
@@ -498,12 +498,13 @@ impl Turns {
 
     /// Writes the answer to the conversation `history`, whose older part `summary` may already summarise, in steps
     /// (see the module's description). Each step follows the conversation's `session` modes as they are then: the
-    /// administrator may change them meanwhile.
+    /// administrator may change them meanwhile. The answer as it is so far joins `history` for each step, in place of
+    /// the previous step's copy: the rest is never copied again.
     async fn write_answer(
         &self,
         settings: Settings,
         mut session: Session,
-        history: &[Message],
+        mut history: Vec<Message>,
         mut summary: Option<Summary>,
         answer: &watch::Sender<AnswerState>,
         stop: CancellationToken,
@@ -520,25 +521,33 @@ impl Turns {
             known = async { tokio::join!(self.window(&settings), self.supports_tools(&settings)) } => known,
             () = stop.cancelled() => (0, false),
         };
-        let mut budget = Budget::new(window, context::correction(history, &settings.model));
+        let mut budget = Budget::new(window, context::correction(&history, &settings.model));
+        let asked = history.len();
         let memory = self.memory().await;
-        let tools: Vec<ToolSpec> = self
-            .tools
-            .list()
-            .into_iter()
-            .map(|tool| ToolSpec {
-                name: tool.name.to_owned(),
-                description: tool.description,
-                parameters: tool.parameters,
-            })
-            .collect();
-        let tools_size = tools
-            .iter()
-            .map(|tool| {
-                context::estimate(&tool.description)
-                    + context::estimate(&tool.parameters.to_string())
-            })
-            .sum::<u64>();
+        // Every tool with System access Full; without the ones that change the system otherwise.
+        let (changing, reading): (Vec<_>, Vec<_>) =
+            self.tools.list().into_iter().partition(|tool| tool.changes);
+        let specs = |tools: Vec<kelpy_tools::Tool>| -> Vec<ToolSpec> {
+            tools
+                .into_iter()
+                .map(|tool| ToolSpec {
+                    name: tool.name.to_owned(),
+                    description: tool.description,
+                    parameters: tool.parameters,
+                })
+                .collect()
+        };
+        let reading = specs(reading);
+        let every = [reading.clone(), specs(changing)].concat();
+        let size = |tools: &[ToolSpec]| {
+            tools
+                .iter()
+                .map(|tool| {
+                    context::estimate(&tool.description)
+                        + context::estimate(&tool.parameters.to_string())
+                })
+                .sum::<u64>()
+        };
         // What the model wrote besides text with the calls of each step, to give back with them.
         let mut replays: HashMap<u32, Vec<Value>> = HashMap::new();
         let mut replays_size = 0;
@@ -563,7 +572,11 @@ impl Turns {
             } else {
                 Looking::Yes
             };
-            let offered: &[ToolSpec] = if looking == Looking::Yes { &tools } else { &[] };
+            let offered: &[ToolSpec] = match (looking, session.access) {
+                (Looking::Yes, Access::Full) => &every,
+                (Looking::Yes, _) => &reading,
+                _ => &[],
+            };
             let modes = Modes {
                 explanations: session.explanations,
                 access: session.access,
@@ -571,18 +584,17 @@ impl Turns {
             };
             let instructions =
                 instructions(modes, looking, self.executor.account(), memory.as_deref());
+            history.truncate(asked);
             let current = answer.borrow().message.clone();
-            let conversation = if current.content.is_empty() && current.actions.is_empty() {
-                Cow::Borrowed(history)
-            } else {
-                Cow::Owned([history, &[current]].concat())
-            };
+            if !current.content.is_empty() || !current.actions.is_empty() {
+                history.push(current);
+            }
             // The tools offered, and what goes back with the calls of this answer, beside its messages.
-            let reserved = if offered.is_empty() { 0 } else { tools_size } + replays_size;
+            let reserved = size(offered) + replays_size;
             let fitted = tokio::select! {
                 biased;
                 () = stop.cancelled() => break (End::Stopped, 0),
-                fitted = self.fit(&settings, &instructions, reserved, &mut summary, &conversation, budget) => fitted,
+                fitted = self.fit(&settings, &instructions, reserved, &mut summary, &history, budget) => fitted,
             };
             let messages = chat_messages(fitted.messages, id, &replays);
             let request = ChatRequest {

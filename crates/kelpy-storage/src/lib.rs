@@ -105,11 +105,16 @@ const MIGRATIONS: &[&str] = &[
 ",
     // 6: when an action started running, for the time shown while it runs.
     "ALTER TABLE actions ADD COLUMN started_at INTEGER;",
+    // 7: the change an action makes, as its card shows it (JSON).
+    "ALTER TABLE actions ADD COLUMN change TEXT;",
+    // 8: a number each change of a conversation raises, so that an older copy is never taken for a newer one.
+    "ALTER TABLE sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;",
 ];
 
-const SESSION_COLUMNS: &str = "id, title, explanations, created_at, updated_at, access, approval";
+const SESSION_COLUMNS: &str =
+    "id, title, explanations, created_at, updated_at, access, approval, revision";
 const ACTION_COLUMNS: &str = "id, message_id, step, position, call_id, tool, input, reason, summary, command, state, \
-     exit_code, output, error, created_at, duration_ms, started_at";
+     exit_code, output, error, created_at, duration_ms, started_at, change";
 const MESSAGE_COLUMNS: &str =
     "id, session_id, role, content, status, model, created_at, context_estimate, input_tokens";
 
@@ -149,6 +154,9 @@ pub struct Session {
     pub created_at: i64,
     /// Unix time of the last message, in seconds.
     pub updated_at: i64,
+    /// Raised by every change of the conversation, in the database's own order: of two copies, the one with the
+    /// higher revision is the newer, however late it arrives.
+    pub revision: i64,
 }
 
 /// How a conversation's answers are written and what they may do: chosen before the first message, changed at any
@@ -233,6 +241,19 @@ pub struct Action {
     pub duration_ms: Option<u64>,
     /// When it started running, Unix time in seconds.
     pub started_at: Option<i64>,
+    /// The change it makes to the system, for an action that changes something.
+    pub change: Option<Change>,
+}
+
+/// A change to the system an action makes, as its card shows it before it runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Change {
+    /// What changes, such as a file's unified diff.
+    pub diff: String,
+    /// What Kelpy checks and how the change is undone, one line each.
+    pub notes: Vec<String>,
+    /// Why it waits for approval in every Approval mode, if it does.
+    pub floor: Option<String>,
 }
 
 /// An action about to be recorded.
@@ -247,6 +268,7 @@ pub struct NewAction<'a> {
     pub reason: &'a str,
     pub summary: &'a str,
     pub command: Option<&'a str>,
+    pub change: Option<&'a Change>,
     pub state: ActionState,
     pub error: Option<&'a str>,
 }
@@ -356,6 +378,7 @@ impl Store {
             approval: modes.approval,
             created_at: now,
             updated_at: now,
+            revision: 0,
         })
     }
 
@@ -376,7 +399,7 @@ impl Store {
 
     pub fn rename_session(&self, id: i64, title: &str) -> Result<()> {
         let changed = self.connection.execute(
-            "UPDATE sessions SET title = ?2 WHERE id = ?1",
+            "UPDATE sessions SET title = ?2, revision = revision + 1 WHERE id = ?1",
             params![id, title],
         )?;
         if changed == 0 {
@@ -387,7 +410,7 @@ impl Store {
 
     pub fn set_explanations(&self, id: i64, explanations: bool) -> Result<()> {
         let changed = self.connection.execute(
-            "UPDATE sessions SET explanations = ?2 WHERE id = ?1",
+            "UPDATE sessions SET explanations = ?2, revision = revision + 1 WHERE id = ?1",
             params![id, explanations],
         )?;
         if changed == 0 {
@@ -406,7 +429,7 @@ impl Store {
 
     fn set_session_field(&self, id: i64, column: &'static str, value: &str) -> Result<()> {
         let changed = self.connection.execute(
-            &format!("UPDATE sessions SET {column} = ?2 WHERE id = ?1"),
+            &format!("UPDATE sessions SET {column} = ?2, revision = revision + 1 WHERE id = ?1"),
             params![id, value],
         )?;
         if changed == 0 {
@@ -419,10 +442,13 @@ impl Store {
     pub fn insert_action(&self, action: &NewAction<'_>) -> Result<Action> {
         let now = unix_now();
         let started_at = (action.state == ActionState::Running).then_some(now);
+        let change = action
+            .change
+            .map(|change| serde_json::to_string(change).expect("a change serializes"));
         let inserted = self.connection.execute(
             "INSERT INTO actions (message_id, step, position, call_id, tool, input, reason, summary, command, state,
-                                  error, created_at, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                  error, created_at, started_at, change)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 action.message_id,
                 action.step,
@@ -436,7 +462,8 @@ impl Store {
                 action.state.as_str(),
                 action.error,
                 now,
-                started_at
+                started_at,
+                change
             ],
         );
         match inserted {
@@ -466,6 +493,7 @@ impl Store {
             created_at: now,
             duration_ms: None,
             started_at,
+            change: action.change.cloned(),
         })
     }
 
@@ -552,14 +580,14 @@ impl Store {
         let now = unix_now();
         let transaction = self.connection.transaction()?;
         let changed = transaction.execute(
-            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+            "UPDATE sessions SET updated_at = ?2, revision = revision + 1 WHERE id = ?1",
             params![session_id, now],
         )?;
         if changed == 0 {
             return Err(StoreError::SessionNotFound(session_id));
         }
         transaction.execute(
-            "UPDATE sessions SET title = ?2
+            "UPDATE sessions SET title = ?2, revision = revision + 1
              WHERE id = ?1 AND title = ?3 AND NOT EXISTS (SELECT 1 FROM messages WHERE session_id = ?1)",
             params![session_id, title, UNTITLED],
         )?;
@@ -877,6 +905,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
         approval: Approval::parse(&approval).ok_or_else(|| invalid(6, &approval))?,
         created_at: row.get(3)?,
         updated_at: row.get(4)?,
+        revision: row.get(7)?,
     })
 }
 
@@ -902,6 +931,10 @@ fn action_from_row(row: &Row<'_>) -> rusqlite::Result<Action> {
             .get::<_, Option<i64>>(15)?
             .map(|duration| duration.unsigned_abs()),
         started_at: row.get(16)?,
+        change: row
+            .get::<_, Option<String>>(17)?
+            .map(|text| serde_json::from_str(&text).map_err(|_| invalid(17, &text)))
+            .transpose()?,
     })
 }
 
@@ -1046,6 +1079,14 @@ mod tests {
     fn modes_and_actions_survive_a_restart_and_unfinished_actions_fail() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kelpy.db");
+        let change = Change {
+            diff: "-a
++b
+"
+            .into(),
+            notes: vec!["Backed up first.".into()],
+            floor: None,
+        };
         let new = |message_id, call_id, state| NewAction {
             message_id,
             step: 0,
@@ -1056,6 +1097,7 @@ mod tests {
             reason: "To see the free space",
             summary: "Show the disk usage",
             command: Some("df -h"),
+            change: Some(&change),
             state,
             error: None,
         };
@@ -1094,6 +1136,8 @@ mod tests {
             (session.access, session.approval),
             (Access::None, Approval::Auto)
         );
+        // Raised by each change: access, approval, then the turn.
+        assert_eq!(session.revision, 3);
         let messages = store.messages(session_id).unwrap();
         assert!(messages[0].actions.is_empty());
         let actions = &messages[1].actions;

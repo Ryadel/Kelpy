@@ -32,7 +32,8 @@ const ACCESS: [Choice<Access>; 3] = [
     Choice {
         value: Access::Full,
         name: "Full",
-        means: "you may also change the system, with commands you write",
+        means: "you may also change the system: files with edit_file and write_file, anything else with commands you \
+                write",
         available: true,
     },
 ];
@@ -47,13 +48,14 @@ const APPROVAL: [Choice<Approval>; 3] = [
     Choice {
         value: Approval::Plan,
         name: "Plan",
-        means: "looking needs no approval",
+        means: "looking needs no approval; each change still waits for it",
         available: true,
     },
     Choice {
         value: Approval::Auto,
         name: "Auto",
-        means: "looking needs no approval",
+        means: "looking, and file changes Kelpy backs up, need no approval; changes to the SSH, sudo, login, \
+                firewall, network or boot configuration still wait for it",
         available: true,
     },
 ];

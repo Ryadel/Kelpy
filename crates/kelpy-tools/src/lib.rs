@@ -5,9 +5,11 @@
 //! reason the model gave. The inspections only read, by construction: Kelpy fixes their commands, and the model only
 //! fills in arguments, which are checked and passed as arguments, never through a shell. `run_command` runs a command
 //! the model wrote, in the system's shell: Kelpy cannot tell what it does, so it is always approved before it runs
-//! ([`Prepared::always_asks`]). [`Executor`] runs the actions: on this computer now, over SSH later.
+//! ([`Prepared::always_asks`]). `edit_file` and `write_file` change files ([`change`]): Kelpy plans the change before
+//! it is shown, backs the file up and checks it. [`Executor`] runs the actions: on this computer now, over SSH later.
 
 mod account;
+pub mod change;
 mod executor;
 mod files;
 mod inspect;
@@ -22,6 +24,7 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 
 pub use account::Account;
+pub use change::{Edit, FileChange, Planned};
 pub use executor::{Executor, Ran};
 pub use output::Output;
 pub use script::MAX_SCRIPT;
@@ -38,6 +41,22 @@ pub enum ToolError {
     NotInstalled(Vec<String>),
     #[error("{} may hold secrets: Kelpy never sends it to the AI service", .0.display())]
     Protected(PathBuf),
+    #[error("{} may hold secrets: Kelpy does not change such files with this tool", .0.display())]
+    Secret(PathBuf),
+    #[error("{} is Kelpy's own data: Kelpy does not change it", .0.display())]
+    OwnData(PathBuf),
+    #[error("{} is over {} MiB: too large to change and back up", .0.display(), change::MAX_FILE >> 20)]
+    TooLarge(PathBuf),
+    #[error("{} changed after the change was shown: nothing was written, plan it again", .0.display())]
+    ChangedMeanwhile(PathBuf),
+    #[error("{} cannot be written: {source}", path.display())]
+    Write { path: PathBuf, source: io::Error },
+    /// The change broke the file's check, and the previous version was put back.
+    #[error(
+        "`{check}` failed after the change, so the previous version was put back:
+{output}"
+    )]
+    CheckFailed { check: String, output: String },
     /// A folder, a named pipe or a device: reading it could wait without end.
     #[error("{} is not a regular file", .0.display())]
     NotRegularFile(PathBuf),
@@ -91,6 +110,8 @@ impl Os {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tool {
     pub name: &'static str,
+    /// Whether it changes the system: offered only with System access Full.
+    pub changes: bool,
     pub description: String,
     /// The JSON Schema of its arguments.
     pub parameters: Value,
@@ -113,10 +134,16 @@ pub enum Work {
     /// Commands run in order. Each comes with alternatives for systems without it: the executor runs the first
     /// one installed, and [`Executor::resolve`] chooses it before the action is shown.
     Commands(Vec<Vec<Command>>),
-    /// A command the model wrote, run by the first of these shells installed, chosen like a step's command.
-    Script(Vec<Command>),
+    /// A command the model wrote, run in `directory` by the first of these shells installed, chosen like a step's
+    /// command.
+    Script {
+        shells: Vec<Command>,
+        directory: PathBuf,
+    },
     ReadFile(PathBuf),
     ListDirectory(PathBuf),
+    /// A change of a file, planned by [`Executor::plan`] before it is shown.
+    ChangeFile(Box<FileChange>),
 }
 
 /// A call of a tool, checked and ready to show and run.
@@ -133,13 +160,32 @@ impl Prepared {
     /// Whether it waits for the administrator's approval in every Approval mode: a command the model wrote may do
     /// anything.
     pub fn always_asks(&self) -> bool {
-        matches!(self.work, Work::Script(_))
+        matches!(self.work, Work::Script { .. }) || self.floor().is_some()
+    }
+
+    /// Whether it changes the system.
+    pub fn changes(&self) -> bool {
+        matches!(self.work, Work::ChangeFile(_))
+    }
+
+    /// Why it waits for approval in every Approval mode, for a change where a mistake could lock the administrator
+    /// out or keep the system from starting.
+    pub fn floor(&self) -> Option<&str> {
+        self.planned()?.floor.as_deref()
+    }
+
+    /// The change it makes, once planned.
+    pub fn planned(&self) -> Option<&Planned> {
+        match &self.work {
+            Work::ChangeFile(change) => change.planned.as_ref(),
+            _ => None,
+        }
     }
 
     /// The commands it runs, one per line, once resolved; `None` for an action that is not a command.
     pub fn command_line(&self) -> Option<String> {
         match &self.work {
-            Work::Script(shells) => shells.first().map(|shell| shell.display.clone()),
+            Work::Script { shells, .. } => shells.first().map(|shell| shell.display.clone()),
             Work::Commands(steps) => Some(
                 steps
                     .iter()
@@ -148,7 +194,7 @@ impl Prepared {
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
-            Work::ReadFile(_) | Work::ListDirectory(_) => None,
+            Work::ReadFile(_) | Work::ListDirectory(_) | Work::ChangeFile(_) => None,
         }
     }
 }
@@ -263,13 +309,49 @@ impl Tools {
                 &[lines],
             ),
         });
+        let checked = "Kelpy shows the change as a diff, backs the file up first, and checks it where it can (such as                        nginx -t): if the change breaks the check, the previous version is put back at once. Files that                        may hold secrets and files over 20 MiB cannot be changed.";
+        tools.push(Tool {
+            changes: true,
+            ..tool(
+                "edit_file",
+                format!(
+                    "Changes a text file by replacing one exact piece of it, which must occur exactly once: copy it                      from read_file, with enough lines around it to be unique. {checked}"
+                ),
+                &[
+                    ("path", "The file's absolute path."),
+                    ("old", "The exact text to replace, as it is in the file."),
+                    ("new", "The text that replaces it; empty to remove it."),
+                ],
+                &[],
+            )
+        });
+        tools.push(Tool {
+            changes: true,
+            ..tool(
+                "write_file",
+                format!(
+                    "Creates a text file, or replaces all its content; its folder must exist. To change part of an                      existing file, use edit_file. {checked}"
+                ),
+                &[
+                    ("path", "The file's absolute path."),
+                    ("content", "The whole content of the file."),
+                ],
+                &[],
+            )
+        });
         tools.push(tool(
             "run_command",
             script::description(self.os),
-            &[(
-                "command",
-                "The command, as the administrator would type it; several lines if needed.",
-            )],
+            &[
+                (
+                    "command",
+                    "The command, as the administrator would type it; several lines if needed.",
+                ),
+                (
+                    "directory",
+                    "The absolute path of the folder it starts in, which must exist.",
+                ),
+            ],
             &[],
         ));
         tools
@@ -374,6 +456,45 @@ impl Tools {
                     inspect::logs(os, lines, unit.as_deref(), log, source.as_deref()),
                 )
             }
+            "edit_file" | "write_file" => {
+                let path = absolute(&required("path")?)?;
+                // Taken as written: spaces and line ends matter in a file.
+                let raw = |field: &str| -> Result<String, ToolError> {
+                    let value = arguments
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| invalid(format!("`{field}` is required, as a string")))?;
+                    if value.len() > change::MAX_TEXT {
+                        return Err(invalid(format!(
+                            "`{field}` may hold at most {} KiB",
+                            change::MAX_TEXT >> 10
+                        )));
+                    }
+                    Ok(value.to_owned())
+                };
+                let (summary, edit) = if name == "edit_file" {
+                    let old = raw("old")?;
+                    if old.is_empty() {
+                        return Err(invalid("`old` cannot be empty"));
+                    }
+                    let edit = Edit::Replace {
+                        old,
+                        new: raw("new")?,
+                    };
+                    (format!("Change {}", path.display()), edit)
+                } else {
+                    (
+                        format!("Write {}", path.display()),
+                        Edit::Write(raw("content")?),
+                    )
+                };
+                let change = FileChange {
+                    path,
+                    edit,
+                    planned: None,
+                };
+                (summary, Work::ChangeFile(Box::new(change)))
+            }
             "run_command" => {
                 let command = arguments
                     .get("command")
@@ -390,7 +511,11 @@ impl Tools {
                 if command.contains('\0') {
                     return Err(invalid("`command` cannot hold a NUL character"));
                 }
-                ("Run a command".to_owned(), script::script(os, command))
+                let directory = absolute(&required("directory")?)?;
+                (
+                    format!("Run a command in {}", directory.display()),
+                    script::script(os, command, directory),
+                )
             }
             other => return Err(invalid(format!("there is no tool named `{other}`"))),
         };
@@ -431,6 +556,7 @@ fn tool(
         .collect();
     Tool {
         name,
+        changes: false,
         description,
         parameters: json!({
             "type": "object",
@@ -484,7 +610,7 @@ mod tests {
     fn every_tool_asks_for_a_reason_and_describes_its_arguments() {
         for os in [Os::Linux, Os::Windows, Os::MacOs] {
             let tools = Tools::new(os).list();
-            assert_eq!(tools.len(), 11);
+            assert_eq!(tools.len(), 13);
             for tool in tools {
                 assert_eq!(tool.parameters["required"][0], "reason", "{}", tool.name);
                 assert_eq!(tool.parameters["additionalProperties"], false);
@@ -497,7 +623,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "looks at the computer running the tests"]
     async fn every_inspection_runs_here() {
-        let executor = Executor::local(Vec::new());
+        let executor = Executor::local(Vec::new(), PathBuf::from("backups"));
         let tools = Tools::new(executor.os());
         let (service, log) = match executor.os() {
             Os::Windows => ("EventLog", r#""log":"System","#),
@@ -570,18 +696,24 @@ mod tests {
         assert!(!prepared.always_asks());
 
         // A command the model wrote: as written, by a shell, always asked.
-        let prepared = linux
-            .prepare(
-                "run_command",
-                r#"{"reason":"Free space","command":" du -sh /var/* | sort -h \n"}"#,
-            )
-            .unwrap();
-        assert_eq!(prepared.summary, "Run a command");
+        // An absolute path where the tests run.
+        let folder = std::env::temp_dir();
+        let call = serde_json::json!({
+            "reason": "Free space",
+            "command": " du -sh /var/* | sort -h \n",
+            "directory": folder,
+        });
+        let prepared = linux.prepare("run_command", &call.to_string()).unwrap();
+        assert_eq!(
+            prepared.summary,
+            format!("Run a command in {}", folder.display())
+        );
         assert!(prepared.always_asks());
         assert_eq!(prepared.command_line().unwrap(), "du -sh /var/* | sort -h");
-        let Work::Script(shells) = &prepared.work else {
+        let Work::Script { shells, directory } = &prepared.work else {
             panic!("{prepared:?}");
         };
+        assert_eq!(directory, &folder);
         assert_eq!(
             (shells[0].program.as_str(), shells[1].program.as_str()),
             ("bash", "sh")

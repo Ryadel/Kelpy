@@ -2,6 +2,7 @@
   import BanIcon from '@lucide/svelte/icons/ban';
   import CheckIcon from '@lucide/svelte/icons/check';
   import CircleAlertIcon from '@lucide/svelte/icons/circle-alert';
+  import ShieldAlertIcon from '@lucide/svelte/icons/shield-alert';
   import ClockIcon from '@lucide/svelte/icons/clock';
   import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
   import XIcon from '@lucide/svelte/icons/x';
@@ -29,11 +30,17 @@
   const waiting = $derived(action.state === 'waiting');
   /** A command the model wrote: it always asks, whatever the Approval mode. */
   const written = $derived(action.tool === 'run_command');
+  /** The diff's lines, without its two header lines: the path is in the heading. */
+  const diffLines = $derived(
+    (action.change?.diff ?? '')
+      .split('\n')
+      .filter((line) => line !== '' && !line.startsWith('--- ') && !line.startsWith('+++ ')),
+  );
   /** A command that ran and reported a failure. */
   const exitedBadly = $derived(action.state === 'done' && action.exit_code !== null && action.exit_code !== 0);
   const heading = $derived(
     waiting
-      ? action.command
+      ? action.command && !written
         ? 'Kelpy wants to run'
         : `Kelpy wants to ${action.summary.charAt(0).toLowerCase()}${action.summary.slice(1)}`
       : action.summary,
@@ -62,6 +69,13 @@
     if (live) {
       following = live.scrollHeight - live.scrollTop - live.clientHeight < 16;
     }
+  }
+
+  function diffLine(line: string): string {
+    if (line.startsWith('+')) return 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400';
+    if (line.startsWith('-')) return 'bg-red-500/10 text-red-700 dark:text-red-400';
+    if (line.startsWith('@@')) return 'text-muted-foreground';
+    return '';
   }
 
   async function decide(decision: 'approve' | 'deny', switchTo?: Approval) {
@@ -108,8 +122,25 @@
   {#if action.command}
     <pre class="bg-muted mt-2 overflow-x-auto rounded-lg px-3 py-2 font-mono text-xs whitespace-pre-wrap">{action.command}</pre>
   {/if}
+  {#if action.change}
+    <pre class="bg-muted mt-2 max-h-80 overflow-auto rounded-lg py-2 font-mono text-xs">{#each diffLines as line, index (index)}<span
+          class={cn('block px-3 whitespace-pre-wrap [overflow-wrap:anywhere]', diffLine(line))}>{line}</span
+        >{/each}</pre>
+  {/if}
   {#if action.reason}
     <p class="text-muted-foreground mt-2">{action.reason}</p>
+  {/if}
+  {#if action.change && waiting}
+    <ul class="text-muted-foreground mt-2 space-y-0.5 text-xs">
+      {#each action.change.notes as note (note)}
+        <li>{note}</li>
+      {/each}
+    </ul>
+  {/if}
+  {#if action.change?.floor}
+    <p class="mt-2 flex gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+      <ShieldAlertIcon class="mt-px size-3.5 shrink-0" />{action.change.floor}
+    </p>
   {/if}
   {#if action.error}
     <p class={cn('mt-2', action.state === 'failed' ? 'text-destructive' : 'text-muted-foreground')}>{action.error}</p>
@@ -123,7 +154,7 @@
     <div class="mt-3 flex flex-wrap items-center gap-2">
       <Button size="sm" disabled={!canDecide || deciding} onclick={() => decide('approve')}>Approve</Button>
       <Button size="sm" variant="outline" disabled={!canDecide || deciding} onclick={() => decide('deny')}>Deny</Button>
-      {#if !written}
+      {#if !written && !action.change?.floor}
         <span class="text-muted-foreground ml-auto flex items-center gap-1 text-xs">
           <Button
             variant="link"
@@ -139,7 +170,7 @@
             size="sm"
             class="h-auto p-0 text-xs"
             disabled={!canDecide || deciding}
-            title="Approves this and runs what only looks without asking, in this conversation."
+            title="Approves this and, in this conversation, runs without asking what only looks and the file changes Kelpy backs up."
             onclick={() => decide('approve', 'auto')}>Switch to Auto</Button
           >
         </span>

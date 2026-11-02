@@ -32,6 +32,8 @@ export interface Session extends Modes {
   title: string;
   created_at: number;
   updated_at: number;
+  /** Raised by every change of the conversation: of two copies, the higher is the newer. */
+  revision: number;
 }
 
 export type ActionState = 'waiting' | 'running' | 'done' | 'failed' | 'denied';
@@ -59,6 +61,18 @@ export interface Action {
   duration_ms: number | null;
   /** When it started running, Unix time in seconds. */
   started_at: number | null;
+  /** The change it makes to the system; null for an action that does not change it. */
+  change: Change | null;
+}
+
+/** A change to the system, as its card shows it before it runs. */
+export interface Change {
+  /** What changes, such as a file's unified diff. */
+  diff: string;
+  /** What Kelpy checks and how the change is undone, one line each. */
+  notes: string[];
+  /** Why it waits for approval in every Approval mode, if it does. */
+  floor: string | null;
 }
 
 export type MessageStatus = 'complete' | 'streaming' | 'interrupted' | 'failed' | 'refused';

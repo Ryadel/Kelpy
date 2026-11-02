@@ -1,6 +1,8 @@
 //! Commands the model writes, run as written in the system's shell. Kelpy cannot tell what such a command does, so
 //! it is shown verbatim and approved before it runs, in every Approval mode.
 
+use std::path::PathBuf;
+
 use crate::executor::MAX_OUTPUT;
 use crate::inspect::powershell;
 use crate::{Command, Os, Work};
@@ -8,9 +10,9 @@ use crate::{Command, Os, Work};
 /// The most a command may hold. Encoded for PowerShell it stays within Windows' limit for a command line.
 pub const MAX_SCRIPT: usize = 8 << 10;
 
-/// `text` run by the shell of `os`: Windows PowerShell; else bash, or sh where bash is missing.
-pub fn script(os: Os, text: &str) -> Work {
-    Work::Script(match os {
+/// `text` run in `directory` by the shell of `os`: Windows PowerShell; else bash, or sh where bash is missing.
+pub fn script(os: Os, text: &str, directory: PathBuf) -> Work {
+    let shells = match os {
         Os::Windows => vec![powershell(text)],
         Os::Linux | Os::MacOs => ["bash", "sh"]
             .into_iter()
@@ -21,7 +23,8 @@ pub fn script(os: Os, text: &str) -> Work {
                 display: text.to_owned(),
             })
             .collect(),
-    })
+    };
+    Work::Script { shells, directory }
 }
 
 /// What the model is told of `run_command` on `os`.
@@ -38,7 +41,8 @@ pub fn description(os: Os) -> String {
     };
     format!(
         "Runs a command you write in {shell}, as the account that started Kelpy, for what no other tool does. The \
-         administrator sees it verbatim and always approves it before it runs. Nothing can be typed into it, so use \
+         administrator sees it verbatim, with its folder, and always approves it before it runs. Each command starts \
+         in a new shell in `directory`: a `cd` does not carry over to the next one. Nothing can be typed into it, so use \
          options that do not ask ({unattended}). Programs it starts end with it: start lasting ones as services. It \
          has no time limit, and the administrator can stop it; its output is kept up to {} KiB.",
         MAX_OUTPUT >> 10,

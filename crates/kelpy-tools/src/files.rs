@@ -146,7 +146,7 @@ fn utc(seconds: u64) -> String {
 
 /// Whether the file at the real `path` may hold secrets: private keys and certificates with their keys, password
 /// stores, environment files, the system's password hashes and registry hives, SSH and GnuPG folders.
-fn is_secret(path: &Path) -> bool {
+pub(crate) fn is_secret(path: &Path) -> bool {
     const NAMES: &[&str] = &[
         "shadow",
         "shadow-",

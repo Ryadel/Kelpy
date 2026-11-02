@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use crate::output::Output;
+use crate::output::{Output, Stream};
 use crate::tree::Tree;
-use crate::{Account, Command, Os, Prepared, ToolError, Work, files};
+use crate::{Account, Command, Os, Prepared, ToolError, Work, change, files};
 
 /// How long one command of an inspection, or reading a file or a folder, may take. A command the model wrote has no
 /// limit: a backup or an installation takes as long as it takes, and the administrator can stop it.
-const RUN_TIME: Duration = Duration::from_secs(30);
+pub(crate) const RUN_TIME: Duration = Duration::from_secs(30);
 /// The most of an action's output kept: the rest is read and dropped, so the program can finish.
 pub const MAX_OUTPUT: usize = 256 << 10;
 
@@ -29,15 +29,18 @@ pub struct Ran {
 pub enum Executor {
     /// This computer, as the account that started Kelpy.
     Local {
-        /// Folders whose files are never read, such as Kelpy's own data.
+        /// Folders whose files are never read or changed, such as Kelpy's own data.
         protected: Vec<PathBuf>,
+        /// Where the versions of files before a change are kept.
+        backups: PathBuf,
         account: Account,
     },
 }
 
 impl Executor {
-    /// This computer. Files in `protected` folders are never read.
-    pub fn local(protected: Vec<PathBuf>) -> Self {
+    /// This computer. Files in `protected` folders are never read or changed; files keep their version before a
+    /// change in `backups`.
+    pub fn local(protected: Vec<PathBuf>, backups: PathBuf) -> Self {
         // Compared with the real paths of the files asked for.
         let protected = protected
             .into_iter()
@@ -45,6 +48,7 @@ impl Executor {
             .collect();
         Self::Local {
             protected,
+            backups,
             account: Account::current(),
         }
     }
@@ -69,9 +73,30 @@ impl Executor {
             Work::Commands(steps) => steps
                 .iter_mut()
                 .try_for_each(|alternatives| self.choose(alternatives)),
-            Work::Script(shells) => self.choose(shells),
-            Work::ReadFile(_) | Work::ListDirectory(_) => Ok(()),
+            Work::Script { shells, directory } => {
+                if !directory.is_dir() {
+                    return Err(crate::invalid(format!(
+                        "the folder {} does not exist",
+                        directory.display()
+                    )));
+                }
+                self.choose(shells)
+            }
+            Work::ReadFile(_) | Work::ListDirectory(_) | Work::ChangeFile(_) => Ok(()),
         }
+    }
+
+    /// Plans a change before it is shown: reads the file, works out the content after it and how it is checked.
+    /// Nothing runs and nothing is written. The error says, for the model, why it cannot be made.
+    pub async fn plan(&self, prepared: &mut Prepared) -> Result<(), ToolError> {
+        let Self::Local { protected, .. } = self;
+        if let Work::ChangeFile(file) = &mut prepared.work {
+            let planned = change::plan(file, self.os(), protected, |program| {
+                self.installed(program)
+            });
+            file.planned = Some(within(planned).await?);
+        }
+        Ok(())
     }
 
     /// Keeps only the first of `alternatives` installed.
@@ -92,7 +117,9 @@ impl Executor {
     /// it runs, and keeps it if the run is stopped or fails. The error says why it could not run or end; a command
     /// that ran and failed is not an error, its exit code tells.
     pub async fn run(&self, prepared: &Prepared, output: &Output) -> Result<Ran, ToolError> {
-        let Self::Local { protected, .. } = self;
+        let Self::Local {
+            protected, backups, ..
+        } = self;
         let exit_code = match &prepared.work {
             Work::Commands(steps) => {
                 let commands: Vec<&Command> =
@@ -102,18 +129,18 @@ impl Executor {
                     if commands.len() > 1 {
                         output.line(&format!("$ {}", command.display));
                     }
-                    let code = run_local(command, Some(RUN_TIME), true, output).await?;
+                    let code = run_local(command, None, Some(RUN_TIME), true, output).await?;
                     if exit_code == 0 {
                         exit_code = code;
                     }
                 }
                 Some(exit_code)
             }
-            Work::Script(shells) => {
+            Work::Script { shells, directory } => {
                 let shell = shells
                     .first()
                     .ok_or_else(|| crate::invalid("there is no shell to run it"))?;
-                Some(run_local(shell, None, false, output).await?)
+                Some(run_local(shell, Some(directory), None, false, output).await?)
             }
             Work::ReadFile(path) => {
                 output.text(&within(files::read(path, protected)).await?);
@@ -121,6 +148,14 @@ impl Executor {
             }
             Work::ListDirectory(path) => {
                 output.text(&within(files::list(path)).await?);
+                None
+            }
+            Work::ChangeFile(file) => {
+                let planned = file
+                    .planned
+                    .as_ref()
+                    .ok_or_else(|| crate::invalid("the change was not planned"))?;
+                change::apply(planned, backups, output).await?;
                 None
             }
         };
@@ -146,8 +181,9 @@ impl Executor {
 /// Runs one command on this computer, within `limit` if given, in English where the program allows it if `english`, else in
 /// the administrator's own language, its lines going to `output` as they come. Returns its exit code. What the
 /// command starts ends with it.
-async fn run_local(
+pub(crate) async fn run_local(
     command: &Command,
+    directory: Option<&Path>,
     limit: Option<Duration>,
     english: bool,
     output: &Output,
@@ -161,6 +197,9 @@ async fn run_local(
         .stderr(Stdio::piped())
         // Stopping the answer drops the future, which ends the program.
         .kill_on_drop(true);
+    if let Some(directory) = directory {
+        process.current_dir(directory);
+    }
     if english {
         process.env("LC_ALL", "C");
     }
@@ -170,10 +209,19 @@ async fn run_local(
         source,
     })?;
     // Dropped with the run, when stopped or out of time, it ends the processes the command started.
-    let tree = Tree::of(&child);
+    // Failing, the command never ran: it is ended with `child`, dropped.
+    let tree = Tree::of(&child).map_err(|source| ToolError::Start {
+        program: command.program.clone(),
+        source,
+    })?;
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
     let finished = async {
-        let reading = async { tokio::join!(output.pump(stdout), output.pump(stderr)) };
+        let reading = async {
+            tokio::join!(
+                output.pump(stdout, Stream::Out),
+                output.pump(stderr, Stream::Err)
+            )
+        };
         let ending = async {
             let status = child.wait().await;
             // What it left running would keep its output open.
@@ -196,9 +244,7 @@ async fn run_local(
 }
 
 /// What `work` gives, within [`RUN_TIME`].
-async fn within(
-    work: impl Future<Output = Result<String, ToolError>>,
-) -> Result<String, ToolError> {
+async fn within<T>(work: impl Future<Output = Result<T, ToolError>>) -> Result<T, ToolError> {
     tokio::time::timeout(RUN_TIME, work)
         .await
         .map_err(|_| ToolError::TimedOut(RUN_TIME))?
@@ -227,7 +273,7 @@ mod tests {
 
     #[test]
     fn the_first_installed_alternative_is_chosen() {
-        let executor = Executor::local(Vec::new());
+        let executor = Executor::local(Vec::new(), PathBuf::from("backups"));
         let present = if cfg!(windows) { "cmd" } else { "sh" };
         let mut action = prepared(Work::Commands(vec![vec![
             command("kelpy-no-such-program", &[]),
@@ -248,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn commands_report_their_output_and_exit_code() {
-        let executor = Executor::local(Vec::new());
+        let executor = Executor::local(Vec::new(), PathBuf::from("backups"));
         let (ok, failing) = if cfg!(windows) {
             (
                 command("cmd", &["/C", "echo hello"]),
@@ -288,8 +334,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_command_the_model_wrote_starts_in_its_folder() {
+        let executor = Executor::local(Vec::new(), PathBuf::from("backups"));
+        let folder = tempfile::tempdir().unwrap();
+        let text = match executor.os() {
+            Os::Windows => "(Get-Location).Path",
+            _ => "pwd",
+        };
+        let mut action = prepared(crate::script::script(
+            executor.os(),
+            text,
+            folder.path().to_owned(),
+        ));
+        executor.resolve(&mut action).unwrap();
+        let ran = executor.run(&action, &Output::new()).await.unwrap();
+        let name = folder.path().file_name().unwrap().to_string_lossy();
+        assert!(
+            ran.output.trim_end().ends_with(name.as_ref()),
+            "{}",
+            ran.output
+        );
+    }
+
+    #[tokio::test]
     async fn a_command_the_model_wrote_runs_as_written() {
-        let executor = Executor::local(Vec::new());
+        let executor = Executor::local(Vec::new(), PathBuf::from("backups"));
         let os = executor.os();
         let text = match os {
             Os::Windows => {
@@ -299,7 +368,13 @@ mod tests {
                 "echo \"it's \\\"quoted\\\" \\\\ here\"\necho 'C:\\dir\\\" \\'\necho oops >&2\nexit 4"
             }
         };
-        let mut action = prepared(crate::script::script(os, text));
+        let nowhere = prepared(crate::script::script(
+            os,
+            text,
+            PathBuf::from("/no/such/folder"),
+        ));
+        assert!(executor.resolve(&mut nowhere.clone()).is_err());
+        let mut action = prepared(crate::script::script(os, text, env::temp_dir()));
         executor.resolve(&mut action).unwrap();
         assert!(action.always_asks());
         assert_eq!(action.command_line().unwrap(), text);
@@ -315,7 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn what_a_command_leaves_running_ends_with_it() {
-        let executor = Executor::local(Vec::new());
+        let executor = Executor::local(Vec::new(), PathBuf::from("backups"));
         // The program left in the background shares the command's output: Kelpy would wait for it.
         let leaving = if cfg!(windows) {
             command(

@@ -11,14 +11,15 @@ publish = false
 [dependencies]
 kelpy-common = { version = "0.1.0", path = "../kelpy-common" }
 serde_json = "1.0.154"
+similar = "2.7.0"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["fs", "io-util", "process", "time"] }
+tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "process", "rt", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

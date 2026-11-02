@@ -1,0 +1,719 @@
+//! Changing files: one exact replacement, or a whole new content.
+//!
+//! Before approval Kelpy reads the file and plans the change ([`plan`]): the content after it, a diff to show, the
+//! check known for the kind of file, and whether the change always asks. Once approved ([`apply`]) it writes only if
+//! the file is still as shown, runs the check, backs the file up, writes it keeping its owner and mode, reads it
+//! back, and runs the check again: when the change broke the check, the previous version is put back at once. A check
+//! that failed in the same way before is not the change's doing, and the change is kept.
+
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use similar::TextDiff;
+
+use crate::executor::{RUN_TIME, run_local};
+use crate::{Command, Os, Output, ToolError, files, invalid};
+
+/// The largest file changed: a larger one is neither read whole nor backed up.
+pub const MAX_FILE: u64 = 20 << 20;
+/// The most text one call may carry.
+pub const MAX_TEXT: usize = 1 << 20;
+/// The most of a diff shown.
+const MAX_DIFF: usize = 64 << 10;
+
+/// What the model asked to change in a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Edit {
+    /// Replaces `old`, which must occur exactly once, with `new`.
+    Replace { old: String, new: String },
+    /// The whole new content; the file is created if it does not exist.
+    Write(String),
+}
+
+/// A change of one file: as asked, then as Kelpy will make it once [`plan`]ned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    pub path: PathBuf,
+    pub edit: Edit,
+    pub planned: Option<Planned>,
+}
+
+/// A change Kelpy read the file for: what it writes, and how it checks and undoes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    /// The path written: links resolved.
+    pub real: PathBuf,
+    /// The content when planned; `None` when the file does not exist yet.
+    pub before: Option<String>,
+    pub after: String,
+    /// The change as a unified diff.
+    pub diff: String,
+    /// The check run before and after, if one is known for the file and installed.
+    pub check: Option<Command>,
+    /// Why it waits for approval in every Approval mode, if it does.
+    pub floor: Option<String>,
+}
+
+impl Planned {
+    /// What the card says besides the diff: when it is written, how it is checked and undone.
+    pub fn notes(&self) -> Vec<String> {
+        let mut notes = vec![match self.before {
+            Some(_) => "Written only if the file is still as shown, after a backup in Kelpy's backups folder.",
+            None => "A new file: deleting it undoes the change.",
+        }
+        .to_owned()];
+        if let Some(check) = &self.check {
+            notes.push(format!(
+                "Checked with `{}` before and after: if the change breaks it, the previous version is put back at \
+                 once.",
+                check.display
+            ));
+        }
+        notes
+    }
+}
+
+/// Reads the file `change` is about and plans the change. `installed` tells whether a check's program is on this
+/// system. The error says, for the model, why the change cannot be made.
+pub async fn plan(
+    change: &FileChange,
+    os: Os,
+    protected: &[PathBuf],
+    installed: impl Fn(&str) -> bool,
+) -> Result<Planned, ToolError> {
+    let path = &change.path;
+    let unreadable = |source| ToolError::Read {
+        path: path.clone(),
+        source,
+    };
+    let exists = tokio::fs::symlink_metadata(path).await.is_ok();
+    // The real path: a link to a protected file is just as protected, and the file it leads to is the one changed.
+    let real = if exists {
+        tokio::fs::canonicalize(path).await.map_err(unreadable)?
+    } else {
+        let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(invalid(format!("{} is not a file's path", path.display())));
+        };
+        let folder = tokio::fs::canonicalize(folder)
+            .await
+            .map_err(|_| invalid(format!("the folder {} does not exist", folder.display())))?;
+        folder.join(name)
+    };
+    if protected.iter().any(|folder| real.starts_with(folder)) {
+        return Err(ToolError::OwnData(path.clone()));
+    }
+    if files::is_secret(&real) {
+        return Err(ToolError::Secret(path.clone()));
+    }
+    let real = plain(real);
+    let before = if exists {
+        Some(read(&real).await?)
+    } else {
+        None
+    };
+    // A file with Windows line ends keeps them: what the model wrote is given the same.
+    let crlf = before.as_deref().is_some_and(|text| text.contains("\r\n"));
+    let ends = |text: &str| {
+        if crlf && !text.contains('\r') {
+            text.replace('\n', "\r\n")
+        } else {
+            text.to_owned()
+        }
+    };
+    let after = match (&change.edit, &before) {
+        (Edit::Replace { .. }, None) => {
+            return Err(invalid(format!(
+                "{} does not exist: use write_file to create it",
+                path.display()
+            )));
+        }
+        (Edit::Replace { old, new }, Some(before)) => {
+            let (old, new) = (ends(old), ends(new));
+            match before.matches(old.as_str()).count() {
+                1 => before.replacen(old.as_str(), &new, 1),
+                0 => {
+                    return Err(invalid(format!(
+                        "`old` does not occur in {}: read the file again and copy the text exactly",
+                        path.display()
+                    )));
+                }
+                times => {
+                    return Err(invalid(format!(
+                        "`old` occurs {times} times in {}: include the lines around it, so that it occurs once",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        (Edit::Write(content), _) => ends(content),
+    };
+    if before.as_deref() == Some(after.as_str()) {
+        return Err(invalid(format!(
+            "{} already holds this content: there is nothing to change",
+            path.display()
+        )));
+    }
+    if is_json(&real) {
+        let valid = |text: &str| serde_json::from_str::<serde_json::Value>(text).map(|_| ());
+        if let Err(error) = valid(&after) {
+            // Kept only when the file was not valid JSON before either.
+            if before.as_deref().is_none_or(|before| valid(before).is_ok()) {
+                return Err(invalid(format!(
+                    "the new content is not valid JSON: {error}"
+                )));
+            }
+        }
+    }
+    Ok(Planned {
+        diff: diff(&real, before.as_deref().unwrap_or_default(), &after),
+        check: check(os, &real).filter(|check| installed(&check.program)),
+        floor: floor(os, &real),
+        real,
+        before,
+        after,
+    })
+}
+
+/// Makes a planned change, writing what it does to `output`; the previous version goes to `backups`.
+pub async fn apply(planned: &Planned, backups: &Path, output: &Output) -> Result<(), ToolError> {
+    let real = &planned.real;
+    let now = match tokio::fs::symlink_metadata(real).await {
+        Ok(_) => Some(read(real).await?),
+        Err(_) => None,
+    };
+    if now != planned.before {
+        return Err(ToolError::ChangedMeanwhile(real.clone()));
+    }
+    let checked_before = match &planned.check {
+        Some(check) => Some(run_check(check).await?),
+        None => None,
+    };
+    if let (Some(check), Some((passed, text))) = (&planned.check, &checked_before) {
+        output.line(&if *passed {
+            format!("Before the change, `{}` passed.", check.display)
+        } else {
+            format!(
+                "Before the change, `{}` failed already:\n{text}",
+                check.display
+            )
+        });
+    }
+    if let Some(before) = &planned.before {
+        let backup = backup(backups, real, before)
+            .await
+            .map_err(|source| ToolError::Write {
+                path: backups.to_owned(),
+                source,
+            })?;
+        output.line(&format!("Backed up to {}.", backup.display()));
+    }
+    let written = |source| ToolError::Write {
+        path: real.clone(),
+        source,
+    };
+    write(real, &planned.after).await.map_err(written)?;
+    if read(real).await? != planned.after {
+        // Something else wrote it meanwhile.
+        return Err(ToolError::ChangedMeanwhile(real.clone()));
+    }
+    let (added, removed) = counts(&planned.diff);
+    output.line(&format!(
+        "Wrote {} (+{added} −{removed} lines).",
+        real.display()
+    ));
+    let Some(check) = &planned.check else {
+        return Ok(());
+    };
+    let (passed, text) = run_check(check).await?;
+    if passed {
+        output.line(&format!("After the change, `{}` passed.", check.display));
+        return Ok(());
+    }
+    output.line(&format!(
+        "After the change, `{}` failed:\n{text}",
+        check.display
+    ));
+    if checked_before.is_some_and(|(passed, before)| !passed && before == text) {
+        output.line("It failed in the same way before: the change is kept.");
+        return Ok(());
+    }
+    match &planned.before {
+        Some(before) => write(real, before).await.map_err(written)?,
+        None => tokio::fs::remove_file(real).await.map_err(written)?,
+    }
+    output.line("The previous version was put back.");
+    Err(ToolError::CheckFailed {
+        check: check.display.clone(),
+        output: text,
+    })
+}
+
+/// The text of the regular file at `path`, up to [`MAX_FILE`].
+async fn read(path: &Path) -> Result<String, ToolError> {
+    let unreadable = |source| ToolError::Read {
+        path: path.to_owned(),
+        source,
+    };
+    let metadata = tokio::fs::metadata(path).await.map_err(unreadable)?;
+    if !metadata.is_file() {
+        return Err(ToolError::NotRegularFile(path.to_owned()));
+    }
+    if metadata.len() > MAX_FILE {
+        return Err(ToolError::TooLarge(path.to_owned()));
+    }
+    let bytes = tokio::fs::read(path).await.map_err(unreadable)?;
+    if bytes.contains(&0) {
+        return Err(ToolError::NotText(path.to_owned()));
+    }
+    String::from_utf8(bytes).map_err(|_| ToolError::NotText(path.to_owned()))
+}
+
+/// Writes `content` to `path`, keeping an existing file's owner, mode and permissions.
+async fn write(path: &Path, content: &str) -> io::Result<()> {
+    let (path, content) = (path.to_owned(), content.to_owned());
+    tokio::task::spawn_blocking(move || write_now(&path, content.as_bytes()))
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// Unix: a new file beside the old one, given its mode and owner, then renamed over it, so that the file is never
+/// seen half written.
+#[cfg(unix)]
+fn write_now(path: &Path, content: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut file = std::fs::File::create_new(path)?;
+            file.write_all(content)?;
+            return file.sync_all();
+        }
+        Err(error) => return Err(error),
+    };
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let staged = path.with_file_name(format!(".{name}.kelpy-{}", std::process::id()));
+    let made = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        std::os::unix::fs::chown(&staged, Some(metadata.uid()), Some(metadata.gid()))?;
+        std::fs::set_permissions(&staged, metadata.permissions())?;
+        std::fs::rename(&staged, path)
+    })();
+    if made.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    made
+}
+
+/// Windows: written in place, which keeps the file's permissions (ACL) as they are.
+#[cfg(not(unix))]
+fn write_now(path: &Path, content: &[u8]) -> io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(content)?;
+    file.sync_all()
+}
+
+/// Saves `content`, the version of `real` before a change, in `backups`; readable by Kelpy's account only, as
+/// the file may be. Returns where.
+async fn backup(backups: &Path, real: &Path, content: &str) -> io::Result<PathBuf> {
+    let (backups, content) = (backups.to_owned(), content.to_owned());
+    let flat: String = real
+        .to_string_lossy()
+        .chars()
+        .map(|char| {
+            if char.is_alphanumeric() || ".-".contains(char) {
+                char
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    let target = backups.join(format!("{millis}-{}", flat.trim_start_matches('_')));
+    let saved = target.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut folder = std::fs::DirBuilder::new();
+        folder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut folder, 0o700);
+        folder.create(&backups)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&target)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()
+    })
+    .await
+    .map_err(io::Error::other)??;
+    Ok(saved)
+}
+
+/// `path` without Windows' `\\?\` prefix, which `canonicalize` adds: shown as the administrator would type it.
+fn plain(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+/// Runs a file's check: whether it passed, and what it said.
+async fn run_check(check: &Command) -> Result<(bool, String), ToolError> {
+    let said = Output::new();
+    let code = run_local(check, None, Some(RUN_TIME), true, &said).await?;
+    Ok((code == 0, said.snapshot().1.trim().to_owned()))
+}
+
+/// The check known for the file at `path`, such as `nginx -t` for nginx's configuration.
+fn check(os: Os, path: &Path) -> Option<Command> {
+    let command = |program: &str, args: &[&str]| Command {
+        program: program.to_owned(),
+        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+        env: Vec::new(),
+        display: std::iter::once(program)
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    let text = path.to_string_lossy();
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("php"))
+    {
+        return Some(command("php", &["-l", &text]));
+    }
+    if os == Os::Windows {
+        return None;
+    }
+    let under = |folder: &str| path.starts_with(folder);
+    if under("/etc/nginx") {
+        Some(command("nginx", &["-t"]))
+    } else if under("/etc/apache2") {
+        Some(command("apache2ctl", &["configtest"]))
+    } else if under("/etc/httpd") {
+        Some(command("apachectl", &["configtest"]))
+    } else if under("/etc/ssh/sshd_config") || under("/etc/ssh/sshd_config.d") {
+        Some(command("sshd", &["-t"]))
+    } else if under("/etc/sudoers") || under("/etc/sudoers.d") {
+        Some(command("visudo", &["-c"]))
+    } else {
+        None
+    }
+}
+
+fn is_json(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+}
+
+/// Why a change of the file at `path` waits for approval in every Approval mode: a mistake there could lock the
+/// administrator out or keep the system from starting.
+fn floor(os: Os, path: &Path) -> Option<String> {
+    let what = if os == Os::Windows {
+        // As written on disk, like `path`: the variable may differ in case, as `C:\WINDOWS`.
+        let system = std::env::var_os("SystemRoot").map(PathBuf::from)?;
+        let system = plain(std::fs::canonicalize(&system).unwrap_or(system));
+        path.starts_with(system)
+            .then_some("a Windows system file")?
+    } else {
+        const FLOOR: &[(&str, &str)] = &[
+            ("/etc/ssh", "the SSH configuration"),
+            ("/etc/sudoers", "the sudo rules"),
+            ("/etc/sudoers.d", "the sudo rules"),
+            ("/etc/pam.d", "the login rules"),
+            ("/etc/security", "the login rules"),
+            ("/etc/ufw", "the firewall"),
+            ("/etc/firewalld", "the firewall"),
+            ("/etc/nftables.conf", "the firewall"),
+            ("/etc/iptables", "the firewall"),
+            ("/etc/hosts.allow", "who may connect"),
+            ("/etc/hosts.deny", "who may connect"),
+            ("/etc/network", "the network configuration"),
+            ("/etc/netplan", "the network configuration"),
+            ("/etc/NetworkManager", "the network configuration"),
+            (
+                "/etc/sysconfig/network-scripts",
+                "the network configuration",
+            ),
+            ("/etc/resolv.conf", "the network configuration"),
+            ("/etc/fstab", "the file systems mounted at start"),
+            ("/etc/crypttab", "the file systems mounted at start"),
+            ("/etc/default/grub", "the boot configuration"),
+            ("/boot", "the boot configuration"),
+        ];
+        FLOOR
+            .iter()
+            .find(|(folder, _)| path.starts_with(folder))
+            .map(|(_, what)| *what)?
+    };
+    Some(format!(
+        "It changes {what}: a mistake could lock you out or keep the system from starting, so it always asks."
+    ))
+}
+
+/// The change from `before` to `after` as a unified diff, at most [`MAX_DIFF`]. Line ends are shown alike.
+fn diff(path: &Path, before: &str, after: &str) -> String {
+    let (before, after) = (before.replace("\r\n", "\n"), after.replace("\r\n", "\n"));
+    let name = path.to_string_lossy();
+    let mut text = TextDiff::from_lines(&before, &after)
+        .unified_diff()
+        .context_radius(3)
+        .header(&name, &name)
+        .to_string();
+    if text.len() > MAX_DIFF {
+        let cut = (0..=MAX_DIFF)
+            .rev()
+            .find(|&index| text.is_char_boundary(index))
+            .unwrap_or(0);
+        let more = text[cut..].lines().count();
+        text.truncate(cut);
+        text.push_str(&format!(
+            "\n[… {more} more lines of the diff not shown …]\n"
+        ));
+    }
+    text
+}
+
+/// The lines a diff adds and removes.
+fn counts(diff: &str) -> (usize, usize) {
+    diff.lines()
+        .filter(|line| !line.starts_with("+++") && !line.starts_with("---"))
+        .fold((0, 0), |(added, removed), line| {
+            match line.as_bytes().first() {
+                Some(b'+') => (added + 1, removed),
+                Some(b'-') => (added, removed + 1),
+                _ => (added, removed),
+            }
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    fn replace(path: &Path, old: &str, new: &str) -> FileChange {
+        FileChange {
+            path: path.to_owned(),
+            edit: Edit::Replace {
+                old: old.into(),
+                new: new.into(),
+            },
+            planned: None,
+        }
+    }
+
+    fn write_all(path: &Path, content: &str) -> FileChange {
+        FileChange {
+            path: path.to_owned(),
+            edit: Edit::Write(content.into()),
+            planned: None,
+        }
+    }
+
+    async fn planned(change: &FileChange) -> Result<Planned, ToolError> {
+        plan(change, Os::current(), &[], |_| true).await
+    }
+
+    /// A check that fails while the file at `path` holds "broken".
+    fn not_broken(path: &Path) -> Command {
+        let path = path.to_string_lossy().into_owned();
+        let (program, args) = if cfg!(windows) {
+            let script = format!(
+                "exit [int](Select-String -Quiet -SimpleMatch broken -LiteralPath '{path}')"
+            );
+            (
+                "powershell",
+                vec!["-NoProfile".to_owned(), "-Command".to_owned(), script],
+            )
+        } else {
+            let script = "! grep -q broken \"$1\"".to_owned();
+            ("sh", vec!["-c".to_owned(), script, "sh".to_owned(), path])
+        };
+        Command {
+            program: program.into(),
+            args,
+            env: Vec::new(),
+            display: "check".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_change_is_shown_backed_up_and_written_keeping_line_ends_and_mode() {
+        let (dir, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "listen 80;\r\nroot /var/www;\r\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        let planned = planned(&replace(&path, "listen 80;\n", "listen 8080;\n"))
+            .await
+            .unwrap();
+        assert!(
+            planned.diff.contains("-listen 80;\n+listen 8080;\n"),
+            "{}",
+            planned.diff
+        );
+        assert_eq!(planned.after, "listen 8080;\r\nroot /var/www;\r\n");
+        assert_eq!(
+            (planned.check.as_ref(), planned.floor.as_ref()),
+            (None, None)
+        );
+
+        let output = Output::new();
+        apply(&planned, backups.path(), &output).await.unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), planned.after);
+        let saved: Vec<_> = fs::read_dir(backups.path()).unwrap().flatten().collect();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            fs::read_to_string(saved[0].path()).unwrap(),
+            "listen 80;\r\nroot /var/www;\r\n"
+        );
+        assert!(output.snapshot().1.contains("(+1 \u{2212}1 lines)"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!((mode(&path), mode(&saved[0].path())), (0o640, 0o600));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_text_replaced_occurs_once_and_a_change_changes_something() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.txt");
+        fs::write(&path, "a\na\nb\n").unwrap();
+        let problem = |result: Result<Planned, ToolError>| result.unwrap_err().to_string();
+
+        assert!(problem(planned(&replace(&path, "a", "c")).await).contains("occurs 2 times"));
+        assert!(problem(planned(&replace(&path, "z", "c")).await).contains("does not occur"));
+        assert!(
+            problem(planned(&write_all(&path, "a\na\nb\n")).await).contains("nothing to change")
+        );
+        let missing = dir.path().join("new.txt");
+        assert!(problem(planned(&replace(&missing, "a", "b")).await).contains("use write_file"));
+        // A new file: nothing before it, nothing to back up.
+        let created = planned(&write_all(&missing, "hello\n")).await.unwrap();
+        assert_eq!(created.before, None);
+        assert!(created.notes()[0].contains("deleting it"));
+        let nowhere = dir.path().join("no").join("such.txt");
+        assert!(problem(planned(&write_all(&nowhere, "x")).await).contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn nothing_is_written_when_the_file_changed_after_it_was_shown() {
+        let (dir, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let path = dir.path().join("app.ini");
+        fs::write(&path, "debug = false\n").unwrap();
+        let planned = planned(&replace(&path, "false", "true")).await.unwrap();
+        fs::write(&path, "debug = false\nport = 80\n").unwrap();
+
+        let result = apply(&planned, backups.path(), &Output::new()).await;
+        assert!(matches!(result, Err(ToolError::ChangedMeanwhile(_))));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "debug = false\nport = 80\n"
+        );
+        assert_eq!(fs::read_dir(backups.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_change_that_breaks_the_check_is_put_back_one_that_found_it_broken_is_kept() {
+        let (dir, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let path = dir.path().join("server.conf");
+        fs::write(&path, "fine\n").unwrap();
+        let mut breaking = planned(&write_all(&path, "broken\n")).await.unwrap();
+        breaking.check = Some(not_broken(&path));
+        let output = Output::new();
+        let result = apply(&breaking, backups.path(), &output).await;
+        assert!(
+            matches!(result, Err(ToolError::CheckFailed { .. })),
+            "{result:?}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fine\n");
+        assert!(
+            output
+                .snapshot()
+                .1
+                .contains("The previous version was put back.")
+        );
+
+        fs::write(&path, "broken\n").unwrap();
+        let mut still = planned(&write_all(&path, "broken\nport 80\n"))
+            .await
+            .unwrap();
+        still.check = Some(not_broken(&path));
+        let output = Output::new();
+        apply(&still, backups.path(), &output).await.unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "broken\nport 80\n");
+        assert!(
+            output
+                .snapshot()
+                .1
+                .contains("failed in the same way before")
+        );
+    }
+
+    #[tokio::test]
+    async fn secrets_kelpys_data_and_invalid_json_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join(".env");
+        assert!(matches!(
+            planned(&write_all(&env, "A=1")).await,
+            Err(ToolError::Secret(_))
+        ));
+        let own = plan(
+            &write_all(&dir.path().join("notes.md"), "x"),
+            Os::current(),
+            &[fs::canonicalize(dir.path()).unwrap()],
+            |_| true,
+        )
+        .await;
+        assert!(matches!(own, Err(ToolError::OwnData(_))));
+
+        let json = dir.path().join("settings.json");
+        fs::write(&json, "{}").unwrap();
+        let invalid = planned(&write_all(&json, "{")).await.unwrap_err();
+        assert!(invalid.to_string().contains("not valid JSON"));
+        // Already invalid before: the change is not refused for it.
+        fs::write(&json, "{").unwrap();
+        assert!(planned(&write_all(&json, "{ ")).await.is_ok());
+    }
+
+    #[test]
+    fn checks_and_the_floor_follow_the_file() {
+        let linux = |path: &str| {
+            (
+                check(Os::Linux, Path::new(path)).map(|check| check.display),
+                floor(Os::Linux, Path::new(path)),
+            )
+        };
+        assert_eq!(
+            linux("/etc/nginx/sites-enabled/blog"),
+            (Some("nginx -t".into()), None)
+        );
+        let (sshd, sshd_floor) = linux("/etc/ssh/sshd_config");
+        assert_eq!(sshd.as_deref(), Some("sshd -t"));
+        assert!(sshd_floor.unwrap().contains("the SSH configuration"));
+        assert!(linux("/etc/fstab").1.is_some());
+        assert_eq!(linux("/srv/app/config.yml"), (None, None));
+    }
+}

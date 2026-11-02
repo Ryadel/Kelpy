@@ -11,8 +11,10 @@ use std::time::{Duration, Instant};
 
 use kelpy_common::{lock, unix_now};
 use kelpy_providers::{ChatMessage, ToolCall, ToolResult};
-use kelpy_storage::{Access, Action, ActionState, Approval, Message, NewAction, Role, Session};
-use kelpy_tools::{Output, Prepared};
+use kelpy_storage::{
+    Access, Action, ActionState, Approval, Change, Message, NewAction, Role, Session,
+};
+use kelpy_tools::{Output, Prepared, ToolError};
 use serde_json::Value;
 use tokio::sync::{oneshot, watch};
 use tokio::time::MissedTickBehavior;
@@ -29,6 +31,9 @@ const LIVE_EVERY: Duration = Duration::from_millis(500);
 
 /// Why an action is denied when the conversation's access does not allow it.
 const NO_ACCESS: &str = "System access is None in this conversation";
+/// Why a change is denied when the conversation's access only allows looking.
+const READ_ONLY: &str =
+    "System access is Read-only in this conversation: changing the system needs Full";
 
 /// An action waiting for a decision, in its answer's [`Running`](super::Running).
 pub(super) enum Question {
@@ -71,13 +76,14 @@ impl Turns {
         answer: &watch::Sender<AnswerState>,
         stop: &CancellationToken,
     ) -> Result<(), End> {
-        let prepared = self
-            .tools
-            .prepare(&call.name, &call.arguments)
-            .and_then(|mut prepared| {
-                self.executor.resolve(&mut prepared)?;
-                Ok(prepared)
-            });
+        // A change is planned before it is shown: what is approved is what will be written.
+        let prepared = async {
+            let mut prepared = self.tools.prepare(&call.name, &call.arguments)?;
+            self.executor.resolve(&mut prepared)?;
+            self.executor.plan(&mut prepared).await?;
+            Ok::<_, ToolError>(prepared)
+        }
+        .await;
         let (summary, reason, command) = match &prepared {
             Ok(prepared) => (
                 prepared.summary.clone(),
@@ -88,6 +94,16 @@ impl Turns {
         };
         let problem = prepared.as_ref().err().map(ToString::to_string);
         let always_asks = prepared.as_ref().is_ok_and(Prepared::always_asks);
+        let changes = prepared.as_ref().is_ok_and(Prepared::changes);
+        let change = prepared
+            .as_ref()
+            .ok()
+            .and_then(Prepared::planned)
+            .map(|planned| Change {
+                diff: planned.diff.clone(),
+                notes: planned.notes(),
+                floor: planned.floor.clone(),
+            });
         let (message_id, call) = (answer.borrow().message.id, call.clone());
         let recorded = self
             .store
@@ -98,9 +114,14 @@ impl Turns {
                     // Tools are offered only with access: the model called one anyway, or the access changed
                     // meanwhile.
                     (None, Access::None, _) => (ActionState::Denied, Some(NO_ACCESS.to_owned())),
+                    (None, Access::ReadOnly, _) if changes => {
+                        (ActionState::Denied, Some(READ_ONLY.to_owned()))
+                    }
                     (None, _, Approval::Ask) => (ActionState::Waiting, None),
                     (None, _, _) if always_asks => (ActionState::Waiting, None),
-                    // The other tools only read: in Plan and Auto, reading needs no approval.
+                    // No plan is made yet: in Plan, each change is approved on its own.
+                    (None, _, Approval::Plan) if changes => (ActionState::Waiting, None),
+                    // What is left only reads, or changes a file Kelpy backs up and can put back.
                     (None, _, Approval::Plan | Approval::Auto) => (ActionState::Running, None),
                 };
                 store.insert_action(&NewAction {
@@ -113,6 +134,7 @@ impl Turns {
                     reason: &reason,
                     summary: &summary,
                     command: command.as_deref(),
+                    change: change.as_ref(),
                     state,
                     error: error.as_deref(),
                 })
@@ -132,7 +154,7 @@ impl Turns {
                     return Err(End::Stopped);
                 }
                 decided => {
-                    action = self.settle(session_id, action, decided).await?;
+                    action = self.settle(session_id, action, decided, changes).await?;
                     show(answer, &action);
                 }
             },
@@ -159,8 +181,7 @@ impl Turns {
                 () = halt.cancelled() => break Ended::Halted,
                 () = stop.cancelled() => break Ended::Stopped,
                 _ = live.tick() => {
-                    let (changes, text) = output.snapshot();
-                    if changes != shown {
+                    if let Some((changes, text)) = output.snapshot_since(shown) {
                         shown = changes;
                         action.output = text;
                         show(answer, &action);
@@ -205,18 +226,22 @@ impl Turns {
     }
 
     /// Settles the waiting `action` with what was `decided`, against the conversation's access as it is now, and
-    /// saves it: it runs only if approved while access allows it.
+    /// saves it: it runs only if approved while access allows it, Full if it `changes` the system.
     async fn settle(
         &self,
         session_id: i64,
         mut action: Action,
         decided: Decided,
+        changes: bool,
     ) -> Result<Action, End> {
         self.store
             .call(move |store| {
                 let access = store.session(session_id)?.access;
                 (action.state, action.error) = match (decided, access) {
                     (_, Access::None) => (ActionState::Denied, Some(NO_ACCESS.to_owned())),
+                    (_, Access::ReadOnly) if changes => {
+                        (ActionState::Denied, Some(READ_ONLY.to_owned()))
+                    }
                     (Decided::Approved, _) => (ActionState::Running, None),
                     (Decided::Unanswered, _) => (
                         ActionState::Denied,
@@ -484,6 +509,7 @@ mod tests {
             created_at: 0,
             duration_ms: Some(5),
             started_at: Some(0),
+            change: None,
         }
     }
 

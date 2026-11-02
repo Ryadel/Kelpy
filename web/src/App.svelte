@@ -41,6 +41,7 @@
   import StopDialog from './lib/StopDialog.svelte';
   import ThemeToggle from './lib/ThemeToggle.svelte';
   import { connection, usable, watchConnection } from './lib/connection.svelte';
+  import { kept, merged } from './lib/conversations';
   import { runtime } from './lib/runtime.svelte';
   import { watchEvents } from './lib/events';
 
@@ -129,7 +130,9 @@
 
   async function catchUp() {
     try {
-      [runtime.status, provider, sessions] = await Promise.all([fetchStatus(), fetchProvider(), fetchSessions()]);
+      let fetched: Session[];
+      [runtime.status, provider, fetched] = await Promise.all([fetchStatus(), fetchProvider(), fetchSessions()]);
+      sessions = merged(sessions, fetched);
       connection.resumed += 1;
     } catch (reason: unknown) {
       fail(reason);
@@ -142,7 +145,9 @@
       const events = watchEvents({ onEvent: receive, onResumed: () => void catchUp(), onEnded: fail });
       stopEvents = events.stop;
       await events.subscribed;
-      [runtime.status, provider, sessions] = await Promise.all([fetchStatus(), fetchProvider(), fetchSessions()]);
+      let fetched: Session[];
+      [runtime.status, provider, fetched] = await Promise.all([fetchStatus(), fetchProvider(), fetchSessions()]);
+      sessions = merged(sessions, fetched);
       selected ??= sessions[0]?.id ?? null;
       view = { kind: 'ready' };
       const callback = takeChatGptReturn();
@@ -212,11 +217,9 @@
     }
   }
 
-  /** Puts a conversation in the list as it is now, most recent first. */
+  /** Puts a conversation in the list as it is now, most recent first, unless the list has a newer copy. */
   function keep(session: Session) {
-    sessions = [session, ...sessions.filter((other) => other.id !== session.id)].sort(
-      (a, b) => b.updated_at - a.updated_at || b.id - a.id,
-    );
+    sessions = kept(sessions, session);
   }
 
   function forget(id: number) {

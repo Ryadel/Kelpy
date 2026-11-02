@@ -147,9 +147,10 @@ asks: *System access* None, Read-only (the default) or Full, and *Approval mode*
 With Read-only, Kelpy looks before it answers: services, installed software, listening ports, disks, processes,
 logs, files. Each look is an action shown in the answer with its exact command and its reason, and with Ask it
 waits for *Approve* or *Deny*. These commands are fixed by Kelpy and only read; files that may hold secrets are
-never read. When they are not enough, or to change the system with Full, Kelpy writes a command (PowerShell or
-bash), shown verbatim and always approved first, in every mode; it runs as the account that started Kelpy, with no
-time limit, and *Stop* on its card ends it. The *Command log*, opened from the top bar, lists every action of the conversation
+never read. With Full, Kelpy changes a file by showing the change as a diff, backing the file up, and checking it
+where it can (such as `nginx -t`): a change that breaks the check is undone at once. For anything else, Kelpy writes
+a command (PowerShell or bash), shown verbatim and always approved first, in every mode; it runs as the account that
+started Kelpy, with no time limit, and *Stop* on its card ends it. The *Command log*, opened from the top bar, lists every action of the conversation
 with its exit code, duration and output. What Kelpy reads is sent to the AI service. The
 [wiki](https://github.com/Ryadel/Kelpy/wiki/System-access) lists what Kelpy can look at.
 
