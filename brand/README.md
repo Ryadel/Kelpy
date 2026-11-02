@@ -31,8 +31,8 @@ The Web UI shows the mark alone.
 
 ## Usage infographic
 
-The README shows four numbered cards, Copy, Run, Work and Stop, each with a short caption and linked by small
-turquoise arrows.
+The README shows four numbered cards, Copy, Run, Work and Stop, each with a short caption and a faint icon in the top
+right corner (copy, terminal, chat, power), linked by small turquoise arrows.
 
 - `kelpy-usage-light.svg` and `kelpy-usage-dark.svg`: the cards side by side, 880 wide.
 - `kelpy-usage-mobile-light.svg` and `kelpy-usage-mobile-dark.svg`: the cards stacked, 420 wide, used at viewport
