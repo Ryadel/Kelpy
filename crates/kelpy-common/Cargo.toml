@@ -1,0 +1,11 @@
+[package]
+name = "kelpy-common"
+description = "Kelpy common: the few helpers every Kelpy crate shares."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]

@@ -1,0 +1,6 @@
+/target/
+/web/node_modules/
+/web/dist/
+
+# Safety net: development material from the surrounding workspace never belongs here.
+/private/

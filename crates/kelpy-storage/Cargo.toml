@@ -1,0 +1,22 @@
+[package]
+name = "kelpy-storage"
+description = "Kelpy storage: conversations, messages and summaries in SQLite."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+kelpy-common = { version = "0.1.0", path = "../kelpy-common" }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["sync"] }
+
+
+[dev-dependencies]
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt", "macros", "time"] }

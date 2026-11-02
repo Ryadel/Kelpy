@@ -1,0 +1,30 @@
+[package]
+name = "kelpy-gateway"
+description = "Kelpy local gateway: the loopback HTTP server and the embedded Web UI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+axum = "0.8.9"
+futures-util = "0.3.34"
+getrandom = "0.4.3"
+kelpy-common = { version = "0.1.0", path = "../kelpy-common" }
+kelpy-core = { version = "0.1.0", path = "../kelpy-core" }
+ring = "0.17.14"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+subtle = "2.6.1"
+tokio = { version = "1.54.1", features = ["net", "sync", "time"] }
+
+
+[dev-dependencies]
+kelpy-test-support = { version = "0.1.0", path = "../kelpy-test-support" }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tower = { version = "0.5.3", features = ["util"] }

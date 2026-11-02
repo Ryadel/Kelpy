@@ -1,0 +1,133 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+/* Dark by default (`class="dark"` in index.html); the header's toggle switches it, and theme.js restores it. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * The shadcn tokens, plus four of Kelpy's own: `bubble` (the user's messages), `composer` (the message box), `code`
+ * and `code-head` (code blocks and their header). `primary` is the brand's teal; `accent` is shadcn's neutral hover.
+ */
+:root {
+  color-scheme: light;
+  --radius: 0.625rem;
+  --background: #ffffff;
+  --foreground: #1a1d1e;
+  --card: #ffffff;
+  --card-foreground: #1a1d1e;
+  --popover: #ffffff;
+  --popover-foreground: #1a1d1e;
+  --primary: #03879a;
+  --primary-foreground: #ffffff;
+  --secondary: #e3e7e8;
+  --secondary-foreground: #1a1d1e;
+  --muted: #eceff0;
+  --muted-foreground: #6a7275;
+  --accent: #eceff0;
+  --accent-foreground: #1a1d1e;
+  --destructive: #d92d20;
+  --border: #e3e7e8;
+  --input: #dde2e3;
+  --ring: #03879a;
+  --sidebar: #f7f8f8;
+  --sidebar-foreground: #1a1d1e;
+  --sidebar-primary: #03879a;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e3e7e8;
+  --sidebar-accent-foreground: #1a1d1e;
+  --sidebar-border: #e3e7e8;
+  --sidebar-ring: #03879a;
+  --bubble: #eff2f3;
+  --composer: #ffffff;
+  --code: #f6f8f8;
+  --code-head: #eceff0;
+  --code-foreground: #1a1d1e;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: #151718;
+  --foreground: #eceff0;
+  --card: #1d2022;
+  --card-foreground: #eceff0;
+  --popover: #1d2022;
+  --popover-foreground: #eceff0;
+  --primary: #3fc0c9;
+  --primary-foreground: #0b1c1f;
+  --secondary: #262b2d;
+  --secondary-foreground: #eceff0;
+  --muted: #1f2325;
+  --muted-foreground: #9da4a5;
+  --accent: #262b2d;
+  --accent-foreground: #eceff0;
+  --destructive: #e5484d;
+  --border: rgb(255 255 255 / 9%);
+  --input: rgb(255 255 255 / 13%);
+  --ring: #3fc0c9;
+  --sidebar: #0f1112;
+  --sidebar-foreground: #eceff0;
+  --sidebar-primary: #3fc0c9;
+  --sidebar-primary-foreground: #0b1c1f;
+  --sidebar-accent: #262b2d;
+  --sidebar-accent-foreground: #eceff0;
+  --sidebar-border: rgb(255 255 255 / 9%);
+  --sidebar-ring: #3fc0c9;
+  --bubble: #262a2c;
+  --composer: #1f2224;
+  --code: #0d0f10;
+  --code-head: #191c1e;
+  --code-foreground: #dfe4e5;
+}
+
+/* Always emitted as variables: the answers' styles (Markdown.svelte) use the monospace font too. */
+@theme static {
+  --font-sans: 'Inter', 'Segoe UI Variable Text', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Code', 'JetBrains Mono', Menlo, Consolas, monospace;
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-bubble: var(--bubble);
+  --color-composer: var(--composer);
+  --color-code: var(--code);
+  --color-code-head: var(--code-head);
+  --color-code-foreground: var(--code-foreground);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground font-sans text-[15px] antialiased;
+  }
+}

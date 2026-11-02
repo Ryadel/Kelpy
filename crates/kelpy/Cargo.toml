@@ -1,0 +1,35 @@
+[package]
+name = "kelpy"
+description = "AI-powered system administration. One binary. No installation required."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+dirs = "7.0.0"
+futures-util = "0.3.34"
+kelpy-common = { version = "0.1.0", path = "../kelpy-common" }
+kelpy-core = { version = "0.1.0", path = "../kelpy-core" }
+kelpy-gateway = { version = "0.1.0", path = "../kelpy-gateway" }
+qrcode = { version = "0.14.1", default-features = false }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
+rpassword = "7.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "process", "time", "net", "io-util"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+webbrowser = "1.2.5"
+
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+winreg = "0.56.0"
