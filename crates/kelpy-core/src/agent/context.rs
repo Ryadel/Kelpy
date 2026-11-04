@@ -153,10 +153,30 @@ pub(super) fn action_result(action: &Action) -> String {
                 format!("It did not complete: {problem}. Its output until then:\n{output}")
             }
         }
+        ActionState::Uncertain => format!(
+            "Its outcome is uncertain: {}. Look at the system to learn what it did before you do it again.",
+            action
+                .error
+                .as_deref()
+                .unwrap_or("Kelpy stopped while it was changing the system")
+        ),
         ActionState::Waiting | ActionState::Running => {
             "It did not run: Kelpy stopped first.".to_owned()
         }
     }
+}
+
+/// An operation the administrator asked for, as the model is told of it.
+pub(super) fn administrator_note(action: &Action) -> String {
+    let outcome = match action.state {
+        ActionState::Done => "done".to_owned(),
+        ActionState::Uncertain => "outcome uncertain".to_owned(),
+        _ => format!(
+            "it did not complete: {}",
+            action.error.as_deref().unwrap_or("unknown error")
+        ),
+    };
+    format!("{} ({outcome})", action.summary)
 }
 
 /// The cost of `text` in quarters of a token.

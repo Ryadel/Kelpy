@@ -5,14 +5,19 @@
 //! the file is still as shown, runs the check, backs the file up, writes it keeping its owner and mode, reads it
 //! back, and runs the check again: when the change broke the check, the previous version is put back at once. A check
 //! that failed in the same way before is not the change's doing, and the change is kept.
+//!
+//! The model's text may name secrets ([`crate::secret`]): their values are written, and the diff shows their
+//! placeholders. A file that may hold secrets can be written whole, never edited: an edit would tell the model
+//! whether a text occurs in it. Its current content is not shown in the diff.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use similar::TextDiff;
 
-use crate::executor::{RUN_TIME, run_local};
-use crate::{Command, Os, Output, ToolError, files, invalid};
+use crate::executor::{Observed, RUN_TIME, run_local};
+use crate::{Command, Os, Output, Recorded, RecordedKind, Secrets, ToolError, files, invalid};
 
 /// The largest file changed: a larger one is neither read whole nor backed up.
 pub const MAX_FILE: u64 = 20 << 20;
@@ -20,6 +25,10 @@ pub const MAX_FILE: u64 = 20 << 20;
 pub const MAX_TEXT: usize = 1 << 20;
 /// The most of a diff shown.
 const MAX_DIFF: usize = 64 << 10;
+/// The largest content kept to show a later difference.
+const MAX_KEPT: usize = 256 << 10;
+/// The most lines of a change shown in a plan.
+const PREVIEW_LINES: usize = 40;
 
 /// What the model asked to change in a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +61,8 @@ pub struct Planned {
     pub check: Option<Command>,
     /// Why it waits for approval in every Approval mode, if it does.
     pub floor: Option<String>,
+    /// Whether the file may hold secrets, or the change writes one: its content is neither shown nor kept.
+    pub secret: bool,
 }
 
 impl Planned {
@@ -62,6 +73,12 @@ impl Planned {
             None => "A new file: deleting it undoes the change.",
         }
         .to_owned()];
+        if self.secret {
+            notes.push(
+                "The file may hold secrets: its current content is not shown, and secrets show as their names."
+                    .to_owned(),
+            );
+        }
         if let Some(check) = &self.check {
             notes.push(format!(
                 "Checked with `{}` before and after: if the change breaks it, the previous version is put back at \
@@ -71,16 +88,70 @@ impl Planned {
         }
         notes
     }
+
+    /// What Kelpy expects to find once the change is made.
+    pub fn recorded(&self) -> Recorded {
+        Recorded {
+            kind: RecordedKind::File,
+            subject: self.real.to_string_lossy().into_owned(),
+            state: digest(&self.after),
+            content: (!self.secret && self.after.len() <= MAX_KEPT).then(|| self.after.clone()),
+            secret: self.secret,
+        }
+    }
 }
 
-/// Reads the file `change` is about and plans the change. `installed` tells whether a check's program is on this
-/// system. The error says, for the model, why the change cannot be made.
+/// The digest Kelpy keeps of a file's content.
+pub fn digest(content: &str) -> String {
+    let hash = Sha256::digest(content.as_bytes());
+    let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("sha256:{hex}")
+}
+
+/// The file at `path` as it is now: its digest and content, or `missing`.
+pub(crate) async fn observe(path: &Path) -> Result<Observed, ToolError> {
+    if tokio::fs::symlink_metadata(path).await.is_err() {
+        return Ok(Observed {
+            state: "missing".to_owned(),
+            content: None,
+        });
+    }
+    let content = read(path).await?;
+    Ok(Observed {
+        state: digest(&content),
+        content: Some(content),
+    })
+}
+
+/// A change as a plan shows it before the file is read: the lines replaced and their replacement, or the start of
+/// the new content.
+pub(crate) fn preview(edit: &Edit) -> String {
+    let lines = |sign: char, text: &str| -> Vec<String> {
+        text.lines().map(|line| format!("{sign}{line}")).collect()
+    };
+    let mut shown = match edit {
+        Edit::Replace { old, new } => [lines('-', old), lines('+', new)].concat(),
+        Edit::Write(content) => lines('+', content),
+    };
+    if shown.len() > PREVIEW_LINES {
+        let more = shown.len() - PREVIEW_LINES;
+        shown.truncate(PREVIEW_LINES);
+        shown.push(format!("[… {more} more lines …]"));
+    }
+    shown.join("\n")
+}
+
+/// Reads the file `change` is about and plans the change, putting in the `secrets` it names. `installed` tells
+/// whether a check's program is on this system. `Ok(Err(text))` when the file already holds what the change would
+/// write. The error says, for the model, why the change cannot be made.
 pub async fn plan(
     change: &FileChange,
     os: Os,
     protected: &[PathBuf],
+    secrets: &Secrets,
+    held: &[PathBuf],
     installed: impl Fn(&str) -> bool,
-) -> Result<Planned, ToolError> {
+) -> Result<Result<Planned, String>, ToolError> {
     let path = &change.path;
     let unreadable = |source| ToolError::Read {
         path: path.clone(),
@@ -102,10 +173,12 @@ pub async fn plan(
     if protected.iter().any(|folder| real.starts_with(folder)) {
         return Err(ToolError::OwnData(path.clone()));
     }
-    if files::is_secret(&real) {
+    let real = plain(real);
+    // A secret file by its name, or one Kelpy wrote a secret into.
+    let secret_file = files::is_secret(&real) || held.contains(&real);
+    if secret_file && matches!(change.edit, Edit::Replace { .. }) {
         return Err(ToolError::Secret(path.clone()));
     }
-    let real = plain(real);
     let before = if exists {
         Some(read(&real).await?)
     } else {
@@ -113,12 +186,13 @@ pub async fn plan(
     };
     // A file with Windows line ends keeps them: what the model wrote is given the same.
     let crlf = before.as_deref().is_some_and(|text| text.contains("\r\n"));
-    let ends = |text: &str| {
-        if crlf && !text.contains('\r') {
+    let ends = |text: &str| -> Result<String, ToolError> {
+        let (text, _) = secrets.fill(text)?;
+        Ok(if crlf && !text.contains('\r') {
             text.replace('\n', "\r\n")
         } else {
-            text.to_owned()
-        }
+            text
+        })
     };
     let after = match (&change.edit, &before) {
         (Edit::Replace { .. }, None) => {
@@ -128,7 +202,7 @@ pub async fn plan(
             )));
         }
         (Edit::Replace { old, new }, Some(before)) => {
-            let (old, new) = (ends(old), ends(new));
+            let (old, new) = (ends(old)?, ends(new)?);
             match before.matches(old.as_str()).count() {
                 1 => before.replacen(old.as_str(), &new, 1),
                 0 => {
@@ -145,11 +219,11 @@ pub async fn plan(
                 }
             }
         }
-        (Edit::Write(content), _) => ends(content),
+        (Edit::Write(content), _) => ends(content)?,
     };
     if before.as_deref() == Some(after.as_str()) {
-        return Err(invalid(format!(
-            "{} already holds this content: there is nothing to change",
+        return Ok(Err(format!(
+            "{} already holds this content: nothing to change.",
             path.display()
         )));
     }
@@ -164,18 +238,29 @@ pub async fn plan(
             }
         }
     }
-    Ok(Planned {
-        diff: diff(&real, before.as_deref().unwrap_or_default(), &after),
+    // The diff shows secrets by their names, and nothing of a secret file before the change.
+    let shown_before = match &before {
+        Some(_) if secret_file => String::new(),
+        Some(before) => secrets.redact(before),
+        None => String::new(),
+    };
+    Ok(Ok(Planned {
+        diff: diff(&real, &shown_before, &secrets.redact(&after)),
         check: check(os, &real).filter(|check| installed(&check.program)),
         floor: floor(os, &real),
+        secret: secret_file || secrets.holds_any(&after),
         real,
         before,
         after,
-    })
+    }))
 }
 
-/// Makes a planned change, writing what it does to `output`; the previous version goes to `backups`.
-pub async fn apply(planned: &Planned, backups: &Path, output: &Output) -> Result<(), ToolError> {
+/// Makes a planned change, writing what it does to `output`; the previous version goes to `backups`. Returns where.
+pub async fn apply(
+    planned: &Planned,
+    backups: &Path,
+    output: &Output,
+) -> Result<Option<PathBuf>, ToolError> {
     let real = &planned.real;
     let now = match tokio::fs::symlink_metadata(real).await {
         Ok(_) => Some(read(real).await?),
@@ -185,7 +270,10 @@ pub async fn apply(planned: &Planned, backups: &Path, output: &Output) -> Result
         return Err(ToolError::ChangedMeanwhile(real.clone()));
     }
     let checked_before = match &planned.check {
-        Some(check) => Some(run_check(check).await?),
+        Some(check) => {
+            output.set_phase("checking the file before the change");
+            Some(run_check(check).await?)
+        }
         None => None,
     };
     if let (Some(check), Some((passed, text))) = (&planned.check, &checked_before) {
@@ -198,19 +286,25 @@ pub async fn apply(planned: &Planned, backups: &Path, output: &Output) -> Result
             )
         });
     }
-    if let Some(before) = &planned.before {
-        let backup = backup(backups, real, before)
-            .await
-            .map_err(|source| ToolError::Write {
-                path: backups.to_owned(),
-                source,
-            })?;
-        output.line(&format!("Backed up to {}.", backup.display()));
-    }
+    let saved = match &planned.before {
+        Some(before) => {
+            output.set_phase("backing up the file");
+            let saved = backup(backups, real, before)
+                .await
+                .map_err(|source| ToolError::Write {
+                    path: backups.to_owned(),
+                    source,
+                })?;
+            output.line(&format!("Backed up to {}.", saved.display()));
+            Some(saved)
+        }
+        None => None,
+    };
     let written = |source| ToolError::Write {
         path: real.clone(),
         source,
     };
+    output.set_phase("writing the file");
     write(real, &planned.after).await.map_err(written)?;
     if read(real).await? != planned.after {
         // Something else wrote it meanwhile.
@@ -222,12 +316,13 @@ pub async fn apply(planned: &Planned, backups: &Path, output: &Output) -> Result
         real.display()
     ));
     let Some(check) = &planned.check else {
-        return Ok(());
+        return Ok(saved);
     };
+    output.set_phase("checking the file after the change");
     let (passed, text) = run_check(check).await?;
     if passed {
         output.line(&format!("After the change, `{}` passed.", check.display));
-        return Ok(());
+        return Ok(saved);
     }
     output.line(&format!(
         "After the change, `{}` failed:\n{text}",
@@ -235,8 +330,9 @@ pub async fn apply(planned: &Planned, backups: &Path, output: &Output) -> Result
     ));
     if checked_before.is_some_and(|(passed, before)| !passed && before == text) {
         output.line("It failed in the same way before: the change is kept.");
-        return Ok(());
+        return Ok(saved);
     }
+    output.set_phase("putting the previous version back");
     match &planned.before {
         Some(before) => write(real, before).await.map_err(written)?,
         None => tokio::fs::remove_file(real).await.map_err(written)?,
@@ -363,7 +459,7 @@ async fn backup(backups: &Path, real: &Path, content: &str) -> io::Result<PathBu
 }
 
 /// `path` without Windows' `\\?\` prefix, which `canonicalize` adds: shown as the administrator would type it.
-fn plain(path: PathBuf) -> PathBuf {
+pub(crate) fn plain(path: PathBuf) -> PathBuf {
     let text = path.to_string_lossy();
     match text.strip_prefix(r"\\?\") {
         Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
@@ -374,7 +470,7 @@ fn plain(path: PathBuf) -> PathBuf {
 /// Runs a file's check: whether it passed, and what it said.
 async fn run_check(check: &Command) -> Result<(bool, String), ToolError> {
     let said = Output::new();
-    let code = run_local(check, None, Some(RUN_TIME), true, &said).await?;
+    let code = run_local(check, None, Some(RUN_TIME), true, None, &said).await?;
     Ok((code == 0, said.snapshot().1.trim().to_owned()))
 }
 
@@ -422,7 +518,7 @@ fn is_json(path: &Path) -> bool {
 
 /// Why a change of the file at `path` waits for approval in every Approval mode: a mistake there could lock the
 /// administrator out or keep the system from starting.
-fn floor(os: Os, path: &Path) -> Option<String> {
+pub(crate) fn floor(os: Os, path: &Path) -> Option<String> {
     let what = if os == Os::Windows {
         // As written on disk, like `path`: the variable may differ in case, as `C:\WINDOWS`.
         let system = std::env::var_os("SystemRoot").map(PathBuf::from)?;
@@ -465,8 +561,9 @@ fn floor(os: Os, path: &Path) -> Option<String> {
     ))
 }
 
-/// The change from `before` to `after` as a unified diff, at most [`MAX_DIFF`]. Line ends are shown alike.
-fn diff(path: &Path, before: &str, after: &str) -> String {
+/// The change from `before` to `after` of the file at `path` as a unified diff, at most 64 KiB. Line ends are shown
+/// alike.
+pub fn diff(path: &Path, before: &str, after: &str) -> String {
     let (before, after) = (before.replace("\r\n", "\n"), after.replace("\r\n", "\n"));
     let name = path.to_string_lossy();
     let mut text = TextDiff::from_lines(&before, &after)
@@ -527,7 +624,13 @@ mod tests {
     }
 
     async fn planned(change: &FileChange) -> Result<Planned, ToolError> {
-        plan(change, Os::current(), &[], |_| true).await
+        planned_with(change, &Secrets::new()).await
+    }
+
+    async fn planned_with(change: &FileChange, secrets: &Secrets) -> Result<Planned, ToolError> {
+        plan(change, Os::current(), &[], secrets, &[], |_| true)
+            .await?
+            .map_err(ToolError::Invalid)
     }
 
     /// A check that fails while the file at `path` holds "broken".
@@ -579,10 +682,20 @@ mod tests {
         );
 
         let output = Output::new();
-        apply(&planned, backups.path(), &output).await.unwrap();
+        let backup = apply(&planned, backups.path(), &output).await.unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), planned.after);
         let saved: Vec<_> = fs::read_dir(backups.path()).unwrap().flatten().collect();
         assert_eq!(saved.len(), 1);
+        assert_eq!(backup, Some(saved[0].path()));
+        assert_eq!(output.phase().as_deref(), Some("writing the file"));
+        // What Kelpy expects to find from now on.
+        let recorded = planned.recorded();
+        assert_eq!(
+            recorded.state,
+            observe(&path).await.unwrap().state,
+            "{recorded:?}"
+        );
+        assert_eq!(recorded.content.as_deref(), Some(planned.after.as_str()));
         assert_eq!(
             fs::read_to_string(saved[0].path()).unwrap(),
             "listen 80;\r\nroot /var/www;\r\n"
@@ -677,13 +790,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let env = dir.path().join(".env");
         assert!(matches!(
-            planned(&write_all(&env, "A=1")).await,
+            planned(&replace(&env, "A=1", "A=2")).await,
             Err(ToolError::Secret(_))
         ));
         let own = plan(
             &write_all(&dir.path().join("notes.md"), "x"),
             Os::current(),
             &[fs::canonicalize(dir.path()).unwrap()],
+            &Secrets::new(),
+            &[],
             |_| true,
         )
         .await;
@@ -696,6 +811,77 @@ mod tests {
         // Already invalid before: the change is not refused for it.
         fs::write(&json, "{").unwrap();
         assert!(planned(&write_all(&json, "{ ")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn secrets_are_written_never_shown_and_a_secret_file_only_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("wp-config.php");
+        fs::write(&config, "<?php define('DB_PASSWORD', 'old-secret');\n").unwrap();
+        let secrets = Secrets::new();
+        secrets.generate("wp_db").unwrap();
+        let (value, _) = secrets.fill("{{secret:wp_db}}").unwrap();
+
+        let written = planned_with(
+            &write_all(
+                &config,
+                "<?php define('DB_PASSWORD', '{{secret:wp_db}}');\n",
+            ),
+            &secrets,
+        )
+        .await
+        .unwrap();
+        assert!(written.after.contains(&value));
+        assert!(written.secret);
+        assert!(
+            written.diff.contains("{{secret:wp_db}}"),
+            "{}",
+            written.diff
+        );
+        // Neither the new value nor the old content.
+        assert!(!written.diff.contains(&value));
+        assert!(!written.diff.contains("old-secret"));
+        assert_eq!(written.recorded().content, None);
+        assert!(
+            written
+                .notes()
+                .iter()
+                .any(|note| note.contains("may hold secrets"))
+        );
+
+        // Written again with the same secret: nothing to change.
+        fs::write(&config, &written.after).unwrap();
+        let again = plan(
+            &write_all(
+                &config,
+                "<?php define('DB_PASSWORD', '{{secret:wp_db}}');\n",
+            ),
+            Os::current(),
+            &[],
+            &secrets,
+            &[],
+            |_| true,
+        )
+        .await
+        .unwrap();
+        assert!(again.unwrap_err().contains("nothing to change"));
+        // A secret that does not exist.
+        let missing = planned(&write_all(&dir.path().join("a.conf"), "{{secret:nope}}"))
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("generate_secret"));
+    }
+
+    #[test]
+    fn a_plan_shows_the_lines_replaced_and_the_start_of_a_new_file() {
+        let edit = Edit::Replace {
+            old: "listen 80;".into(),
+            new: "listen 8080;".into(),
+        };
+        assert_eq!(preview(&edit), "-listen 80;\n+listen 8080;");
+        let long = Edit::Write("x\n".repeat(50));
+        let shown = preview(&long);
+        assert!(shown.ends_with("[… 10 more lines …]"), "{shown}");
     }
 
     #[test]

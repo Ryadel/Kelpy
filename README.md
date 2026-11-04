@@ -147,12 +147,16 @@ asks: *System access* None, Read-only (the default) or Full, and *Approval mode*
 With Read-only, Kelpy looks before it answers: services, installed software, listening ports, disks, processes,
 logs, files. Each look is an action shown in the answer with its exact command and its reason, and with Ask it
 waits for *Approve* or *Deny*. These commands are fixed by Kelpy and only read; files that may hold secrets are
-never read. With Full, Kelpy changes a file by showing the change as a diff, backing the file up, and checking it
-where it can (such as `nginx -t`): a change that breaks the check is undone at once. For anything else, Kelpy writes
-a command (PowerShell or bash), shown verbatim and always approved first, in every mode; it runs as the account that
-started Kelpy, with no time limit, and *Stop* on its card ends it. The *Command log*, opened from the top bar, lists every action of the conversation
-with its exit code, duration and output. What Kelpy reads is sent to the AI service. The
-[wiki](https://github.com/Ryadel/Kelpy/wiki/System-access) lists what Kelpy can look at.
+never read. With Full, Kelpy changes files, services, packages (apt) and MariaDB or MySQL databases through
+operations it understands: the card shows the change first (a diff, what apt would install, the service's state),
+files are backed up, and the result is checked, with what can be put back put back when the check fails. A change
+already made is not made again. Passwords are secrets Kelpy generates and the AI model never sees. With Plan, Kelpy
+proposes the changes as one plan, approved once. For anything else, Kelpy writes a command (PowerShell or bash),
+shown verbatim and approved first. The *Command log*, opened from the top bar, lists every action of the
+conversation; there *Restore* puts a file back from its backup, and *Report* gives the handover report. Kelpy
+notices when something it changed was changed outside it, shows the difference and never reverts it by itself. What
+Kelpy reads is sent to the AI service. The [wiki](https://github.com/Ryadel/Kelpy/wiki/System-access) has the
+details.
 
 ## Building from source
 

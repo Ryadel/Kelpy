@@ -6,12 +6,14 @@
 //! system, as each conversation's [`Access`] allows; its actions wait for the administrator's decision
 //! ([`Agent::decide`]) when its [`Approval`] mode asks for one.
 //!
-//! The agent puts together three parts with one job each: [`providers`] chooses the provider, [`turns`] runs the
-//! turns of the conversations, fitting each to the model's window with [`context`], and [`Storage`] serves the
-//! database. The agent itself only passes requests on, and publishes what changed to the interfaces' [`Events`].
+//! The agent puts together four parts with one job each: [`providers`] chooses the provider, [`turns`] runs the
+//! turns of the conversations, fitting each to the model's window with [`context`], [`server`] keeps what Kelpy left
+//! on the server and runs the administrator's own operations, and [`Storage`] serves the database. The agent itself
+//! only passes requests on, and publishes what changed to the interfaces' [`Events`].
 
 mod context;
 mod providers;
+mod server;
 mod turns;
 
 use std::future::Future;
@@ -34,6 +36,8 @@ use providers::Providers;
 pub use providers::{
     KeySource, KindInfo, ModelChoice, ModelList, ModelQuery, Needed, ProviderInfo, ProviderUpdate,
 };
+use server::Server;
+pub use server::{DifferenceView, Operated};
 use turns::Turns;
 pub use turns::{AnswerEvents, ChatEvent};
 
@@ -75,6 +79,7 @@ pub struct Agent {
     store: Storage,
     providers: Providers,
     turns: Arc<Turns>,
+    server: Arc<Server>,
     /// Where the work in the background runs, answers and downloads: [`Agent::close`] waits for it.
     tasks: TaskTracker,
     events: Events,
@@ -93,29 +98,98 @@ impl Agent {
         let tasks = TaskTracker::new();
         let events = Events::new();
         let store = Storage::start(store)?;
+        let backups = home.data_dir().join("backups");
+        // Kelpy's own data holds credentials and every conversation: never read or changed for the model.
+        let executor =
+            Executor::local(vec![home.data_dir()], backups.clone()).with_memory(home.memory_dir());
         let providers = Providers::new(
             client.clone(),
             ChatGpt::new(home, client.clone(), chatgpt, events.clone()),
-            Arc::new(Ollama::new(client.clone(), tasks.clone())),
+            Arc::new(Ollama::new(client.clone(), tasks.clone(), executor.clone())),
             home.config_path(),
             provider,
         );
+        let server = Arc::new(Server::new(
+            store.clone(),
+            executor.clone(),
+            events.clone(),
+            backups,
+            home.memory_dir(),
+        ));
         let turns = Turns::new(
             store.clone(),
             client,
             tasks.clone(),
             events.clone(),
             home.memory_dir().join("MEMORY.md"),
-            // Kelpy's own data holds credentials and every conversation: never read or changed for the model.
-            Executor::local(vec![home.data_dir()], home.data_dir().join("backups")),
+            executor,
+            Arc::clone(&server),
         );
         Ok(Self {
             store,
             providers,
             turns: Arc::new(turns),
+            server,
             tasks,
             events,
         })
+    }
+
+    /// Checks what Kelpy left on the server against what is there now, as when Kelpy starts: the differences found
+    /// are shown and told to the model, never reverted.
+    pub async fn check_server(&self) -> Result<(), AgentError> {
+        self.server.check(true).await
+    }
+
+    /// The differences found between what Kelpy left on the server and what is there, not settled yet.
+    pub async fn differences(&self) -> Result<Vec<DifferenceView>, AgentError> {
+        self.server.differences().await
+    }
+
+    /// Accepts a difference: what was found is expected from now on.
+    pub async fn accept_difference(&self, id: i64) -> Result<(), AgentError> {
+        self.server.accept(id).await
+    }
+
+    /// Puts back a file as Kelpy last wrote it, in place of the difference `id`, as an operation of the
+    /// administrator in the conversation `session_id`; only shown if `preview`.
+    pub async fn put_back(
+        &self,
+        session_id: i64,
+        id: i64,
+        preview: bool,
+    ) -> Result<Operated, AgentError> {
+        self.server.put_back(session_id, id, preview).await
+    }
+
+    /// Puts a file back as it was before the change of an action, from its backup, as an operation of the
+    /// administrator; only shown if `preview`. The administrator's own request: it does not depend on the
+    /// conversation's System access or Approval mode, which govern what the model does.
+    pub async fn restore(
+        &self,
+        session_id: i64,
+        action_id: i64,
+        preview: bool,
+    ) -> Result<Operated, AgentError> {
+        self.server.restore(session_id, action_id, preview).await
+    }
+
+    /// The operations the administrator asked for in a conversation, oldest first.
+    pub async fn administrator_actions(&self, session_id: i64) -> Result<Vec<Action>, AgentError> {
+        Ok(self
+            .store
+            .call(move |store| store.administrator_actions(session_id))
+            .await?)
+    }
+
+    /// The handover report of a conversation, in Markdown.
+    pub async fn report(&self, session_id: i64) -> Result<String, AgentError> {
+        self.server.report(session_id).await
+    }
+
+    /// The operations of a conversation that succeeded, with their arguments and checks, as JSON.
+    pub async fn export(&self, session_id: i64) -> Result<serde_json::Value, AgentError> {
+        self.server.export(session_id).await
     }
 
     /// The changes from now on, until Kelpy stops: conversations, answers, the provider.
@@ -285,6 +359,7 @@ impl Agent {
         self.store
             .call(move |store| store.delete_session(id))
             .await?;
+        self.server.forget(id);
         self.events.publish(Event::SessionDeleted { id });
         Ok(())
     }
@@ -894,7 +969,7 @@ mod tests {
     async fn until(answer: &mut AnswerEvents, state: ActionState) -> Action {
         loop {
             match answer.next().await {
-                Some(ChatEvent::Action { action }) if action.state == state => return action,
+                Some(ChatEvent::Action { action }) if action.state == state => return *action,
                 Some(_) => {}
                 None => panic!("the answer ended without a {state:?} action"),
             }
@@ -1030,7 +1105,7 @@ mod tests {
         let actions: Vec<&Action> = events
             .iter()
             .filter_map(|event| match event {
-                ChatEvent::Action { action } => Some(action),
+                ChatEvent::Action { action } => Some(action.as_ref()),
                 _ => None,
             })
             .collect();
@@ -2073,5 +2148,396 @@ mod tests {
                 .map(|message| (message.content.as_str(), message.status)),
             Some(("Hello", Status::Complete))
         );
+    }
+
+    /// The actions of `events`, in order.
+    fn actions_of(events: &[ChatEvent]) -> Vec<Action> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::Action { action } => Some(action.as_ref().clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn full(approval: Approval) -> Modes {
+        Modes {
+            access: Access::Full,
+            approval,
+            ..Modes::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plan_approved_once_lets_its_steps_run_and_a_change_outside_it_ask() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (site, other) = (
+            folder.path().join("site.conf"),
+            folder.path().join("other.conf"),
+        );
+        let write = json!({ "path": site, "content": "listen 80;\n" });
+        let server = model("Done.").await;
+        let plan = json!({
+            "reason": "To set up the site",
+            "goal": "Set up the site",
+            "steps": [{ "tool": "write_file", "arguments": write }],
+        });
+        let mut step = write.clone();
+        step["reason"] = json!("The site's configuration");
+        for queued in [
+            calling("propose_plan", &plan),
+            calling("write_file", &step),
+            calling(
+                "write_file",
+                &json!({ "reason": "Also this", "path": other, "content": "x\n" }),
+            ),
+            // The same step again: carried out already, so it asks.
+            calling("write_file", &step),
+        ] {
+            server.respond_once(CHAT, "200 OK", queued);
+        }
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let session = agent
+            .create_session(None, full(Approval::Plan))
+            .await
+            .unwrap();
+
+        let mut answer = agent.send(session.id, "Set it up", ()).await.unwrap();
+        let proposed = until(&mut answer, ActionState::Waiting).await;
+        assert_eq!(proposed.tool, "propose_plan");
+        let shown = proposed.plan.as_ref().unwrap();
+        assert_eq!(shown.goal, "Set up the site");
+        assert_eq!(shown.steps[0].summary, format!("Write {}", site.display()));
+        assert_eq!(shown.steps[0].detail.as_deref(), Some("+listen 80;"));
+        agent
+            .decide(session.id, proposed.id, true, None)
+            .await
+            .unwrap();
+        // The step runs without asking.
+        let written = until(&mut answer, ActionState::Done).await;
+        assert_eq!(written.tool, "propose_plan");
+        let written = until(&mut answer, ActionState::Done).await;
+        assert_eq!(written.plan_step.unwrap().plan_id, proposed.id);
+        assert_eq!(fs::read_to_string(&site).unwrap(), "listen 80;\n");
+        // Outside the plan: it asks, and says why.
+        let outside = until(&mut answer, ActionState::Waiting).await;
+        assert!(
+            outside
+                .change
+                .as_ref()
+                .unwrap()
+                .notes
+                .iter()
+                .any(|note| note.starts_with("Not in the plan approved"))
+        );
+        agent
+            .decide(session.id, outside.id, false, None)
+            .await
+            .unwrap();
+        // The step again: the system is as asked already, so it ends without running.
+        let again = until(&mut answer, ActionState::Done).await;
+        assert!(
+            again.output.contains("nothing to change"),
+            "{}",
+            again.output
+        );
+        assert_eq!(again.plan_step, None);
+        collect(answer).await;
+        // propose_plan is offered in Plan only.
+        assert!(chat_requests(&server)[0].contains("\"propose_plan\""));
+    }
+
+    #[tokio::test]
+    async fn a_secret_is_written_where_it_goes_and_never_reaches_the_model() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let config = folder.path().join("wp-config.php");
+        let server = model("Configured.").await;
+        for queued in [
+            calling(
+                "generate_secret",
+                &json!({ "reason": "Database password", "name": "wp_db" }),
+            ),
+            calling(
+                "write_file",
+                &json!({
+                    "reason": "WordPress's configuration",
+                    "path": config,
+                    "content": "<?php define('DB_PASSWORD', '{{secret:wp_db}}');\n",
+                }),
+            ),
+            calling(
+                "edit_file",
+                &json!({ "reason": "x", "path": config, "old": "DB_", "new": "X_" }),
+            ),
+        ] {
+            server.respond_once(CHAT, "200 OK", queued);
+        }
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let session = agent
+            .create_session(None, full(Approval::Auto))
+            .await
+            .unwrap();
+        let events = collect(agent.send(session.id, "Configure", ()).await.unwrap()).await;
+        let actions = actions_of(&events);
+        let written = fs::read_to_string(&config).unwrap();
+        let value = &written["<?php define('DB_PASSWORD', '".len()..written.len() - "');\n".len()];
+        assert_eq!(value.len(), 32);
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.state != ActionState::Waiting)
+        );
+        // A secret file is written whole, never edited.
+        let edit = actions.last().unwrap();
+        assert_eq!(edit.state, ActionState::Failed);
+        assert!(edit.error.as_deref().unwrap().contains("may hold secrets"));
+        let stored = serde_json::to_string(&agent.messages(session.id).await.unwrap()).unwrap();
+        assert!(!stored.contains(value));
+        for request in chat_requests(&server) {
+            assert!(!request.contains(value));
+        }
+        // The report says where it went, not what it is.
+        let report = agent.report(session.id).await.unwrap();
+        assert!(
+            report.contains("- wp_db: in ") && report.contains("wp-config.php\n"),
+            "{report}"
+        );
+        assert!(!report.contains(value));
+    }
+
+    #[tokio::test]
+    async fn a_change_is_restored_from_the_command_log_and_the_model_is_told() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let path = folder.path().join("app.ini");
+        fs::write(&path, "debug = true\n").unwrap();
+        let server = model("Done.").await;
+        let edit = json!({ "reason": "Off", "path": path, "old": "true", "new": "false" });
+        server.respond_once(CHAT, "200 OK", calling("edit_file", &edit));
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let session = agent
+            .create_session(None, full(Approval::Auto))
+            .await
+            .unwrap();
+        let events = collect(agent.send(session.id, "Turn it off", ()).await.unwrap()).await;
+        let edited = actions_of(&events).pop().unwrap();
+        assert!(edited.change.as_ref().unwrap().backup.is_some());
+
+        let Operated::Preview { change, .. } =
+            agent.restore(session.id, edited.id, true).await.unwrap()
+        else {
+            panic!("not a preview");
+        };
+        assert!(
+            change.diff.contains("-debug = false\n+debug = true"),
+            "{}",
+            change.diff
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "debug = false\n");
+        let mut events = agent.subscribe();
+        let Operated::Done { action } = agent.restore(session.id, edited.id, false).await.unwrap()
+        else {
+            panic!("not done");
+        };
+        assert_eq!(action.state, ActionState::Done, "{:?}", action.error);
+        assert_eq!(action.message_id, None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "debug = true\n");
+        // The version it replaced was backed up too.
+        assert!(action.change.as_ref().unwrap().backup.is_some());
+        assert!(matches!(
+            events.next().await,
+            Some(Event::ActionChanged { .. })
+        ));
+        assert_eq!(
+            agent.administrator_actions(session.id).await.unwrap(),
+            [*action]
+        );
+        // Told to the model with the next message.
+        collect(agent.send(session.id, "Is it on?", ()).await.unwrap()).await;
+        let last = chat_requests(&server).pop().unwrap();
+        assert!(
+            last.contains("the administrator did this through Kelpy:\\n- Put back"),
+            "{last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_change_made_outside_kelpy_is_found_shown_told_and_accepted() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let path = folder.path().join("site.conf");
+        let server = model("Noted.").await;
+        let write = json!({ "reason": "Site", "path": path, "content": "listen 80;\n" });
+        server.respond_once(CHAT, "200 OK", calling("write_file", &write));
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let session = agent
+            .create_session(None, full(Approval::Auto))
+            .await
+            .unwrap();
+        collect(agent.send(session.id, "Write it", ()).await.unwrap()).await;
+        agent.check_server().await.unwrap();
+        assert!(agent.differences().await.unwrap().is_empty());
+
+        fs::write(&path, "listen 8080;\n").unwrap();
+        agent.check_server().await.unwrap();
+        let differences = agent.differences().await.unwrap();
+        assert_eq!(differences.len(), 1);
+        let diff = differences[0].diff.as_deref().unwrap();
+        assert!(diff.contains("-listen 80;\n+listen 8080;"), "{diff}");
+        assert!(differences[0].can_put_back);
+        // Checked again: noted once.
+        agent.check_server().await.unwrap();
+        assert_eq!(agent.differences().await.unwrap()[0].id, differences[0].id);
+
+        collect(agent.send(session.id, "Anything new?", ()).await.unwrap()).await;
+        let last = chat_requests(&server).pop().unwrap();
+        assert!(last.contains("Changes made outside Kelpy"), "{last}");
+        assert!(last.contains("+listen 8080;"));
+
+        // Put back as Kelpy wrote it, then changed again and accepted.
+        let Operated::Done { action } = agent
+            .put_back(session.id, differences[0].id, false)
+            .await
+            .unwrap()
+        else {
+            panic!("not done");
+        };
+        assert_eq!(action.state, ActionState::Done, "{:?}", action.error);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "listen 80;\n");
+        assert!(agent.differences().await.unwrap().is_empty());
+        fs::write(&path, "listen 81;\n").unwrap();
+        agent.check_server().await.unwrap();
+        let id = agent.differences().await.unwrap()[0].id;
+        agent.accept_difference(id).await.unwrap();
+        agent.check_server().await.unwrap();
+        assert!(agent.differences().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_export_lists_the_operations_that_succeeded_with_their_arguments() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let path = folder.path().join("motd");
+        let server = model("Done.").await;
+        let write = json!({ "reason": "Greeting", "path": path, "content": "Hello\n" });
+        server.respond_once(CHAT, "200 OK", calling("write_file", &write));
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let session = agent
+            .create_session(None, full(Approval::Auto))
+            .await
+            .unwrap();
+        collect(agent.send(session.id, "Greet", ()).await.unwrap()).await;
+        let export = agent.export(session.id).await.unwrap();
+        let operations = export["operations"].as_array().unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0]["tool"], "write_file");
+        assert_eq!(operations[0]["arguments"]["content"], "Hello\n");
+        assert_eq!(operations[0]["arguments"].get("reason"), None);
+        assert!(export["note"].as_str().unwrap().contains("Not repeatable"));
+    }
+
+    #[tokio::test]
+    async fn facts_are_remembered_and_kelpys_own_page_lists_its_changes() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let path = folder.path().join("site.conf");
+        let server = model("Noted.").await;
+        for queued in [
+            calling(
+                "write_file",
+                &json!({ "reason": "Site", "path": path, "content": "listen 80;\n" }),
+            ),
+            calling(
+                "remember",
+                &json!({ "reason": "For next time", "page": "web", "note": "The site is served by nginx." }),
+            ),
+            calling(
+                "read_memory",
+                &json!({ "reason": "What changed?", "page": "server" }),
+            ),
+        ] {
+            server.respond_once(CHAT, "200 OK", queued);
+        }
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let session = agent
+            .create_session(None, full(Approval::Auto))
+            .await
+            .unwrap();
+        collect(agent.send(session.id, "Set it up", ()).await.unwrap()).await;
+        let actions = agent.messages(session.id).await.unwrap()[1].actions.clone();
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.state == ActionState::Done),
+            "{actions:?}"
+        );
+        let memory = dir.path().join("memory");
+        let web = fs::read_to_string(memory.join("web.md")).unwrap();
+        assert!(
+            web.starts_with("# Web\n\n- 20") && web.ends_with(": The site is served by nginx.\n"),
+            "{web}"
+        );
+        assert!(
+            fs::read_to_string(memory.join("MEMORY.md"))
+                .unwrap()
+                .contains("- [Web](web.md)")
+        );
+        // Kelpy's page lists the file it wrote, and the model read it.
+        let page = fs::read_to_string(memory.join("server.md")).unwrap();
+        assert!(
+            page.contains("## Files") && page.contains("site.conf (since "),
+            "{page}"
+        );
+        assert!(actions.last().unwrap().output.contains("## Files"));
+        // The index goes to the model with each answer, with how to use the memory.
+        let first = chat_requests(&server).remove(0);
+        assert!(first.contains("read_memory") && first.contains("The user's memory index"));
+
+        // Edited outside Kelpy: a difference, and the page is not written over it.
+        fs::write(memory.join("server.md"), "# Mine\n").unwrap();
+        agent.check_server().await.unwrap();
+        let differences = agent.differences().await.unwrap();
+        assert!(
+            differences
+                .iter()
+                .any(|difference| difference.subject.ends_with("server.md")),
+            "{differences:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(memory.join("server.md")).unwrap(),
+            "# Mine\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_kelpy_wrote_a_secret_into_is_kept_from_the_model() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let config = folder.path().join("app.yml");
+        let server = model("Done.").await;
+        for queued in [
+            calling(
+                "generate_secret",
+                &json!({ "reason": "Password", "name": "app_db" }),
+            ),
+            calling(
+                "write_file",
+                &json!({ "reason": "Configuration", "path": config, "content": "password: {{secret:app_db}}\n" }),
+            ),
+            calling("read_file", &json!({ "reason": "Check", "path": config })),
+        ] {
+            server.respond_once(CHAT, "200 OK", queued);
+        }
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let session = agent
+            .create_session(None, full(Approval::Auto))
+            .await
+            .unwrap();
+        collect(agent.send(session.id, "Configure", ()).await.unwrap()).await;
+        let actions = agent.messages(session.id).await.unwrap()[1].actions.clone();
+        let read = actions.last().unwrap();
+        assert_eq!(read.state, ActionState::Failed, "{read:?}");
+        assert!(read.error.as_deref().unwrap().contains("may hold secrets"));
+        let written = fs::read_to_string(&config).unwrap();
+        assert!(!written.contains("{{secret"));
+        for request in chat_requests(&server) {
+            assert!(!request.contains(written.trim_start_matches("password: ").trim()));
+        }
     }
 }

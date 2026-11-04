@@ -9,12 +9,14 @@
   import ActionCard from './ActionCard.svelte';
   import CommandLog from './CommandLog.svelte';
   import Composer from './Composer.svelte';
+  import Differences from './Differences.svelte';
   import Markdown from './Markdown.svelte';
+  import PlanCard from './PlanCard.svelte';
   import Waiting from './Waiting.svelte';
   import Welcome from './Welcome.svelte';
   import { connection, usable } from './connection.svelte';
   import { loadDraft, saveDraft } from './drafts';
-  import { pending, segments } from './actions';
+  import { commandLog, mergeOperations, pending, segments, stepStates } from './actions';
   import { copyText } from './clipboard';
   import { hasCallouts } from './explanations';
   import { advance, settled } from './reveal';
@@ -25,6 +27,7 @@
     stopAction,
     describe,
     fetchConversation,
+    fetchDifferences,
     followAnswer,
     sendMessage,
     setModes,
@@ -33,6 +36,7 @@
     type AnswerEvent,
     type Approval,
     type ChatEvent,
+    type Difference,
     type Message,
     type Modes,
     type Session,
@@ -54,6 +58,10 @@
   let { session, start, onStarted, onChanged, onOpenProvider, log, onCloseLog }: Props = $props();
 
   let messages = $state<Message[]>([]);
+  /** The operations the administrator asked for in this conversation, such as putting a file back. */
+  let administrator = $state<Action[]>([]);
+  /** What Kelpy changed on the server and was changed outside it since, not settled yet. */
+  let differences = $state<Difference[]>([]);
   /** The last message summarised for the model, if the older messages are. */
   let summarisedThrough = $state<number | null>(null);
   let loaded = $state(false);
@@ -92,8 +100,8 @@
   /** Before its first message a conversation shows the welcome, with the message box in the middle. */
   const empty = $derived(loaded && messages.length === 0 && !running);
 
-  /** Every action of the conversation, in order: the Command log. */
-  const actions = $derived(messages.flatMap((message) => message.actions));
+  /** Every action of the conversation, the answers' and the administrator's, in order: the Command log. */
+  const actions = $derived(commandLog(messages, administrator));
   /** An action waits for the administrator's decision. */
   const waitingApproval = $derived(actions.some((action) => action.state === 'waiting'));
 
@@ -117,6 +125,7 @@
   $effect(() => {
     const id = sessionId;
     messages = [];
+    administrator = [];
     summarisedThrough = null;
     endings = {};
     error = null;
@@ -154,9 +163,11 @@
         return;
       }
       messages = conversation.messages;
+      administrator = mergeOperations(conversation.administrator_actions, administrator);
       summarisedThrough = conversation.summarised_through;
       running = conversation.running;
       loaded = true;
+      void refreshDifferences();
       if (start !== null && messages.length === 0 && !running) {
         // Sent in the same step as `loaded`, so the welcome never shows in between.
         draft = start;
@@ -207,6 +218,28 @@
       follow(id).catch(report);
     } else {
       apply({ ...event, type: 'done' });
+    }
+  }
+
+  /** An operation of the administrator in some conversation started or ended: one in this conversation is shown. */
+  export function receiveAction(action: Action) {
+    if (action.session_id !== session.id) {
+      return;
+    }
+    const index = administrator.findIndex((other) => other.id === action.id);
+    if (index >= 0) {
+      administrator[index] = action;
+    } else {
+      administrator.push(action);
+    }
+  }
+
+  /** Reads again the changes made outside Kelpy. */
+  export async function refreshDifferences() {
+    try {
+      differences = await fetchDifferences();
+    } catch {
+      // The conversation stays usable; the next change or check reads them again.
     }
   }
 
@@ -505,6 +538,12 @@
 
 <div class="flex min-h-0 flex-1">
   <div class="flex min-w-0 flex-1 flex-col">
+    <Differences
+      {differences}
+      sessionId={session.id}
+      onOperated={receiveAction}
+      onChanged={(changed) => (differences = changed)}
+    />
     {#if empty}
       <Welcome onSuggest={suggest}>{@render messageBox()}</Welcome>
     {:else}
@@ -533,12 +572,21 @@
                     <Markdown text={segment.text} explanationsOpen={!closedExplanations[message.id]} />
                   {:else}
                     {#each segment.actions as action (action.id)}
-                      <ActionCard
-                        {action}
-                        canDecide={usable() && message.status === 'streaming'}
-                        onDecide={(decision, switchTo) => decide(action, decision, switchTo)}
-                        onStop={() => stopOne(action)}
-                      />
+                      {#if action.plan}
+                        <PlanCard
+                          {action}
+                          steps={stepStates(action, actions)}
+                          canDecide={usable() && message.status === 'streaming'}
+                          onDecide={(decision) => decide(action, decision)}
+                        />
+                      {:else}
+                        <ActionCard
+                          {action}
+                          canDecide={usable() && message.status === 'streaming'}
+                          onDecide={(decision, switchTo) => decide(action, decision, switchTo)}
+                          onStop={() => stopOne(action)}
+                        />
+                      {/if}
                     {/each}
                   {/if}
                 {/each}
@@ -595,6 +643,12 @@
     {/if}
   </div>
   {#if log}
-    <CommandLog {actions} onClose={onCloseLog} />
+    <CommandLog
+      {actions}
+      sessionId={session.id}
+      title={session.title}
+      onOperated={receiveAction}
+      onClose={onCloseLog}
+    />
   {/if}
 </div>

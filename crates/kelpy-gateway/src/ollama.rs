@@ -4,8 +4,10 @@
 //! |---|---|
 //! | `GET /api/ollama?base_url=…` | whether Ollama answers, its models, the models suggested for this computer, downloads |
 //! | `POST /api/ollama/download` | downloads a model, or follows its download; the progress streams back as SSE |
+//! | `POST /api/ollama/install` | installs Ollama on this computer: `preview` shows the command; the output streams back as SSE |
 //!
-//! A download goes on when its stream closes; asking again for the same model follows it from where it is.
+//! A download goes on when its stream closes; asking again for the same model follows it from where it is. So does
+//! the installation.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -18,8 +20,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream;
 use kelpy_core::agent::Agent;
-use kelpy_core::ollama::Download;
-use serde::Deserialize;
+use kelpy_core::ollama::{Download, InstallError, Installation};
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::Activity;
@@ -35,6 +37,44 @@ pub fn routes() -> Router<OllamaState> {
     Router::new()
         .route("/api/ollama", get(status))
         .route("/api/ollama/download", post(download))
+        .route("/api/ollama/install", post(install))
+}
+
+#[derive(Deserialize, Default)]
+struct InstallRequest {
+    #[serde(default)]
+    preview: bool,
+}
+
+/// With `preview`, the installer to approve; else the installation's progress, as SSE.
+async fn install(State(state): State<OllamaState>, body: axum::body::Bytes) -> Response {
+    let request: InstallRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        InstallRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(parse) => return error(StatusCode::BAD_REQUEST, "invalid", parse.to_string()),
+        }
+    };
+    let ollama = state.agent.ollama();
+    let refused = |failure: InstallError| match failure {
+        InstallError::Unsupported(why) => error(StatusCode::CONFLICT, "unsupported", why),
+        InstallError::Stopping => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stopping",
+            failure.to_string(),
+        ),
+    };
+    if request.preview {
+        return match ollama.installer() {
+            Ok(installer) => Json(installer).into_response(),
+            Err(failure) => refused(failure),
+        };
+    }
+    match ollama.install(state.activity.busy()) {
+        Ok(progress) => stream(progress, |installation: &Installation| installation.done),
+        Err(failure) => refused(failure),
+    }
 }
 
 #[derive(Deserialize)]
@@ -76,7 +116,7 @@ async fn download(
         state.activity.busy(),
     );
     match download {
-        Ok(progress) => stream_progress(progress),
+        Ok(progress) => stream(progress, |download: &Download| download.done),
         Err(stopping) => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "stopping",
@@ -85,11 +125,14 @@ async fn download(
     }
 }
 
-/// Sends the download's state at once, then its latest state at every change, and ends after the final one.
-fn stream_progress(progress: watch::Receiver<Download>) -> Response {
+/// Sends the state at once, then its latest state at every change, and ends after the final one, `done`.
+fn stream<T>(progress: watch::Receiver<T>, done: fn(&T) -> bool) -> Response
+where
+    T: Clone + Serialize + Send + Sync + 'static,
+{
     let events = stream::unfold(
         (progress, true, false),
-        |(mut progress, first, ended)| async move {
+        move |(mut progress, first, ended)| async move {
             // A closed channel cannot come before the final state, but it ends the stream too.
             if ended || (!first && progress.changed().await.is_err()) {
                 return None;
@@ -97,7 +140,7 @@ fn stream_progress(progress: watch::Receiver<Download>) -> Response {
             let current = progress.borrow_and_update().clone();
             let data = serde_json::to_string(&current).unwrap_or_default();
             let event = Ok::<_, Infallible>(Event::default().data(data));
-            Some((event, (progress, false, current.done)))
+            Some((event, (progress, false, done(&current))))
         },
     );
     Sse::new(events)

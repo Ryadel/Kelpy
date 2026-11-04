@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 use kelpy_common::lock;
 use kelpy_providers::{ChatRequest, Outcome, Provider, Settings, StopReason, ToolSpec};
 use kelpy_storage::{
-    Access, Action, Message, Modes, PartialSave, Session, Status, Storage, Summary,
+    Access, Action, Approval, Message, Modes, PartialSave, Session, Status, Storage, Summary,
 };
-use kelpy_tools::{Account, Executor, Tools};
+use kelpy_tools::{Account, Executor, ToolKind, Tools};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
@@ -33,6 +33,7 @@ use tokio_util::task::TaskTracker;
 
 use super::AgentError;
 use super::context::{self, Budget};
+use super::server::Server;
 use crate::events::{Event, Events};
 use actions::{Question, chat_messages};
 use fitting::{WindowKey, window_key};
@@ -71,15 +72,31 @@ not ask for it again unless they say so: go on with what you know. If something 
 
 /// What the model is told about acting on the system with System access Full.
 pub(super) const CHANGING: &str = "You can look at this system and change it with the tools provided. Prefer the \
-built-in tools to look, as they only read. Change files with `edit_file` and `write_file`: Kelpy shows the change \
-as a diff, backs the file up and checks it, so do not back files up yourself. `run_command` runs the commands you \
-write, to look further or for changes no other tool makes; the administrator approves each one after reading it and \
-its `reason`. Never use a command to read files that may hold secrets. Look before you answer or change anything \
-rather than guessing. Before a change, say what will change, what could go wrong and how to undo it. Keep each \
-command to one change, so that each is approved on its own, and check afterwards that it worked. Say plainly before asking for \
-anything risky or irreversible: deleting data, firewall, SSH or network changes that could lock the administrator \
-out, reboots and outages. Prefer the distribution's own packages and tools. If the administrator denies an action, \
-do not ask for it again unless they say so: go on with what you know. If something is unclear, ask.";
+built-in tools to look, as they only read. Make changes with the typed tools: `edit_file` and `write_file` for files, \
+`manage_service` for services, `install_packages` and `remove_packages` for packages, `create_database` for MariaDB \
+or MySQL. Kelpy shows each change before it is approved, backs files up, checks the result and puts back what it can \
+when the check fails, and does nothing when the system is already as asked: do not back files up yourself, nor \
+repeat the checks it reports. Where a password or a key goes, create it with `generate_secret` and write \
+{{secret:name}} there: you never see its value, so never ask for it nor write one yourself. `run_command` runs the \
+commands you write, to look further or for changes no other tool makes; the administrator approves each one after \
+reading it and its `reason`. Never use a command to read files that may hold secrets. Look before you answer or \
+change anything rather than guessing. Before a change, say what will change, what could go wrong and how to undo \
+it. Keep each command to one change, so that each is approved on its own, and check afterwards that it worked. Say \
+plainly before asking for anything risky or irreversible: deleting data, firewall, SSH or network changes that \
+could lock the administrator out, reboots and outages. An action whose outcome is uncertain may have been done in \
+part: look before doing it again. Prefer the distribution's own packages and tools. If the administrator denies an \
+action, do not ask for it again unless they say so: go on with what you know. If something is unclear, ask.";
+
+/// How the model uses Kelpy's memory, after [`LOOKING`] or [`CHANGING`].
+pub(super) const MEMORY_TOOLS: &str = "Kelpy's memory of this server is in memory/: read a page with `read_memory` \
+(`server` lists what Kelpy changed here and what was changed outside it), and note lasting facts with `remember`, \
+one a call, never a secret.";
+
+/// What the model is told besides [`CHANGING`] in the Approval mode Plan.
+pub(super) const PLANNING: &str = "The Approval mode is Plan: when a task needs changes, look first at what you \
+need, then propose them all with `propose_plan`, each step as the exact call you will make. Once the administrator \
+approves the plan, make the calls with the same arguments: they run without asking again. A change outside the plan \
+asks on its own. Keep to the plan; when it must change, say why and propose a new one.";
 
 /// What the model is told when it cannot look at the system, after saying why.
 pub(super) const NOT_LOOKING: &str = "When something must be done or checked on the server, give the exact commands \
@@ -128,7 +145,7 @@ pub enum ChatEvent {
     /// More text of the answer.
     Delta { text: String },
     /// An action of the answer, new or changed: waiting for approval, running, ended.
-    Action { action: Action },
+    Action { action: Box<Action> },
     /// The answer is over, as stored, with the reason if it did not complete.
     Done {
         message: Message,
@@ -211,7 +228,9 @@ impl AnswerEvents {
                     } else {
                         self.seen.push(action.clone());
                     }
-                    return Some(ChatEvent::Action { action });
+                    return Some(ChatEvent::Action {
+                        action: Box::new(action),
+                    });
                 }
                 if state.message.status != Status::Streaming {
                     self.done = true;
@@ -250,6 +269,8 @@ pub(super) struct Turns {
     /// The tools the model may call, and where they run.
     tools: Tools,
     executor: Executor,
+    /// What Kelpy left on the server, and the secrets of each conversation.
+    server: Arc<Server>,
     /// Under one lock: starting an answer never interleaves with deleting its conversation or stopping Kelpy.
     pub(super) answers: Mutex<Answers>,
     /// The context windows learned while Kelpy runs.
@@ -321,7 +342,8 @@ impl Turns {
     }
 
     /// Turns stored in `store`, answered through `client`, run in `tasks` and published to `events`, with the memory
-    /// index at `memory_index`. The model looks at the system through `executor`.
+    /// index at `memory_index`. The model looks at the system through `executor`; what its changes leave is recorded
+    /// by `server`.
     pub(super) fn new(
         store: Storage,
         client: Provider,
@@ -329,6 +351,7 @@ impl Turns {
         events: Events,
         memory_index: PathBuf,
         executor: Executor,
+        server: Arc<Server>,
     ) -> Self {
         Self {
             store,
@@ -338,6 +361,7 @@ impl Turns {
             memory_index,
             tools: Tools::new(executor.os()),
             executor,
+            server,
             answers: Mutex::new(Answers::default()),
             windows: Mutex::new(HashMap::new()),
             tool_support: Mutex::new(HashMap::new()),
@@ -451,6 +475,7 @@ impl Turns {
                     settings,
                     turn.session,
                     turn.history,
+                    turn.administrator,
                     turn.summary,
                     &answer,
                     stop,
@@ -499,12 +524,15 @@ impl Turns {
     /// Writes the answer to the conversation `history`, whose older part `summary` may already summarise, in steps
     /// (see the module's description). Each step follows the conversation's `session` modes as they are then: the
     /// administrator may change them meanwhile. The answer as it is so far joins `history` for each step, in place of
-    /// the previous step's copy: the rest is never copied again.
+    /// the previous step's copy: the rest is never copied again. The operations the `administrator` asked for are
+    /// told to the model with the messages that follow them.
+    #[allow(clippy::too_many_arguments)]
     async fn write_answer(
         &self,
         settings: Settings,
         mut session: Session,
         mut history: Vec<Message>,
+        administrator: Vec<Action>,
         mut summary: Option<Summary>,
         answer: &watch::Sender<AnswerState>,
         stop: CancellationToken,
@@ -524,12 +552,22 @@ impl Turns {
         let mut budget = Budget::new(window, context::correction(&history, &settings.model));
         let asked = history.len();
         let memory = self.memory().await;
-        // Every tool with System access Full; without the ones that change the system otherwise.
-        let (changing, reading): (Vec<_>, Vec<_>) =
-            self.tools.list().into_iter().partition(|tool| tool.changes);
-        let specs = |tools: Vec<kelpy_tools::Tool>| -> Vec<ToolSpec> {
-            tools
+        // What changed on the server outside Kelpy, checked again if it was not lately.
+        if session.access != Access::None {
+            let _ = self.server.check(false).await;
+        }
+        let differences = if session.access == Access::None {
+            None
+        } else {
+            self.server.notes().await
+        };
+        // The tools that look with System access Read-only; with Full also those that change, and propose_plan in
+        // the Approval mode Plan.
+        let specs = |kind: ToolKind| -> Vec<ToolSpec> {
+            self.tools
+                .list()
                 .into_iter()
+                .filter(|tool| tool.kind == kind)
                 .map(|tool| ToolSpec {
                     name: tool.name.to_owned(),
                     description: tool.description,
@@ -537,8 +575,9 @@ impl Turns {
                 })
                 .collect()
         };
-        let reading = specs(reading);
-        let every = [reading.clone(), specs(changing)].concat();
+        let reading = specs(ToolKind::Looks);
+        let every = [reading.clone(), specs(ToolKind::Changes)].concat();
+        let planning = [every.clone(), specs(ToolKind::Plans)].concat();
         let size = |tools: &[ToolSpec]| {
             tools
                 .iter()
@@ -572,9 +611,10 @@ impl Turns {
             } else {
                 Looking::Yes
             };
-            let offered: &[ToolSpec] = match (looking, session.access) {
-                (Looking::Yes, Access::Full) => &every,
-                (Looking::Yes, _) => &reading,
+            let offered: &[ToolSpec] = match (looking, session.access, session.approval) {
+                (Looking::Yes, Access::Full, Approval::Plan) => &planning,
+                (Looking::Yes, Access::Full, _) => &every,
+                (Looking::Yes, _, _) => &reading,
                 _ => &[],
             };
             let modes = Modes {
@@ -582,8 +622,12 @@ impl Turns {
                 access: session.access,
                 approval: session.approval,
             };
-            let instructions =
+            let mut instructions =
                 instructions(modes, looking, self.executor.account(), memory.as_deref());
+            if let Some(differences) = differences.as_deref() {
+                instructions.push_str("\n\n");
+                instructions.push_str(differences);
+            }
             history.truncate(asked);
             let current = answer.borrow().message.clone();
             if !current.content.is_empty() || !current.actions.is_empty() {
@@ -596,7 +640,7 @@ impl Turns {
                 () = stop.cancelled() => break (End::Stopped, 0),
                 fitted = self.fit(&settings, &instructions, reserved, &mut summary, &history, budget) => fitted,
             };
-            let messages = chat_messages(fitted.messages, id, &replays);
+            let messages = chat_messages(fitted.messages, id, &replays, &administrator);
             let request = ChatRequest {
                 system: &fitted.system,
                 messages: &messages,
@@ -734,8 +778,12 @@ impl Turns {
         });
     }
 
-    /// The memory index, at most [`MAX_MEMORY_INDEX`] bytes of it, if there is one. Read once for each answer.
+    /// The memory index, at most [`MAX_MEMORY_INDEX`] bytes of it, if there is one. Read once for each answer. An
+    /// index other accounts could change is not read: the model is told why.
     pub(super) async fn memory(&self) -> Option<String> {
+        if let Err(untrusted) = kelpy_tools::memory::trusted(&self.memory_index).await {
+            return Some(format!("(Not read: {untrusted}. Tell the administrator.)"));
+        }
         let file = tokio::fs::File::open(&self.memory_index).await.ok()?;
         let mut bytes = Vec::new();
         file.take(MAX_MEMORY_INDEX as u64)
@@ -760,12 +808,13 @@ pub(super) fn instructions(
     account: &Account,
     memory: Option<&str>,
 ) -> String {
-    let acting = match modes.access {
-        Access::Full => CHANGING,
-        Access::ReadOnly | Access::None => LOOKING,
+    let acting = match (modes.access, modes.approval) {
+        (Access::Full, Approval::Plan) => format!("{CHANGING} {PLANNING} {MEMORY_TOOLS}"),
+        (Access::Full, _) => format!("{CHANGING} {MEMORY_TOOLS}"),
+        (Access::ReadOnly | Access::None, _) => format!("{LOOKING} {MEMORY_TOOLS}"),
     };
     let access = match looking {
-        Looking::Yes => acting.to_owned(),
+        Looking::Yes => acting,
         Looking::Exhausted => format!(
             "{acting} You have used the tools as many times as one answer allows: answer now with what you found \
              and did, and say what is still to do."

@@ -36,12 +36,17 @@ export interface Session extends Modes {
   revision: number;
 }
 
-export type ActionState = 'waiting' | 'running' | 'done' | 'failed' | 'denied';
+export type ActionState = 'waiting' | 'running' | 'done' | 'failed' | 'denied' | 'uncertain';
 
-/** What an answer did on the system, or asked to: an entry of the Command log. */
+/**
+ * What Kelpy did on the system, or was asked to: an entry of the Command log. A call of the model in an answer, or
+ * an operation the administrator asked for, such as putting a file back.
+ */
 export interface Action {
   id: number;
-  message_id: number;
+  session_id: number;
+  /** The answer whose model called it; null for an operation the administrator asked for. */
+  message_id: number | null;
   /** The model's step in the answer: the actions of one step were asked for together. */
   step: number;
   /** Where in the answer's text it was asked for, in UTF-8 bytes. */
@@ -63,16 +68,61 @@ export interface Action {
   started_at: number | null;
   /** The change it makes to the system; null for an action that does not change it. */
   change: Change | null;
+  /** What a change is doing while it runs, such as "writing the file". */
+  phase: string | null;
+  /** The plan it proposes, for a plan. */
+  plan: Plan | null;
+  /** The plan, and the step of it, this action carries out. */
+  plan_step: { plan_id: number; step: number } | null;
 }
 
 /** A change to the system, as its card shows it before it runs. */
 export interface Change {
-  /** What changes, such as a file's unified diff. */
+  /** What changes: a file's unified diff, the packages installed (+) and removed (-), a service's state. */
   diff: string;
   /** What Kelpy checks and how the change is undone, one line each. */
   notes: string[];
   /** Why it waits for approval in every Approval mode, if it does. */
   floor: string | null;
+  /** The file it changes. */
+  path?: string;
+  /** Where the version of the file before the change was saved, once it ran. */
+  backup?: string;
+}
+
+/** Changes the model proposes, approved together. */
+export interface Plan {
+  goal: string;
+  steps: PlanStep[];
+}
+
+export interface PlanStep {
+  tool: string;
+  summary: string;
+  /** The commands it runs, or the lines of the file it changes. */
+  detail: string | null;
+  /** Why it would ask outside the plan: approved with it, and marked. */
+  floor: string | null;
+}
+
+/** What an operation of the administrator would do, or did. */
+export type Operated =
+  | { outcome: 'preview'; summary: string; change: Change }
+  | { outcome: 'done'; action: Action };
+
+/** A difference between what Kelpy left on the server and what is there: changed outside Kelpy. */
+export interface Difference {
+  id: number;
+  kind: 'file' | 'service' | 'package';
+  subject: string;
+  expected: string;
+  found: string;
+  /** For a file whose content may be shown, what changed. */
+  diff: string | null;
+  found_at: number;
+  recorded_at: number;
+  /** Kelpy kept the file's content, and can put it back. */
+  can_put_back: boolean;
 }
 
 export type MessageStatus = 'complete' | 'streaming' | 'interrupted' | 'failed' | 'refused';
@@ -91,6 +141,8 @@ export interface Message {
 
 export interface Conversation {
   messages: Message[];
+  /** The operations the administrator asked for: in the Command log, not in answers. */
+  administrator_actions: Action[];
   /** An answer is being written: it keeps going on the server even with no page open. */
   running: boolean;
   /** The last message summarised for the model: the model reads a summary of it and those before. */
@@ -274,6 +326,10 @@ export type RuntimeEvent =
   | { type: 'session_changed'; session: Session }
   | { type: 'session_deleted'; id: number }
   | AnswerEvent
+  /** An operation the administrator asked for started or ended. */
+  | { type: 'action_changed'; session_id: number; action: Action }
+  /** Changes made outside Kelpy were found or settled: read them again. */
+  | { type: 'differences_changed' }
   /** The provider, or what it needs to answer, changed: read it again. */
   | { type: 'provider_changed' }
   /** Some events were missed: read again everything shown. */
@@ -486,6 +542,37 @@ export const fetchOllama = (baseUrl: string) =>
  * Downloads a model into Ollama, or follows its download, calling `onProgress` as it goes. Resolves when the download
  * ends. Aborting `signal` only stops following: the download goes on.
  */
+/** How Ollama would be installed on this computer, to approve. */
+export interface OllamaInstaller {
+  command: string;
+  notes: string[];
+}
+
+/** An installation's progress: the installer's output so far. */
+export interface OllamaInstallation {
+  command: string;
+  output: string;
+  done: boolean;
+  error: string | null;
+}
+
+export const fetchOllamaInstaller = () =>
+  json<OllamaInstaller>('/api/ollama/install', { method: 'POST', body: JSON.stringify({ preview: true }) });
+
+/** Installs Ollama, or follows the installation under way, until it ends. */
+export async function installOllama(
+  onProgress: (installation: OllamaInstallation) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await request('/api/ollama/install', {
+    method: 'POST',
+    body: '{}',
+    headers: { Accept: 'text/event-stream' },
+    signal,
+  });
+  await readEvents(response, onProgress);
+}
+
 export async function downloadModel(
   baseUrl: string,
   model: string,
@@ -538,6 +625,40 @@ export async function decideAction(
 /** Stops an action running. The answer goes on, and the model is told that the administrator stopped it. */
 export async function stopAction(sessionId: number, actionId: number): Promise<void> {
   await request(`/api/sessions/${sessionId}/actions/${actionId}/stop`, { method: 'POST' });
+}
+
+/** Puts a file back from the backup of a change: with `preview`, only shows what would change. */
+export const restoreAction = (sessionId: number, actionId: number, preview: boolean) =>
+  json<Operated>(`/api/sessions/${sessionId}/actions/${actionId}/restore`, {
+    method: 'POST',
+    body: JSON.stringify({ preview }),
+  });
+
+export const fetchDifferences = () => json<Difference[]>('/api/differences');
+
+/** Checks the server now for changes made outside Kelpy. */
+export const checkDifferences = () => json<Difference[]>('/api/differences/check', { method: 'POST' });
+
+/** Keeps what was found: it is expected from now on. */
+export async function acceptDifference(id: number): Promise<void> {
+  await request(`/api/differences/${id}/accept`, { method: 'POST' });
+}
+
+/** Puts Kelpy's version of a file back, as an operation in the conversation: with `preview`, only shows it. */
+export const putBack = (sessionId: number, id: number, preview: boolean) =>
+  json<Operated>(`/api/sessions/${sessionId}/differences/${id}/put-back`, {
+    method: 'POST',
+    body: JSON.stringify({ preview }),
+  });
+
+/** The handover report of a conversation, in Markdown. */
+export async function fetchReport(id: number): Promise<string> {
+  return (await request(`/api/sessions/${id}/report`)).text();
+}
+
+/** The operations of a conversation that succeeded, as JSON text. */
+export async function fetchExport(id: number): Promise<string> {
+  return JSON.stringify(await json<unknown>(`/api/sessions/${id}/export`), null, 2);
 }
 
 export async function deleteSession(id: number): Promise<void> {

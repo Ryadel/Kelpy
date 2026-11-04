@@ -152,6 +152,13 @@ pub async fn run_foreground(home: &Home, open_browser: bool, limits: Limits) -> 
         config.provider.clone(),
         Endpoints::default(),
     )?);
+    // What Kelpy left on the server, checked against what is there: the differences wait in the Web UI.
+    tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move {
+            let _ = agent.check_server().await;
+        }
+    });
 
     let last_port_path = home.data_dir().join(LAST_PORT_FILE);
     let last_port = fs::read_to_string(&last_port_path)

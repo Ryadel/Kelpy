@@ -28,3 +28,8 @@ export function groupByDate<T extends { updated_at: number }>(items: T[], now: D
   }
   return groups;
 }
+
+/** A Unix time, in seconds, as a short local date and time, such as `3 Nov 2026, 14:05`. */
+export function dateTime(seconds: number): string {
+  return new Date(seconds * 1000).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+}

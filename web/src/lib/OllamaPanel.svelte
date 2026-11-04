@@ -7,8 +7,12 @@
     describe,
     downloadModel,
     fetchOllama,
+    fetchOllamaInstaller,
     gigabytes,
+    installOllama,
     type Download,
+    type OllamaInstallation,
+    type OllamaInstaller,
     type OllamaStatus,
     type Service,
   } from './api';
@@ -104,6 +108,36 @@
     }
   }
 
+  /** How Ollama would be installed here, once asked; then its installation as it goes. */
+  let installer = $state<OllamaInstaller | null>(null);
+  let installation = $state<OllamaInstallation | null>(null);
+
+  async function offerInstall() {
+    error = null;
+    try {
+      installer = await fetchOllamaInstaller();
+    } catch (reason: unknown) {
+      error = describe(reason);
+    }
+  }
+
+  async function install() {
+    installation = { command: installer?.command ?? '', output: '', done: false, error: null };
+    try {
+      await installOllama((progress) => (installation = progress), following.signal);
+    } catch (reason: unknown) {
+      if (!following.signal.aborted && installation) {
+        installation = { ...installation, done: true, error: describe(reason) };
+      }
+      return;
+    }
+    if (!installation?.error) {
+      installer = null;
+      installation = null;
+      await check();
+    }
+  }
+
   onMount(() => void check());
   // Closing the dialog stops following; the downloads go on.
   onDestroy(() => following.abort());
@@ -133,11 +167,37 @@
     {:else if status.memory === null}
       No Ollama answers at {status.base_url}.
     {:else}
-      Ollama is not installed on this computer. Download it from
+      Ollama is not installed on this computer. Kelpy can install it, or download it from
       <a class="underline" href="https://ollama.com/download" target="_blank" rel="noreferrer">ollama.com/download</a>,
       or enter the address of a computer running it.
     {/if}
   </p>
+  {#if !status.installed && status.memory !== null}
+    {#if installation}
+      <div class="grid gap-1.5">
+        <p class="text-sm">
+          {#if !installation.done}Installing Ollama…{:else if installation.error}The installation did not complete: {installation.error}{/if}
+        </p>
+        <pre class="bg-muted max-h-48 overflow-auto rounded-lg px-3 py-2 font-mono text-xs">{installation.output || installation.command}</pre>
+      </div>
+    {:else if installer}
+      <div class="grid gap-1.5 rounded-lg border p-3">
+        <p class="text-sm font-medium">Kelpy will run:</p>
+        <pre class="bg-muted overflow-x-auto rounded-lg px-3 py-2 font-mono text-xs whitespace-pre-wrap">{installer.command}</pre>
+        <ul class="text-muted-foreground space-y-0.5 text-xs">
+          {#each installer.notes as note (note)}<li>{note}</li>{/each}
+        </ul>
+        <div class="flex gap-2">
+          <Button type="button" size="sm" onclick={() => void install()}>Install</Button>
+          <Button type="button" size="sm" variant="outline" onclick={() => (installer = null)}>Cancel</Button>
+        </div>
+      </div>
+    {:else}
+      <div>
+        <Button type="button" variant="outline" size="sm" onclick={() => void offerInstall()}>Install Ollama</Button>
+      </div>
+    {/if}
+  {/if}
 {:else}
   <fieldset class="grid gap-1">
     <legend class="mb-1 text-sm font-medium">Installed models</legend>

@@ -109,12 +109,76 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE actions ADD COLUMN change TEXT;",
     // 8: a number each change of a conversation raises, so that an older copy is never taken for a newer one.
     "ALTER TABLE sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;",
+    // 9: actions belong to their conversation, and those the administrator asks for to no answer; the phase of a
+    // change under way, the plan an action proposes and the plan step it carries out. What Kelpy changed and
+    // verified on the server, and the differences found since: kept when a conversation is deleted.
+    "
+    CREATE TABLE actions_new (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id    INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+        message_id    INTEGER REFERENCES messages (id) ON DELETE CASCADE,
+        step          INTEGER NOT NULL,
+        position      INTEGER NOT NULL,
+        call_id       TEXT    NOT NULL,
+        tool          TEXT    NOT NULL,
+        input         TEXT    NOT NULL,
+        reason        TEXT    NOT NULL,
+        summary       TEXT    NOT NULL,
+        command       TEXT,
+        state         TEXT    NOT NULL,
+        exit_code     INTEGER,
+        output        TEXT    NOT NULL DEFAULT '',
+        error         TEXT,
+        created_at    INTEGER NOT NULL,
+        duration_ms   INTEGER,
+        started_at    INTEGER,
+        change        TEXT,
+        after_message INTEGER,
+        phase         TEXT,
+        plan          TEXT,
+        plan_id       INTEGER,
+        plan_step     INTEGER
+    );
+    INSERT INTO actions_new (id, session_id, message_id, step, position, call_id, tool, input, reason, summary,
+                             command, state, exit_code, output, error, created_at, duration_ms, started_at, change)
+        SELECT actions.id, messages.session_id, message_id, step, position, call_id, tool, input, reason, summary,
+               command, state, exit_code, output, error, actions.created_at, duration_ms, started_at, change
+        FROM actions JOIN messages ON messages.id = actions.message_id;
+    DELETE FROM sqlite_sequence WHERE name = 'actions_new';
+    INSERT INTO sqlite_sequence (name, seq) SELECT 'actions_new', seq FROM sqlite_sequence WHERE name = 'actions';
+    DROP TABLE actions;
+    ALTER TABLE actions_new RENAME TO actions;
+    CREATE INDEX actions_by_message ON actions (message_id, id);
+    CREATE INDEX actions_by_session ON actions (session_id, id);
+    CREATE TABLE records (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind        TEXT    NOT NULL,
+        subject     TEXT    NOT NULL,
+        expected    TEXT    NOT NULL,
+        content     TEXT,
+        secret      INTEGER NOT NULL DEFAULT 0,
+        action_id   INTEGER REFERENCES actions (id) ON DELETE SET NULL,
+        recorded_at INTEGER NOT NULL,
+        UNIQUE (kind, subject)
+    );
+    CREATE TABLE differences (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        record_id  INTEGER NOT NULL REFERENCES records (id) ON DELETE CASCADE,
+        found      TEXT    NOT NULL,
+        content    TEXT,
+        found_at   INTEGER NOT NULL,
+        settled    TEXT,
+        settled_at INTEGER
+    );
+",
 ];
 
 const SESSION_COLUMNS: &str =
     "id, title, explanations, created_at, updated_at, access, approval, revision";
 const ACTION_COLUMNS: &str = "id, message_id, step, position, call_id, tool, input, reason, summary, command, state, \
-     exit_code, output, error, created_at, duration_ms, started_at, change";
+     exit_code, output, error, created_at, duration_ms, started_at, change, session_id, after_message, phase, plan, \
+     plan_id, plan_step";
+const RECORD_COLUMNS: &str = "id, kind, subject, expected, content, action_id, recorded_at, secret";
 const MESSAGE_COLUMNS: &str =
     "id, session_id, role, content, status, model, created_at, context_estimate, input_tokens";
 
@@ -130,6 +194,10 @@ pub enum StoreError {
     /// The message is gone, typically because its conversation was deleted.
     #[error("message {0} not found")]
     MessageNotFound(i64),
+    #[error("action {0} not found")]
+    ActionNotFound(i64),
+    #[error("difference {0} not found")]
+    DifferenceNotFound(i64),
     #[error("the database was created by a newer version of Kelpy (schema {0})")]
     TooNew(i64),
     #[error("cannot start the database thread: {0}")]
@@ -207,13 +275,22 @@ pub enum ActionState {
     Failed,
     /// The administrator refused it, or it was not allowed.
     Denied,
+    /// Kelpy stopped while it was changing the system: what it left is not known. Never run again by itself.
+    Uncertain,
 }
 
-/// What an answer did on the system, or asked to: a call of a tool by the model, as the Command log shows it.
+/// What Kelpy did on the system, or was asked to, as the Command log shows it: a call of a tool by the model in an
+/// answer, or an operation the administrator asked for, such as putting a file back as it was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Action {
     pub id: i64,
-    pub message_id: i64,
+    pub session_id: i64,
+    /// The answer whose model called it; `None` for an operation the administrator asked for.
+    pub message_id: Option<i64>,
+    /// For the administrator's operations, the last message of the conversation when it was asked for: the model is
+    /// told of it with the next message.
+    #[serde(skip)]
+    pub after_message: Option<i64>,
     /// The model's step in the answer, from 0: the calls of one step were asked for together.
     pub step: u32,
     /// Where in the answer's text the model asked for it, in bytes.
@@ -243,23 +320,66 @@ pub struct Action {
     pub started_at: Option<i64>,
     /// The change it makes to the system, for an action that changes something.
     pub change: Option<Change>,
+    /// What a change is doing while it runs, such as "writing the file": if Kelpy stops then, its outcome is
+    /// uncertain.
+    pub phase: Option<String>,
+    /// The plan it proposes, for a plan.
+    pub plan: Option<Plan>,
+    /// The plan, and the step of it, this action carries out.
+    pub plan_step: Option<PlanStepRef>,
 }
 
 /// A change to the system an action makes, as its card shows it before it runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
-    /// What changes, such as a file's unified diff.
+    /// What changes, such as a file's unified diff, or the packages a package manager would install.
     pub diff: String,
     /// What Kelpy checks and how the change is undone, one line each.
     pub notes: Vec<String>,
     /// Why it waits for approval in every Approval mode, if it does.
     pub floor: Option<String>,
+    /// The file it changes, links resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Where the version of the file before the change was saved, once it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<String>,
+}
+
+/// Changes the model proposes to make in order, approved together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Plan {
+    /// What the plan is for.
+    pub goal: String,
+    pub steps: Vec<PlanStep>,
+}
+
+/// A step of a plan: one call of a tool, with its arguments, as approved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub tool: String,
+    /// The arguments without the reason, as canonical JSON: a call carries out the step only with these.
+    pub input: String,
+    pub summary: String,
+    /// The commands it runs, or the file it changes.
+    pub detail: Option<String>,
+    /// Why it would ask outside a plan, if it would: approved with the plan, and marked.
+    pub floor: Option<String>,
+}
+
+/// A step of a plan: the plan's action, and the step's index in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PlanStepRef {
+    pub plan_id: i64,
+    pub step: u32,
 }
 
 /// An action about to be recorded.
 #[derive(Debug, Clone)]
 pub struct NewAction<'a> {
-    pub message_id: i64,
+    pub session_id: i64,
+    /// `None` for an operation the administrator asked for.
+    pub message_id: Option<i64>,
     pub step: u32,
     pub position: usize,
     pub call_id: &'a str,
@@ -269,8 +389,65 @@ pub struct NewAction<'a> {
     pub summary: &'a str,
     pub command: Option<&'a str>,
     pub change: Option<&'a Change>,
+    pub plan: Option<&'a Plan>,
+    pub plan_step: Option<PlanStepRef>,
     pub state: ActionState,
     pub error: Option<&'a str>,
+}
+
+/// What Kelpy found on the server after changing it, and expects to find again: a file's content, a service's
+/// state, a package's version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Record {
+    pub id: i64,
+    pub kind: RecordKind,
+    /// The file's path, the service's or the package's name.
+    pub subject: String,
+    /// What is expected: a file's digest, a service's state such as `active, enabled`, a package's version or
+    /// `absent`.
+    pub expected: String,
+    /// A file's content, when it may be shown: not for files that may hold secrets, nor for large ones.
+    #[serde(skip)]
+    pub content: Option<String>,
+    /// The action that made the change, while its conversation exists.
+    pub action_id: Option<i64>,
+    pub recorded_at: i64,
+    /// Whether the file holds a secret Kelpy wrote: never read for the model nor shown.
+    pub secret: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordKind {
+    File,
+    Service,
+    Package,
+}
+
+/// A difference between a record and what Kelpy found later: a change made outside Kelpy, shown and explained,
+/// never reverted by itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Difference {
+    pub id: i64,
+    pub record: Record,
+    /// What was found, in the record's terms; `missing` for a file gone.
+    pub found: String,
+    /// A file's content as found, when it may be shown.
+    #[serde(skip)]
+    pub content: Option<String>,
+    pub found_at: i64,
+}
+
+/// How the administrator settled a difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Settled {
+    /// What was found is kept, and expected from now on.
+    Accepted,
+    /// Kelpy's version was put back.
+    PutBack,
+    /// Kelpy changed it again, which replaced the record.
+    Replaced,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -346,6 +523,13 @@ impl Store {
         // Answers that were being written when the previous runtime stopped will never be completed.
         connection.execute(
             "UPDATE messages SET status = 'interrupted' WHERE status = 'streaming'",
+            [],
+        )?;
+        // A change stopped in a phase may have changed part of the system: never run again by itself.
+        connection.execute(
+            "UPDATE actions SET state = 'uncertain',
+                 error = 'Kelpy stopped while ' || phase || ': what it left is not known'
+             WHERE state = 'running' AND phase IS NOT NULL",
             [],
         )?;
         connection.execute(
@@ -438,18 +622,27 @@ impl Store {
         Ok(())
     }
 
-    /// Records an action of an answer.
+    /// Records an action of an answer, or of the administrator.
     pub fn insert_action(&self, action: &NewAction<'_>) -> Result<Action> {
         let now = unix_now();
         let started_at = (action.state == ActionState::Running).then_some(now);
-        let change = action
-            .change
-            .map(|change| serde_json::to_string(change).expect("a change serializes"));
+        let change = action.change.map(to_json);
+        let plan = action.plan.map(to_json);
+        let after_message: Option<i64> = match action.message_id {
+            Some(_) => None,
+            None => self.connection.query_row(
+                "SELECT MAX(id) FROM messages WHERE session_id = ?1",
+                [action.session_id],
+                |row| row.get(0),
+            )?,
+        };
         let inserted = self.connection.execute(
-            "INSERT INTO actions (message_id, step, position, call_id, tool, input, reason, summary, command, state,
-                                  error, created_at, started_at, change)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO actions (session_id, message_id, step, position, call_id, tool, input, reason, summary,
+                                  command, state, error, created_at, started_at, change, after_message, plan, plan_id,
+                                  plan_step)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
+                action.session_id,
                 action.message_id,
                 action.step,
                 count(action.position),
@@ -463,7 +656,11 @@ impl Store {
                 action.error,
                 now,
                 started_at,
-                change
+                change,
+                after_message,
+                plan,
+                action.plan_step.map(|step| step.plan_id),
+                action.plan_step.map(|step| step.step)
             ],
         );
         match inserted {
@@ -471,13 +668,18 @@ impl Store {
             Err(rusqlite::Error::SqliteFailure(error, _))
                 if error.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
-                return Err(StoreError::MessageNotFound(action.message_id));
+                return Err(match action.message_id {
+                    Some(id) => StoreError::MessageNotFound(id),
+                    None => StoreError::SessionNotFound(action.session_id),
+                });
             }
             inserted => inserted?,
         };
         Ok(Action {
             id: self.connection.last_insert_rowid(),
+            session_id: action.session_id,
             message_id: action.message_id,
+            after_message,
             step: action.step,
             position: action.position,
             call_id: action.call_id.to_owned(),
@@ -494,13 +696,17 @@ impl Store {
             duration_ms: None,
             started_at,
             change: action.change.cloned(),
+            phase: None,
+            plan: action.plan.cloned(),
+            plan_step: action.plan_step,
         })
     }
 
-    /// Saves where an action is: its state, exit code, output, error, start and duration.
+    /// Saves where an action is: its state, exit code, output, error, start, duration, phase and change.
     pub fn update_action(&self, action: &Action) -> Result<()> {
         let changed = self.connection.execute(
-            "UPDATE actions SET state = ?2, exit_code = ?3, output = ?4, error = ?5, duration_ms = ?6, started_at = ?7
+            "UPDATE actions SET state = ?2, exit_code = ?3, output = ?4, error = ?5, duration_ms = ?6, started_at = ?7,
+                 phase = ?8, change = ?9
              WHERE id = ?1",
             params![
                 action.id,
@@ -509,12 +715,207 @@ impl Store {
                 action.output,
                 action.error,
                 action.duration_ms.map(count),
-                action.started_at
+                action.started_at,
+                action.phase,
+                action.change.as_ref().map(to_json)
             ],
         )?;
         if changed == 0 {
-            return Err(StoreError::MessageNotFound(action.message_id));
+            return Err(match action.message_id {
+                Some(id) => StoreError::MessageNotFound(id),
+                None => StoreError::SessionNotFound(action.session_id),
+            });
         }
+        Ok(())
+    }
+
+    /// An action of a conversation.
+    pub fn action(&self, session_id: i64, id: i64) -> Result<Action> {
+        self.connection
+            .query_row(
+                &format!("SELECT {ACTION_COLUMNS} FROM actions WHERE session_id = ?1 AND id = ?2"),
+                [session_id, id],
+                action_from_row,
+            )
+            .optional()?
+            .ok_or(StoreError::ActionNotFound(id))
+    }
+
+    /// The operations the administrator asked for in a conversation, oldest first.
+    pub fn administrator_actions(&self, session_id: i64) -> Result<Vec<Action>> {
+        self.session(session_id)?;
+        query_administrator_actions(&self.connection, session_id)
+    }
+
+    /// The latest plan approved in a conversation, with the actions that carried out its steps, oldest first.
+    pub fn approved_plan(&self, session_id: i64) -> Result<Option<(Action, Vec<Action>)>> {
+        let plan = self
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT {ACTION_COLUMNS} FROM actions
+                     WHERE session_id = ?1 AND plan IS NOT NULL ORDER BY id DESC LIMIT 1"
+                ),
+                [session_id],
+                action_from_row,
+            )
+            .optional()?;
+        let Some(plan) = plan.filter(|plan| plan.state == ActionState::Done) else {
+            return Ok(None);
+        };
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {ACTION_COLUMNS} FROM actions WHERE plan_id = ?1 ORDER BY id"
+        ))?;
+        let steps = statement
+            .query_map([plan.id], action_from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(Some((plan, steps)))
+    }
+
+    /// Every action of a conversation that ran, oldest first: for its report.
+    pub fn actions(&self, session_id: i64) -> Result<Vec<Action>> {
+        self.session(session_id)?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {ACTION_COLUMNS} FROM actions WHERE session_id = ?1 ORDER BY id"
+        ))?;
+        let actions = statement
+            .query_map([session_id], action_from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(actions)
+    }
+
+    /// Records what Kelpy expects to find from now on, after a change it made and verified, in place of what it
+    /// expected before. The differences still open for it are settled: the new change replaced them.
+    pub fn record(
+        &mut self,
+        kind: RecordKind,
+        subject: &str,
+        expected: &str,
+        content: Option<&str>,
+        secret: bool,
+        action_id: Option<i64>,
+    ) -> Result<Record> {
+        let now = unix_now();
+        let transaction = self.connection.transaction()?;
+        // Once a file held a secret, it is kept from the model: a later change does not make it safe.
+        transaction.execute(
+            "INSERT INTO records (kind, subject, expected, content, secret, action_id, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (kind, subject) DO UPDATE SET
+                 expected = excluded.expected, content = excluded.content, secret = secret OR excluded.secret,
+                 action_id = excluded.action_id, recorded_at = excluded.recorded_at",
+            params![kind.as_str(), subject, expected, content, secret, action_id, now],
+        )?;
+        let record = transaction.query_row(
+            &format!("SELECT {RECORD_COLUMNS} FROM records WHERE kind = ?1 AND subject = ?2"),
+            params![kind.as_str(), subject],
+            record_from_row,
+        )?;
+        transaction.execute(
+            "UPDATE differences SET settled = 'replaced', settled_at = ?2 WHERE record_id = ?1 AND settled IS NULL",
+            params![record.id, now],
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    /// Everything Kelpy expects to find on the server, oldest first.
+    pub fn records(&self) -> Result<Vec<Record>> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("SELECT {RECORD_COLUMNS} FROM records ORDER BY id"))?;
+        let records = statement
+            .query_map([], record_from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(records)
+    }
+
+    /// Notes that a record's subject was `found` different, unless that difference is already open: the earlier
+    /// note keeps its time. A difference found otherwise replaces the open one. Returns whether it is new.
+    pub fn found_different(
+        &mut self,
+        record_id: i64,
+        found: &str,
+        content: Option<&str>,
+    ) -> Result<bool> {
+        let transaction = self.connection.transaction()?;
+        let open: Option<String> = transaction
+            .query_row(
+                "SELECT found FROM differences WHERE record_id = ?1 AND settled IS NULL",
+                [record_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if open.as_deref() == Some(found) {
+            return Ok(false);
+        }
+        transaction.execute(
+            "DELETE FROM differences WHERE record_id = ?1 AND settled IS NULL",
+            [record_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO differences (record_id, found, content, found_at) VALUES (?1, ?2, ?3, ?4)",
+            params![record_id, found, content, unix_now()],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Notes that a record's subject is again as expected: its open difference is gone with it.
+    pub fn found_as_expected(&self, record_id: i64) -> Result<bool> {
+        let removed = self.connection.execute(
+            "DELETE FROM differences WHERE record_id = ?1 AND settled IS NULL",
+            [record_id],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// The differences not settled yet, oldest first.
+    pub fn differences(&self) -> Result<Vec<Difference>> {
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT differences.id, found, differences.content, found_at, {} FROM differences
+             JOIN records ON records.id = differences.record_id
+             WHERE settled IS NULL ORDER BY differences.id",
+            RECORD_COLUMNS
+                .split(", ")
+                .map(|column| format!("records.{column}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))?;
+        let differences = statement
+            .query_map([], |row| {
+                Ok(Difference {
+                    id: row.get(0)?,
+                    found: row.get(1)?,
+                    content: row.get(2)?,
+                    found_at: row.get(3)?,
+                    record: record_at(row, 4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(differences)
+    }
+
+    /// Settles an open difference. Accepted, the record expects what was found from then on.
+    pub fn settle_difference(&mut self, id: i64, settled: Settled) -> Result<()> {
+        let now = unix_now();
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE differences SET settled = ?2, settled_at = ?3 WHERE id = ?1 AND settled IS NULL",
+            params![id, settled.as_str(), now],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::DifferenceNotFound(id));
+        }
+        if settled == Settled::Accepted {
+            transaction.execute(
+                "UPDATE records SET (expected, content, recorded_at) =
+                     (SELECT found, content, ?2 FROM differences WHERE id = ?1)
+                 WHERE id = (SELECT record_id FROM differences WHERE id = ?1)",
+                params![id, now],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -603,6 +1004,7 @@ impl Store {
             },
         )?;
         let history = query_messages(&transaction, session_id)?;
+        let administrator = query_administrator_actions(&transaction, session_id)?;
         let summary = query_summary(&transaction, session_id)?;
         let session = query_session(&transaction, session_id)?;
         let answer = insert_message(
@@ -620,6 +1022,7 @@ impl Store {
         Ok(Turn {
             user,
             history,
+            administrator,
             summary,
             answer,
             session,
@@ -785,6 +1188,8 @@ pub struct Turn {
     pub user: Message,
     /// The conversation up to and including the user's message.
     pub history: Vec<Message>,
+    /// The operations the administrator asked for in the conversation, oldest first.
+    pub administrator: Vec<Action>,
     /// The summary of the conversation's older messages, if it has one.
     pub summary: Option<Summary>,
     /// The empty answer, `streaming`.
@@ -844,12 +1249,24 @@ fn query_messages(connection: &Connection, session_id: i64) -> Result<Vec<Messag
     let mut actions: HashMap<i64, Vec<Action>> = HashMap::new();
     for action in statement.query_map([session_id], action_from_row)? {
         let action = action?;
-        actions.entry(action.message_id).or_default().push(action);
+        if let Some(message_id) = action.message_id {
+            actions.entry(message_id).or_default().push(action);
+        }
     }
     for message in &mut messages {
         message.actions = actions.remove(&message.id).unwrap_or_default();
     }
     Ok(messages)
+}
+
+fn query_administrator_actions(connection: &Connection, session_id: i64) -> Result<Vec<Action>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {ACTION_COLUMNS} FROM actions WHERE session_id = ?1 AND message_id IS NULL ORDER BY id"
+    ))?;
+    let actions = statement
+        .query_map([session_id], action_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(actions)
 }
 
 fn query_session(connection: &Connection, id: i64) -> Result<Session> {
@@ -913,7 +1330,9 @@ fn action_from_row(row: &Row<'_>) -> rusqlite::Result<Action> {
     let state: String = row.get(10)?;
     Ok(Action {
         id: row.get(0)?,
+        session_id: row.get(18)?,
         message_id: row.get(1)?,
+        after_message: row.get(19)?,
         step: row.get(2)?,
         position: usize::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
         call_id: row.get(4)?,
@@ -931,11 +1350,47 @@ fn action_from_row(row: &Row<'_>) -> rusqlite::Result<Action> {
             .get::<_, Option<i64>>(15)?
             .map(|duration| duration.unsigned_abs()),
         started_at: row.get(16)?,
-        change: row
-            .get::<_, Option<String>>(17)?
-            .map(|text| serde_json::from_str(&text).map_err(|_| invalid(17, &text)))
-            .transpose()?,
+        change: from_json(row, 17)?,
+        phase: row.get(20)?,
+        plan: from_json(row, 21)?,
+        plan_step: match (row.get(22)?, row.get(23)?) {
+            (Some(plan_id), Some(step)) => Some(PlanStepRef { plan_id, step }),
+            _ => None,
+        },
     })
+}
+
+fn record_from_row(row: &Row<'_>) -> rusqlite::Result<Record> {
+    record_at(row, 0)
+}
+
+/// The record whose columns, [`RECORD_COLUMNS`], start at `offset`.
+fn record_at(row: &Row<'_>, offset: usize) -> rusqlite::Result<Record> {
+    let kind: String = row.get(offset + 1)?;
+    Ok(Record {
+        id: row.get(offset)?,
+        kind: RecordKind::parse(&kind).ok_or_else(|| invalid(offset + 1, &kind))?,
+        subject: row.get(offset + 2)?,
+        expected: row.get(offset + 3)?,
+        content: row.get(offset + 4)?,
+        action_id: row.get(offset + 5)?,
+        recorded_at: row.get(offset + 6)?,
+        secret: row.get(offset + 7)?,
+    })
+}
+
+/// The JSON value in the column `index`, if any.
+fn from_json<T: serde::de::DeserializeOwned>(
+    row: &Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<T>> {
+    row.get::<_, Option<String>>(index)?
+        .map(|text| serde_json::from_str(&text).map_err(|_| invalid(index, &text)))
+        .transpose()
+}
+
+fn to_json(value: &impl Serialize) -> String {
+    serde_json::to_string(value).expect("a stored value serializes")
 }
 
 fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
@@ -1002,7 +1457,19 @@ stored_as!(ActionState {
     Done => "done",
     Failed => "failed",
     Denied => "denied",
+    Uncertain => "uncertain",
 });
+stored_as!(RecordKind { File => "file", Service => "service", Package => "package" });
+
+impl Settled {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::PutBack => "put_back",
+            Self::Replaced => "replaced",
+        }
+    }
+}
 
 stored_as!(Role { User => "user", Assistant => "assistant" });
 stored_as!(Status {
@@ -1086,9 +1553,12 @@ mod tests {
             .into(),
             notes: vec!["Backed up first.".into()],
             floor: None,
+            path: None,
+            backup: None,
         };
-        let new = |message_id, call_id, state| NewAction {
-            message_id,
+        let new = |session_id, message_id, call_id, state| NewAction {
+            session_id,
+            message_id: Some(message_id),
             step: 0,
             position: 4,
             call_id,
@@ -1098,6 +1568,8 @@ mod tests {
             summary: "Show the disk usage",
             command: Some("df -h"),
             change: Some(&change),
+            plan: None,
+            plan_step: None,
             state,
             error: None,
         };
@@ -1114,7 +1586,12 @@ mod tests {
                 .start_turn(session.id, "Disks?", "Disks?", "m")
                 .unwrap();
             let mut done = store
-                .insert_action(&new(turn.answer.id, "call_1", ActionState::Running))
+                .insert_action(&new(
+                    session.id,
+                    turn.answer.id,
+                    "call_1",
+                    ActionState::Running,
+                ))
                 .unwrap();
             // Recorded running: it started then.
             assert_eq!(done.started_at, Some(done.created_at));
@@ -1122,10 +1599,27 @@ mod tests {
             done.exit_code = Some(0);
             done.output = "/ 40% used".into();
             done.duration_ms = Some(120);
+            done.change.as_mut().unwrap().backup = Some("/home/kelpy/data/backups/1-a".into());
             store.update_action(&done).unwrap();
             store
-                .insert_action(&new(turn.answer.id, "call_2", ActionState::Waiting))
+                .insert_action(&new(
+                    session.id,
+                    turn.answer.id,
+                    "call_2",
+                    ActionState::Waiting,
+                ))
                 .unwrap();
+            // Stopped while writing: what it left is not known.
+            let mut writing = store
+                .insert_action(&new(
+                    session.id,
+                    turn.answer.id,
+                    "call_3",
+                    ActionState::Running,
+                ))
+                .unwrap();
+            writing.phase = Some("writing the file".into());
+            store.update_action(&writing).unwrap();
             assert_eq!(store.messages(session.id).unwrap()[1].actions[0], done);
             (session.id, turn.answer.id, done)
         };
@@ -1147,13 +1641,202 @@ mod tests {
             actions[1].error.as_deref(),
             Some("Kelpy stopped before it ended")
         );
+        assert_eq!(actions[2].state, ActionState::Uncertain);
+        assert_eq!(
+            actions[2].error.as_deref(),
+            Some("Kelpy stopped while writing the file: what it left is not known")
+        );
 
         // Gone with their conversation; none can be added to it afterwards.
         store.delete_session(session_id).unwrap();
         assert!(matches!(
-            store.insert_action(&new(answer_id, "call_3", ActionState::Running)),
+            store.insert_action(&new(session_id, answer_id, "call_4", ActionState::Running)),
             Err(StoreError::MessageNotFound(id)) if id == answer_id
         ));
+    }
+
+    fn new_action<'a>(
+        session_id: i64,
+        message_id: Option<i64>,
+        tool: &'a str,
+        input: &'a str,
+    ) -> NewAction<'a> {
+        NewAction {
+            session_id,
+            message_id,
+            step: 0,
+            position: 0,
+            call_id: "",
+            tool,
+            input,
+            reason: "",
+            summary: tool,
+            command: None,
+            change: None,
+            plan: None,
+            plan_step: None,
+            state: ActionState::Done,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn the_administrators_operations_belong_to_the_conversation_after_its_last_message() {
+        let mut store = Store::in_memory().unwrap();
+        let session = store.create_session("Site", Modes::default()).unwrap();
+        let turn = store.start_turn(session.id, "Fix it", "x", "m").unwrap();
+        let restore = store
+            .insert_action(&new_action(session.id, None, "restore_file", "{}"))
+            .unwrap();
+        assert_eq!(restore.after_message, Some(turn.answer.id));
+        // Not an answer's: listed apart.
+        assert!(store.messages(session.id).unwrap()[1].actions.is_empty());
+        assert_eq!(
+            store.administrator_actions(session.id).unwrap(),
+            std::slice::from_ref(&restore)
+        );
+        assert_eq!(store.action(session.id, restore.id).unwrap(), restore);
+        assert!(matches!(
+            store.action(session.id + 1, restore.id),
+            Err(StoreError::ActionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn the_latest_plan_approved_comes_with_the_steps_carried_out() {
+        let mut store = Store::in_memory().unwrap();
+        let session = store.create_session("Blog", Modes::default()).unwrap();
+        let turn = store.start_turn(session.id, "Install", "x", "m").unwrap();
+        let plan = Plan {
+            goal: "Install nginx".into(),
+            steps: vec![PlanStep {
+                tool: "install_packages".into(),
+                input: r#"{"packages":["nginx"]}"#.into(),
+                summary: "Install nginx".into(),
+                detail: None,
+                floor: None,
+            }],
+        };
+        assert_eq!(store.approved_plan(session.id).unwrap(), None);
+        let mut proposed = new_action(session.id, Some(turn.answer.id), "propose_plan", "{}");
+        proposed.plan = Some(&plan);
+        proposed.state = ActionState::Waiting;
+        let mut proposed = store.insert_action(&proposed).unwrap();
+        // Not approved yet.
+        assert_eq!(store.approved_plan(session.id).unwrap(), None);
+        proposed.state = ActionState::Done;
+        store.update_action(&proposed).unwrap();
+        let mut step = new_action(session.id, Some(turn.answer.id), "install_packages", "{}");
+        step.plan_step = Some(PlanStepRef {
+            plan_id: proposed.id,
+            step: 0,
+        });
+        let step = store.insert_action(&step).unwrap();
+        let (approved, steps) = store.approved_plan(session.id).unwrap().unwrap();
+        assert_eq!(approved.plan.as_ref(), Some(&plan));
+        assert_eq!(steps, [step]);
+        // A later plan ends it, even before it is approved or when it is denied.
+        let mut newer = new_action(session.id, Some(turn.answer.id), "propose_plan", "{}");
+        newer.plan = Some(&plan);
+        newer.state = ActionState::Denied;
+        store.insert_action(&newer).unwrap();
+        assert_eq!(store.approved_plan(session.id).unwrap(), None);
+    }
+
+    #[test]
+    fn differences_are_noted_once_settled_by_the_administrator_and_replaced_by_a_new_change() {
+        let mut store = Store::in_memory().unwrap();
+        let path = "/etc/nginx/nginx.conf";
+        let record = store
+            .record(
+                RecordKind::File,
+                path,
+                "a1",
+                Some("worker 2;\n"),
+                false,
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .found_different(record.id, "b2", Some("worker 4;\n"))
+                .unwrap()
+        );
+        // The same difference again: still the first note.
+        assert!(
+            !store
+                .found_different(record.id, "b2", Some("worker 4;\n"))
+                .unwrap()
+        );
+        let open = store.differences().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(
+            (open[0].found.as_str(), open[0].record.expected.as_str()),
+            ("b2", "a1")
+        );
+        assert_eq!(open[0].content.as_deref(), Some("worker 4;\n"));
+
+        store
+            .settle_difference(open[0].id, Settled::Accepted)
+            .unwrap();
+        assert!(store.differences().unwrap().is_empty());
+        let records = store.records().unwrap();
+        assert_eq!(
+            (records[0].expected.as_str(), records[0].content.as_deref()),
+            ("b2", Some("worker 4;\n"))
+        );
+        assert!(matches!(
+            store.settle_difference(open[0].id, Settled::PutBack),
+            Err(StoreError::DifferenceNotFound(_))
+        ));
+
+        // Changed by hand, then back as expected: nothing to settle.
+        store.found_different(record.id, "c3", None).unwrap();
+        assert!(store.found_as_expected(record.id).unwrap());
+        assert!(store.differences().unwrap().is_empty());
+        // Changed by hand, then changed by Kelpy: the new record replaces the difference.
+        store.found_different(record.id, "c3", None).unwrap();
+        store
+            .record(RecordKind::File, path, "d4", None, false, None)
+            .unwrap();
+        assert!(store.differences().unwrap().is_empty());
+        assert_eq!(store.records().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn actions_of_an_older_database_join_their_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kelpy.db");
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            let transaction = connection.transaction().unwrap();
+            for migration in &MIGRATIONS[..8] {
+                transaction.execute_batch(migration).unwrap();
+            }
+            transaction.pragma_update(None, "user_version", 8).unwrap();
+            transaction
+                .execute_batch(
+                    "INSERT INTO sessions (title, created_at, updated_at) VALUES ('Old', 0, 0);
+                     INSERT INTO messages (session_id, role, content, status, created_at)
+                         VALUES (1, 'assistant', 'x', 'complete', 0);
+                     INSERT INTO actions (message_id, step, position, call_id, tool, input, reason, summary, state,
+                                          created_at)
+                         VALUES (1, 0, 0, 'c', 'disk_usage', '{}', '', 'Show the disk usage', 'done', 0),
+                                (1, 0, 0, 'd', 'disk_usage', '{}', '', 'Show the disk usage', 'done', 0);
+                     DELETE FROM actions WHERE call_id = 'd';",
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        let action = store.messages(1).unwrap()[0].actions[0].clone();
+        assert_eq!((action.session_id, action.message_id), (1, Some(1)));
+        // New ids follow the old ones, those of deleted actions included: an id is never given twice.
+        let turn = store.start_turn(1, "Again", "x", "m").unwrap();
+        let next = store
+            .insert_action(&new_action(1, Some(turn.answer.id), "disk_usage", "{}"))
+            .unwrap();
+        assert_eq!(next.id, action.id + 2);
     }
 
     #[test]

@@ -5,6 +5,11 @@
 //! is decided by the database's own thread, which serves one call at a time: recording an action, and starting it
 //! once decided, each read the conversation's modes and write the action in one call, so a change of the modes
 //! comes before or after them, never between. Setting access to None also denies the actions waiting at once.
+//!
+//! With Approval mode Plan, a change that matches a step of the plan approved last, with the same tool and the same
+//! arguments, runs without asking; each step runs once. A change already made ends at once, saying so. A change
+//! saves its phase as it goes: should Kelpy stop meanwhile, its outcome is uncertain, and it is never run again by
+//! itself.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -12,9 +17,10 @@ use std::time::{Duration, Instant};
 use kelpy_common::{lock, unix_now};
 use kelpy_providers::{ChatMessage, ToolCall, ToolResult};
 use kelpy_storage::{
-    Access, Action, ActionState, Approval, Change, Message, NewAction, Role, Session,
+    Access, Action, ActionState, Approval, Message, NewAction, Plan, PlanStep, PlanStepRef, Role,
+    Session,
 };
-use kelpy_tools::{Output, Prepared, ToolError};
+use kelpy_tools::{Output, Prepared, ToolError, Work};
 use serde_json::Value;
 use tokio::sync::{oneshot, watch};
 use tokio::time::MissedTickBehavior;
@@ -34,6 +40,10 @@ const NO_ACCESS: &str = "System access is None in this conversation";
 /// Why a change is denied when the conversation's access only allows looking.
 const READ_ONLY: &str =
     "System access is Read-only in this conversation: changing the system needs Full";
+/// What a change outside the plan approved says on its card.
+const NOT_IN_PLAN: &str = "Not in the plan approved: it asks on its own.";
+/// What a floor change inside the plan approved says on its card.
+const WITH_PLAN: &str = "Approved with the plan.";
 
 /// An action waiting for a decision, in its answer's [`Running`](super::Running).
 pub(super) enum Question {
@@ -77,10 +87,11 @@ impl Turns {
         stop: &CancellationToken,
     ) -> Result<(), End> {
         // A change is planned before it is shown: what is approved is what will be written.
+        let secrets = self.server.secrets(session_id);
         let prepared = async {
             let mut prepared = self.tools.prepare(&call.name, &call.arguments)?;
             self.executor.resolve(&mut prepared)?;
-            self.executor.plan(&mut prepared).await?;
+            self.executor.plan(&mut prepared, &secrets).await?;
             Ok::<_, ToolError>(prepared)
         }
         .await;
@@ -92,40 +103,74 @@ impl Turns {
             ),
             Err(_) => (format!("Use {}", call.name), String::new(), None),
         };
-        let problem = prepared.as_ref().err().map(ToString::to_string);
-        let always_asks = prepared.as_ref().is_ok_and(Prepared::always_asks);
-        let changes = prepared.as_ref().is_ok_and(Prepared::changes);
-        let change = prepared
+        let problem = prepared
             .as_ref()
-            .ok()
-            .and_then(Prepared::planned)
-            .map(|planned| Change {
-                diff: planned.diff.clone(),
-                notes: planned.notes(),
-                floor: planned.floor.clone(),
-            });
+            .err()
+            .map(|problem| secrets.redact(&problem.to_string()));
+        let ready = prepared.as_ref().ok();
+        let always_asks = ready.is_some_and(Prepared::always_asks);
+        let never_asks = ready.is_some_and(Prepared::never_asks);
+        let changes = ready.is_some_and(Prepared::changes);
+        let script = ready.is_some_and(|prepared| matches!(prepared.work, Work::Script { .. }));
+        let proposal = ready.and_then(Prepared::proposal).map(plan_of);
+        // A change, a plan or a secret: only with System access Full.
+        let needs_full = changes || proposal.is_some() || never_asks;
+        let already = ready.and_then(|prepared| prepared.already.clone());
+        let mut change = ready
+            .and_then(Prepared::card)
+            .map(crate::agent::server::change_of);
+        let input = (changes || script)
+            .then(|| kelpy_tools::canonical(&call.arguments))
+            .flatten();
+        let floor = ready.and_then(Prepared::floor).map(str::to_owned);
         let (message_id, call) = (answer.borrow().message.id, call.clone());
         let recorded = self
             .store
             .call(move |store| {
                 let session = store.session(session_id)?;
+                let (plan_step, planned) = match (&input, session.access, session.approval) {
+                    (Some(input), Access::Full, Approval::Plan) => {
+                        let approved = store.approved_plan(session_id)?;
+                        let step = approved.as_ref().and_then(|(plan, steps)| {
+                            step_of(plan, steps, &call.name, input, floor.as_deref())
+                        });
+                        (step, approved.is_some())
+                    }
+                    _ => (None, false),
+                };
                 let (state, error) = match (problem, session.access, session.approval) {
                     (Some(problem), _, _) => (ActionState::Failed, Some(problem)),
                     // Tools are offered only with access: the model called one anyway, or the access changed
                     // meanwhile.
                     (None, Access::None, _) => (ActionState::Denied, Some(NO_ACCESS.to_owned())),
-                    (None, Access::ReadOnly, _) if changes => {
+                    (None, Access::ReadOnly, _) if needs_full => {
                         (ActionState::Denied, Some(READ_ONLY.to_owned()))
+                    }
+                    // The system is already as asked: nothing runs.
+                    (None, _, _) if already.is_some() => (ActionState::Done, None),
+                    (None, _, _) if never_asks => (ActionState::Running, None),
+                    (None, _, _) if proposal.is_some() => (ActionState::Waiting, None),
+                    // A step of the plan approved: approved with it, floor or not.
+                    (None, _, Approval::Plan) if plan_step.is_some() => {
+                        (ActionState::Running, None)
                     }
                     (None, _, Approval::Ask) => (ActionState::Waiting, None),
                     (None, _, _) if always_asks => (ActionState::Waiting, None),
-                    // No plan is made yet: in Plan, each change is approved on its own.
+                    // In Plan, a change outside the plan asks on its own.
                     (None, _, Approval::Plan) if changes => (ActionState::Waiting, None),
-                    // What is left only reads, or changes a file Kelpy backs up and can put back.
+                    // What is left only reads, or makes a change Kelpy checks and can put back.
                     (None, _, Approval::Plan | Approval::Auto) => (ActionState::Running, None),
                 };
-                store.insert_action(&NewAction {
-                    message_id,
+                if let Some(change) = change.as_mut() {
+                    if plan_step.is_some() && change.floor.is_some() {
+                        change.notes.push(WITH_PLAN.to_owned());
+                    } else if planned && plan_step.is_none() && state == ActionState::Waiting {
+                        change.notes.push(NOT_IN_PLAN.to_owned());
+                    }
+                }
+                let mut action = store.insert_action(&NewAction {
+                    session_id,
+                    message_id: Some(message_id),
                     step,
                     position,
                     call_id: &call.id,
@@ -135,9 +180,16 @@ impl Turns {
                     summary: &summary,
                     command: command.as_deref(),
                     change: change.as_ref(),
+                    plan: proposal.as_ref(),
+                    plan_step,
                     state,
                     error: error.as_deref(),
-                })
+                })?;
+                if state == ActionState::Done {
+                    action.output = already.unwrap_or_default();
+                    store.update_action(&action)?;
+                }
+                Ok(action)
             })
             .await;
         let mut action = recorded.map_err(not_saved)?;
@@ -154,7 +206,7 @@ impl Turns {
                     return Err(End::Stopped);
                 }
                 decided => {
-                    action = self.settle(session_id, action, decided, changes).await?;
+                    action = self.settle(session_id, action, decided, needs_full).await?;
                     show(answer, &action);
                 }
             },
@@ -164,6 +216,15 @@ impl Turns {
         if action.state != ActionState::Running {
             return Ok(());
         }
+        if changes || script {
+            // Saved before anything runs: should Kelpy stop from now on, what the change left is not known.
+            action.phase = Some(if script {
+                "running the command".to_owned()
+            } else {
+                "starting the change".to_owned()
+            });
+            self.save(&action, answer).await?;
+        }
 
         let halt = CancellationToken::new();
         self.running(session_id, |running| {
@@ -171,7 +232,7 @@ impl Turns {
         });
         let started = Instant::now();
         let output = Output::new();
-        let mut run = Box::pin(self.executor.run(&prepared, &output));
+        let mut run = Box::pin(self.executor.run(&prepared, &secrets, &output));
         let mut live = tokio::time::interval(LIVE_EVERY);
         live.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut shown = 0;
@@ -183,8 +244,15 @@ impl Turns {
                 _ = live.tick() => {
                     if let Some((changes, text)) = output.snapshot_since(shown) {
                         shown = changes;
-                        action.output = text;
-                        show(answer, &action);
+                        action.output = secrets.redact(&text);
+                        let phase = output.phase();
+                        if phase.is_some() && phase != action.phase {
+                            // Saved as it changes: the phase tells, after a restart, where the change stopped.
+                            action.phase = phase;
+                            self.save(&action, answer).await?;
+                        } else {
+                            show(answer, &action);
+                        }
                     }
                 }
             }
@@ -192,18 +260,24 @@ impl Turns {
         // Dropping the run ends its program, and what the program started.
         drop(run);
         self.running(session_id, |running| running.halts.remove(&action.id));
-        // What it wrote before it was stopped or failed stays with it.
-        action.output = output.snapshot().1;
+        // What it wrote before it was stopped or failed stays with it, secrets hidden.
+        action.output = secrets.redact(&output.snapshot().1);
+        action.phase = output.phase().or(action.phase);
         action.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         let stopped = matches!(ended, Ended::Stopped);
+        let mut records = Vec::new();
         match ended {
             Ended::Ran(Ok(ran)) => {
                 action.state = ActionState::Done;
                 action.exit_code = ran.exit_code;
+                if let (Some(change), Some(backup)) = (action.change.as_mut(), ran.backup) {
+                    change.backup = Some(backup.to_string_lossy().into_owned());
+                }
+                records = ran.records;
             }
             Ended::Ran(Err(problem)) => {
                 action.state = ActionState::Failed;
-                action.error = Some(problem.to_string());
+                action.error = Some(secrets.redact(&problem.to_string()));
             }
             Ended::Halted => {
                 action.state = ActionState::Failed;
@@ -222,6 +296,8 @@ impl Turns {
             show(answer, &action);
             return Err(end);
         }
+        // What the change left, as Kelpy expects to find it: a record missed only loses a later difference.
+        let _ = self.server.record(action.id, records).await;
         if stopped { Err(End::Stopped) } else { Ok(()) }
     }
 
@@ -416,6 +492,66 @@ fn not_saved(error: kelpy_storage::StoreError) -> End {
     End::Failed(format!("the action could not be saved: {error}"))
 }
 
+/// A proposal as the plan's action stores it.
+fn plan_of(proposal: &kelpy_tools::Proposal) -> Plan {
+    Plan {
+        goal: proposal.goal.clone(),
+        steps: proposal
+            .steps
+            .iter()
+            .map(|step| PlanStep {
+                tool: step.tool.clone(),
+                input: step.input.clone(),
+                summary: step.summary.clone(),
+                detail: step.detail.clone(),
+                floor: step.floor.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// The first step of the `plan` approved that a call of `tool` with the canonical `input` carries out, among those
+/// no action has taken in `steps`: carried out, carrying out, started (stopped or failed once running) or left
+/// uncertain. A call whose change is on the `floor` carries out only a step shown with a floor: the plan approved
+/// would otherwise hide it.
+fn step_of(
+    plan: &Action,
+    steps: &[Action],
+    tool: &str,
+    input: &str,
+    floor: Option<&str>,
+) -> Option<PlanStepRef> {
+    let proposed = plan.plan.as_ref()?;
+    let taken = |index: usize| {
+        steps.iter().any(|action| {
+            action
+                .plan_step
+                .is_some_and(|step| step.step as usize == index)
+                && (matches!(
+                    action.state,
+                    ActionState::Done
+                        | ActionState::Running
+                        | ActionState::Waiting
+                        | ActionState::Uncertain
+                ) || (action.state == ActionState::Failed && action.started_at.is_some()))
+        })
+    };
+    let index = proposed
+        .steps
+        .iter()
+        .enumerate()
+        .position(|(index, step)| {
+            step.tool == tool
+                && step.input == input
+                && (floor.is_none() || step.floor.is_some())
+                && !taken(index)
+        })?;
+    Some(PlanStepRef {
+        plan_id: plan.id,
+        step: u32::try_from(index).ok()?,
+    })
+}
+
 /// Puts `action` in the answer as it is now, in its place or at the end.
 fn show(answer: &watch::Sender<AnswerState>, action: &Action) {
     answer.send_modify(|state| {
@@ -429,17 +565,39 @@ fn show(answer: &watch::Sender<AnswerState>, action: &Action) {
 
 /// The conversation as the model reads it. An answer with actions becomes its steps: the text before each step's
 /// calls, the calls, their results, and the text after the last step. The answer being written, `current`, carries
-/// back what the model wrote besides text in each step, from `replays`.
+/// back what the model wrote besides text in each step, from `replays`. The operations the `administrator` asked
+/// for come before the user's message that follows them.
 pub(super) fn chat_messages(
     messages: &[Message],
     current: i64,
     replays: &HashMap<u32, Vec<Value>>,
+    administrator: &[Action],
 ) -> Vec<ChatMessage> {
     let mut chat = Vec::with_capacity(messages.len());
+    // Those before the messages given are in their summary, or older.
+    let first = messages.first().map_or(i64::MAX, |message| message.id);
+    let mut operations = administrator
+        .iter()
+        .filter(|action| action.after_message.unwrap_or(0) >= first)
+        .peekable();
     for message in messages {
         match message.role {
             Role::User if !message.content.is_empty() => {
-                chat.push(ChatMessage::user(&message.content))
+                let mut notes = Vec::new();
+                while let Some(action) =
+                    operations.next_if(|action| action.after_message.unwrap_or(0) < message.id)
+                {
+                    notes.push(format!("- {}", context::administrator_note(action)));
+                }
+                if notes.is_empty() {
+                    chat.push(ChatMessage::user(&message.content));
+                } else {
+                    chat.push(ChatMessage::user(format!(
+                        "[Since your last answer, the administrator did this through Kelpy:\n{}]\n\n{}",
+                        notes.join("\n"),
+                        message.content
+                    )));
+                }
             }
             Role::User => {}
             Role::Assistant => {
@@ -493,7 +651,12 @@ mod tests {
     fn action(id: i64, step: u32, position: usize, state: ActionState) -> Action {
         Action {
             id,
-            message_id: 2,
+            session_id: 1,
+            message_id: Some(2),
+            after_message: None,
+            phase: None,
+            plan: None,
+            plan_step: None,
             step,
             position,
             call_id: format!("call_{id}"),
@@ -543,7 +706,7 @@ mod tests {
         ];
         let thinking = serde_json::json!({ "type": "thinking" });
         let replays = HashMap::from([(1, vec![thinking.clone()])]);
-        let chat = chat_messages(&messages, 2, &replays);
+        let chat = chat_messages(&messages, 2, &replays, &[]);
         assert_eq!(chat.len(), 7);
         assert_eq!(chat[0], ChatMessage::user("Disks?"));
         assert!(
@@ -561,7 +724,80 @@ mod tests {
         );
         assert_eq!(chat[6], ChatMessage::assistant("The disk is 40% full."));
         // Only the answer being written carries back its blocks.
-        assert!(matches!(&chat_messages(&messages, 9, &replays)[4],
+        assert!(matches!(&chat_messages(&messages, 9, &replays, &[])[4],
             ChatMessage::Assistant { replay, .. } if replay.is_empty()));
+
+        // An operation of the administrator after the answer comes with the next message.
+        let mut later = messages.to_vec();
+        later.push(message(3, Role::User, "Is it fixed?", Vec::new()));
+        let mut restore = action(9, 0, 0, ActionState::Done);
+        (restore.message_id, restore.after_message) = (None, Some(2));
+        restore.summary = "Put back /etc/hosts as it was before this change".into();
+        let chat = chat_messages(&later, 2, &replays, &[restore]);
+        let ChatMessage::User(text) = chat.last().unwrap() else {
+            panic!("{chat:?}");
+        };
+        assert!(
+            text.starts_with("[Since your last answer, the administrator did this through Kelpy:\n- Put back /etc/hosts")
+                && text.ends_with("Is it fixed?"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_call_carries_out_the_first_step_of_the_plan_not_taken_with_the_same_arguments() {
+        let step = |input: &str, floor: Option<&str>| PlanStep {
+            tool: "manage_service".into(),
+            input: input.into(),
+            summary: String::new(),
+            detail: None,
+            floor: floor.map(str::to_owned),
+        };
+        let mut plan = action(5, 0, 0, ActionState::Done);
+        plan.plan = Some(Plan {
+            goal: "Restart twice".into(),
+            steps: vec![
+                step("{\"a\":1}", None),
+                step("{\"a\":1}", None),
+                step("{\"b\":2}", Some("It stops sshd.")),
+            ],
+        });
+        let next = |taken: &[Action], input: &str, floor: Option<&str>| {
+            step_of(&plan, taken, "manage_service", input, floor).map(|step| step.step)
+        };
+        let first = step_of(&plan, &[], "manage_service", "{\"a\":1}", None).unwrap();
+        assert_eq!((first.plan_id, first.step), (5, 0));
+        let mut taken = action(6, 0, 0, ActionState::Done);
+        taken.plan_step = Some(first);
+        assert_eq!(
+            next(std::slice::from_ref(&taken), "{\"a\":1}", None),
+            Some(1)
+        );
+        // A failed attempt that never started leaves its step to the next call; one that started, or left the
+        // outcome uncertain, does not: it asks again.
+        taken.state = ActionState::Failed;
+        taken.started_at = None;
+        assert_eq!(
+            next(std::slice::from_ref(&taken), "{\"a\":1}", None),
+            Some(0)
+        );
+        taken.started_at = Some(0);
+        assert_eq!(
+            next(std::slice::from_ref(&taken), "{\"a\":1}", None),
+            Some(1)
+        );
+        taken.state = ActionState::Uncertain;
+        assert_eq!(
+            next(std::slice::from_ref(&taken), "{\"a\":1}", None),
+            Some(1)
+        );
+        assert_eq!(next(&[], "{\"a\":2}", None), None);
+        assert_eq!(step_of(&plan, &[], "write_file", "{\"b\":2}", None), None);
+        // A call on the floor matches only a step shown with a floor.
+        assert_eq!(
+            next(&[], "{\"a\":1}", Some("It changes the SSH configuration.")),
+            None
+        );
+        assert_eq!(next(&[], "{\"b\":2}", Some("It stops sshd.")), Some(2));
     }
 }

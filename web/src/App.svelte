@@ -205,6 +205,12 @@
       case 'answer_ended':
         chat?.receive(event);
         break;
+      case 'action_changed':
+        chat?.receiveAction(event.action);
+        break;
+      case 'differences_changed':
+        void chat?.refreshDifferences();
+        break;
       case 'provider_changed':
         void refreshProvider();
         break;

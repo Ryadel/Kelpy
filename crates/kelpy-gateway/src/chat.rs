@@ -12,19 +12,26 @@
 //! | `POST /api/sessions/{id}/cancel` | stop the answer being written |
 //! | `POST /api/sessions/{id}/actions/{action}` | approve or deny an action waiting for a decision |
 //! | `POST /api/sessions/{id}/actions/{action}/stop` | stop an action running; the answer goes on |
+//! | `POST /api/sessions/{id}/actions/{action}/restore` | put a file back from the backup of a change; `preview` only shows it |
+//! | `GET /api/sessions/{id}/report` | the handover report, in Markdown |
+//! | `GET /api/sessions/{id}/export` | the operations that succeeded, as JSON |
+//! | `GET /api/differences`, `POST /api/differences/check` | changes made outside Kelpy; check again now |
+//! | `POST /api/differences/{id}/accept` | keep what was found |
+//! | `POST /api/sessions/{id}/differences/{difference}/put-back` | put Kelpy's version back; `preview` only shows it |
 
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream;
 use kelpy_core::agent::{
-    Access, Agent, AgentError, AnswerEvents, Approval, ChatEvent, ModelQuery, Modes, ProviderUpdate,
+    Access, Action, Agent, AgentError, AnswerEvents, Approval, ChatEvent, ModelQuery, Modes,
+    ProviderUpdate,
 };
 use kelpy_core::providers::ProviderError;
 use kelpy_core::storage::{Message, StoreError};
@@ -58,6 +65,16 @@ pub fn routes() -> Router<ChatState> {
         .route(
             "/api/sessions/{id}/actions/{action}/stop",
             post(stop_action),
+        )
+        .route("/api/sessions/{id}/actions/{action}/restore", post(restore))
+        .route("/api/sessions/{id}/report", get(report))
+        .route("/api/sessions/{id}/export", get(export))
+        .route("/api/differences", get(differences))
+        .route("/api/differences/check", post(check_differences))
+        .route("/api/differences/{id}/accept", post(accept_difference))
+        .route(
+            "/api/sessions/{id}/differences/{difference}/put-back",
+            post(put_back),
         )
 }
 
@@ -196,6 +213,8 @@ async fn delete_session(State(state): State<ChatState>, Path(id): Path<i64>) -> 
 #[derive(Serialize)]
 struct Conversation {
     messages: Vec<Message>,
+    /// The operations the administrator asked for, such as putting a file back: in the Command log, not in answers.
+    administrator_actions: Vec<Action>,
     /// An answer is being written: its latest saved text is in `messages`, and it will complete on its own.
     running: bool,
     /// The last message the summary given to the model covers, if the older messages are summarised.
@@ -206,6 +225,7 @@ async fn messages(State(state): State<ChatState>, Path(id): Path<i64>) -> Respon
     let conversation = async {
         Ok::<_, AgentError>(Conversation {
             messages: state.agent.messages(id).await?,
+            administrator_actions: state.agent.administrator_actions(id).await?,
             running: state.agent.is_running(id),
             summarised_through: state.agent.summarised_through(id).await?,
         })
@@ -323,6 +343,99 @@ async fn stop_action(
     }
 }
 
+/// An operation of the administrator: shown first with `preview`, then run.
+#[derive(Deserialize, Default)]
+struct Operation {
+    #[serde(default)]
+    preview: bool,
+}
+
+/// The body is optional: empty runs the operation.
+fn operation(body: &[u8]) -> Result<Operation, serde_json::Error> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Operation::default());
+    }
+    serde_json::from_slice(body)
+}
+
+async fn restore(
+    State(state): State<ChatState>,
+    Path((id, action)): Path<(i64, i64)>,
+    body: axum::body::Bytes,
+) -> Response {
+    let operation = match operation(&body) {
+        Ok(operation) => operation,
+        Err(parse) => return error(StatusCode::BAD_REQUEST, "invalid", parse.to_string()),
+    };
+    // Kelpy does not stop for inactivity while it changes a file.
+    let _busy = state.activity.busy();
+    match state.agent.restore(id, action, operation.preview).await {
+        Ok(operated) => Json(operated).into_response(),
+        Err(error) => failure(&error),
+    }
+}
+
+async fn put_back(
+    State(state): State<ChatState>,
+    Path((id, difference)): Path<(i64, i64)>,
+    body: axum::body::Bytes,
+) -> Response {
+    let operation = match operation(&body) {
+        Ok(operation) => operation,
+        Err(parse) => return error(StatusCode::BAD_REQUEST, "invalid", parse.to_string()),
+    };
+    let _busy = state.activity.busy();
+    match state
+        .agent
+        .put_back(id, difference, operation.preview)
+        .await
+    {
+        Ok(operated) => Json(operated).into_response(),
+        Err(error) => failure(&error),
+    }
+}
+
+async fn report(State(state): State<ChatState>, Path(id): Path<i64>) -> Response {
+    match state.agent.report(id).await {
+        Ok(report) => (
+            [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+            report,
+        )
+            .into_response(),
+        Err(error) => failure(&error),
+    }
+}
+
+async fn export(State(state): State<ChatState>, Path(id): Path<i64>) -> Response {
+    match state.agent.export(id).await {
+        Ok(export) => Json(export).into_response(),
+        Err(error) => failure(&error),
+    }
+}
+
+async fn differences(State(state): State<ChatState>) -> Response {
+    match state.agent.differences().await {
+        Ok(differences) => Json(differences).into_response(),
+        Err(error) => failure(&error),
+    }
+}
+
+/// Checks the server now, then lists the differences.
+async fn check_differences(State(state): State<ChatState>) -> Response {
+    let _busy = state.activity.busy();
+    if let Err(error) = state.agent.check_server().await {
+        return failure(&error);
+    }
+    differences(State(state)).await
+}
+
+async fn accept_difference(State(state): State<ChatState>, Path(id): Path<i64>) -> Response {
+    match state.agent.accept_difference(id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => failure(&error),
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorBody {
     /// Stable, for the interfaces: `not_configured`, `missing_key`, `missing_base_url`, `busy`, `stopping`,
@@ -346,7 +459,11 @@ fn failure(failure: &AgentError) -> Response {
         AgentError::NotWaiting => (StatusCode::CONFLICT, "not_waiting"),
         AgentError::NotRunning => (StatusCode::CONFLICT, "not_running"),
         AgentError::EmptyMessage | AgentError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid"),
-        AgentError::Store(StoreError::SessionNotFound(_)) => (StatusCode::NOT_FOUND, "not_found"),
+        AgentError::Store(
+            StoreError::SessionNotFound(_)
+            | StoreError::ActionNotFound(_)
+            | StoreError::DifferenceNotFound(_),
+        ) => (StatusCode::NOT_FOUND, "not_found"),
         AgentError::ChatGpt(failure) => return chatgpt_failure(failure),
         AgentError::Provider(_)
         | AgentError::Store(_)

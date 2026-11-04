@@ -32,8 +32,8 @@ const ACCESS: [Choice<Access>; 3] = [
     Choice {
         value: Access::Full,
         name: "Full",
-        means: "you may also change the system: files with edit_file and write_file, anything else with commands you \
-                write",
+        means: "you may also change the system: files, services, packages and databases with the typed tools, \
+                anything else with commands you write",
         available: true,
     },
 ];
@@ -48,14 +48,17 @@ const APPROVAL: [Choice<Approval>; 3] = [
     Choice {
         value: Approval::Plan,
         name: "Plan",
-        means: "looking needs no approval; each change still waits for it",
+        means: "looking needs no approval; you propose the changes with propose_plan and the administrator approves \
+                the plan once, its steps marked where they would always ask otherwise; a change outside the plan \
+                waits for approval",
         available: true,
     },
     Choice {
         value: Approval::Auto,
         name: "Auto",
-        means: "looking, and file changes Kelpy backs up, need no approval; changes to the SSH, sudo, login, \
-                firewall, network or boot configuration still wait for it",
+        means: "looking, and the changes Kelpy checks and puts back (files, services, package installations, \
+                databases), need no approval; removing packages, stopping SSH, remote management or the network, and \
+                changes to the SSH, sudo, login, firewall, network or boot configuration still wait for it",
         available: true,
     },
 ];
@@ -88,9 +91,15 @@ closes; off, you stay concise and write none.
 always wait for approval, in every mode.
 Each action you take shows in your answer as a card with Approve and Deny; on a card that is not a command, Switch \
 to Plan and Switch to Auto approve it and change the Approval mode. While an action runs, its card shows the time \
-it has taken and Stop, which ends that action only: you are told, and your answer goes on. The terminal button in the top bar opens the \
-Command log: what you ran in this conversation. Stop, beside the message box, ends your answer. The AI provider menu in the top bar changes the \
-service and the model (Change provider).
+it has taken and Stop, which ends that action only: you are told, and your answer goes on. A plan shows as one card \
+with its steps, each marked as it is carried out. The terminal button in the top bar opens the Command log: what \
+you ran in this conversation. There, Restore puts a file back as it was before one of your changes, from its \
+backup: that is the administrator's own action, told to you with their next message. Report gives the handover \
+report of the conversation (what changed, what did not complete, where secrets went, what stays on the server), \
+and Export the operations that succeeded, with their arguments. When Kelpy finds that something it changed was \
+changed outside it, a bar above the conversation says so, and the administrator settles each difference with Accept \
+or Put back. Stop, beside the message box, ends your answer. The AI provider menu in the top bar changes the service \
+and the model (Change provider).
 
 When a request needs a setting other than the current one, say which control to change, where it is and to which \
 value. When no setting allows it, say so plainly. Name the controls and their values as written here, in English, whatever language \
@@ -102,7 +111,9 @@ Kelpy runs on this server, started by the administrator for this session: it sto
 are kept in Kelpy's data folder and survive a restart. What you read on the system is sent to the AI service with \
 the conversation. Files that may hold secrets (private keys, `.env` files, password stores, Kelpy's own data) are \
 never shown to you. Your actions run as the account that started Kelpy, {account}. {rights} An action \
-not approved within 30 minutes counts as denied. One answer may use the tools up to 20 times.",
+not approved within 30 minutes counts as denied. One answer may use the tools up to 20 times. If Kelpy stops while \
+a change is under way, its outcome is uncertain: it is never run again by itself. Secrets you generate last until \
+Kelpy stops.",
         access = name(&ACCESS, modes.access),
         access_choices = choices(&ACCESS),
         approval = name(&APPROVAL, modes.approval),
@@ -185,6 +196,14 @@ mod tests {
             ">Stop<",
         ] {
             assert!(card.contains(label), "{label}");
+        }
+        let log = web("lib/CommandLog.svelte");
+        for label in [">Restore<", ">Report<", ">Export<"] {
+            assert!(log.contains(label), "{label}");
+        }
+        let differences = web("lib/Differences.svelte");
+        for label in [">Accept<", ">Put back<", "Changed outside Kelpy"] {
+            assert!(differences.contains(label), "{label}");
         }
         let app = web("App.svelte");
         for label in [

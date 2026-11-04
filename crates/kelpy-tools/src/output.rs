@@ -32,6 +32,8 @@ struct Written {
     open: [Vec<u8>; 2],
     /// Bytes past the limit, read and not kept.
     dropped: usize,
+    /// What a change is doing now, such as "writing the file"; kept once set.
+    phase: Option<String>,
     /// Changes whenever anything above does.
     changes: u64,
 }
@@ -52,6 +54,18 @@ impl Output {
     pub fn snapshot_since(&self, seen: u64) -> Option<(u64, String)> {
         let written = lock(&self.0);
         (written.changes != seen).then(|| (written.changes, written.shown()))
+    }
+
+    /// What the change is doing now, if it said.
+    pub fn phase(&self) -> Option<String> {
+        lock(&self.0).phase.clone()
+    }
+
+    /// Says what the change is doing from now on: should Kelpy stop meanwhile, its outcome is uncertain.
+    pub(crate) fn set_phase(&self, phase: &str) {
+        let mut written = lock(&self.0);
+        written.phase = Some(phase.to_owned());
+        written.changes += 1;
     }
 
     /// Adds a line.

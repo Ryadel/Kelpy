@@ -7,7 +7,7 @@
 use crate::{Command, Os, Work};
 
 /// A program with its arguments.
-fn run(program: &str, args: &[&str]) -> Command {
+pub(crate) fn run(program: &str, args: &[&str]) -> Command {
     let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
     let display = std::iter::once(program.to_owned())
         .chain(args.iter().map(|arg| shell_quoted(arg)))
@@ -66,7 +66,7 @@ fn shell_quoted(value: &str) -> String {
 }
 
 /// `value` as a PowerShell string literal.
-fn quoted(value: &str) -> String {
+pub(crate) fn quoted(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 

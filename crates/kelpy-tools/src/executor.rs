@@ -3,11 +3,18 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use kelpy_common::lock;
+use tokio::io::AsyncWriteExt;
 
 use crate::output::{Output, Stream};
 use crate::tree::Tree;
-use crate::{Account, Command, Os, Prepared, ToolError, Work, change, files};
+use crate::{
+    Account, Command, Os, Prepared, Recorded, RecordedKind, Secrets, ToolError, Work, change,
+    database, files, memory, package, service,
+};
 
 /// How long one command of an inspection, or reading a file or a folder, may take. A command the model wrote has no
 /// limit: a backup or an installation takes as long as it takes, and the administrator can stop it.
@@ -22,6 +29,19 @@ pub struct Ran {
     pub exit_code: Option<i32>,
     /// What the commands wrote, standard output then errors, or the file or folder read.
     pub output: String,
+    /// What a change left, as Kelpy expects to find it from now on.
+    pub records: Vec<Recorded>,
+    /// Where a file's version before the change was saved.
+    pub backup: Option<PathBuf>,
+}
+
+/// A file, a service or a package as found now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observed {
+    /// In the terms of [`Recorded::state`]; `missing` for a file gone.
+    pub state: String,
+    /// A file's content.
+    pub content: Option<String>,
 }
 
 /// Runs actions on one system.
@@ -33,6 +53,10 @@ pub enum Executor {
         protected: Vec<PathBuf>,
         /// Where the versions of files before a change are kept.
         backups: PathBuf,
+        /// Kelpy's memory of the server, if it has one.
+        memory: Option<PathBuf>,
+        /// Files Kelpy wrote a generated secret into: like secret files, never read for the model nor shown.
+        held: Arc<Mutex<Vec<PathBuf>>>,
         account: Account,
     },
 }
@@ -49,7 +73,47 @@ impl Executor {
         Self::Local {
             protected,
             backups,
+            memory: None,
+            held: Arc::default(),
             account: Account::current(),
+        }
+    }
+
+    /// Keeps the file at `path`, which holds a secret, from the model from now on.
+    pub fn hold(&self, path: PathBuf) {
+        let Self::Local { held, .. } = self;
+        let mut held = lock(held);
+        if !held.contains(&path) {
+            held.push(path);
+        }
+    }
+
+    /// Whether the file at the real `path` holds a secret Kelpy wrote.
+    async fn holds_secret(&self, path: &Path) -> bool {
+        let Self::Local { held, .. } = self;
+        let real = match tokio::fs::canonicalize(path).await {
+            Ok(real) => change::plain(real),
+            Err(_) => return false,
+        };
+        lock(held).contains(&real)
+    }
+
+    /// The same, with Kelpy's memory in `folder`.
+    pub fn with_memory(self, folder: PathBuf) -> Self {
+        match self {
+            Self::Local {
+                protected,
+                backups,
+                held,
+                account,
+                ..
+            } => Self::Local {
+                protected,
+                backups,
+                memory: Some(folder),
+                held,
+                account,
+            },
         }
     }
 
@@ -82,21 +146,61 @@ impl Executor {
                 }
                 self.choose(shells)
             }
-            Work::ReadFile(_) | Work::ListDirectory(_) | Work::ChangeFile(_) => Ok(()),
+            _ => Ok(()),
         }
     }
 
-    /// Plans a change before it is shown: reads the file, works out the content after it and how it is checked.
-    /// Nothing runs and nothing is written. The error says, for the model, why it cannot be made.
-    pub async fn plan(&self, prepared: &mut Prepared) -> Result<(), ToolError> {
-        let Self::Local { protected, .. } = self;
-        if let Work::ChangeFile(file) = &mut prepared.work {
-            let planned = change::plan(file, self.os(), protected, |program| {
-                self.installed(program)
-            });
-            file.planned = Some(within(planned).await?);
-        }
+    /// Plans a change before it is shown: reads the file and works out the content after it, reads the service's
+    /// state, asks apt what it would install. Nothing is changed. When the system is already as asked, says so in
+    /// [`Prepared::already`]. The error says, for the model, why it cannot be made.
+    pub async fn plan(&self, prepared: &mut Prepared, secrets: &Secrets) -> Result<(), ToolError> {
+        let Self::Local {
+            protected, held, ..
+        } = self;
+        let os = self.os();
+        let installed = |program: &str| self.installed(program);
+        let held = lock(held).clone();
+        let already = match &mut prepared.work {
+            Work::ChangeFile(file) => {
+                let planned =
+                    within(change::plan(file, os, protected, secrets, &held, installed)).await?;
+                planned.map(|planned| file.planned = Some(planned)).err()
+            }
+            Work::Service(change) => {
+                let planned = within(service::plan(change, os)).await?;
+                planned.map(|planned| change.planned = Some(planned)).err()
+            }
+            Work::Packages(change) => {
+                let planned = within(package::plan(change, os, installed)).await?;
+                planned.map(|planned| change.planned = Some(planned)).err()
+            }
+            Work::Database(change) => {
+                let planned = within(database::plan(change, secrets, installed)).await?;
+                planned.map(|planned| change.planned = Some(planned)).err()
+            }
+            Work::Secret(name) if secrets.names().contains(name) => Some(format!(
+                "The secret {name} exists already: write {} where it goes.",
+                crate::secret::placeholder(name)
+            )),
+            _ => None,
+        };
+        prepared.already = already;
         Ok(())
+    }
+
+    /// What the file at `subject`, the service or the package of that name is now.
+    pub async fn observe(&self, kind: RecordedKind, subject: &str) -> Result<Observed, ToolError> {
+        match kind {
+            RecordedKind::File => within(change::observe(Path::new(subject))).await,
+            RecordedKind::Service => Ok(Observed {
+                state: within(service::state(self.os(), subject)).await?.shown(),
+                content: None,
+            }),
+            RecordedKind::Package => Ok(Observed {
+                state: within(package::state(subject)).await?,
+                content: None,
+            }),
+        }
     }
 
     /// Keeps only the first of `alternatives` installed.
@@ -116,10 +220,24 @@ impl Executor {
     /// Runs a resolved action, writing what it gives to `output` as it comes: whoever holds a clone sees it while
     /// it runs, and keeps it if the run is stopped or fails. The error says why it could not run or end; a command
     /// that ran and failed is not an error, its exit code tells.
-    pub async fn run(&self, prepared: &Prepared, output: &Output) -> Result<Ran, ToolError> {
+    pub async fn run(
+        &self,
+        prepared: &Prepared,
+        secrets: &Secrets,
+        output: &Output,
+    ) -> Result<Ran, ToolError> {
         let Self::Local {
-            protected, backups, ..
+            protected,
+            backups,
+            memory,
+            ..
         } = self;
+        let (mut records, mut backup) = (Vec::new(), None);
+        let memory = || {
+            memory
+                .as_deref()
+                .ok_or_else(|| crate::invalid("Kelpy has no memory folder here"))
+        };
         let exit_code = match &prepared.work {
             Work::Commands(steps) => {
                 let commands: Vec<&Command> =
@@ -129,7 +247,7 @@ impl Executor {
                     if commands.len() > 1 {
                         output.line(&format!("$ {}", command.display));
                     }
-                    let code = run_local(command, None, Some(RUN_TIME), true, output).await?;
+                    let code = run_local(command, None, Some(RUN_TIME), true, None, output).await?;
                     if exit_code == 0 {
                         exit_code = code;
                     }
@@ -140,9 +258,14 @@ impl Executor {
                 let shell = shells
                     .first()
                     .ok_or_else(|| crate::invalid("there is no shell to run it"))?;
-                Some(run_local(shell, Some(directory), None, false, output).await?)
+                // It may change anything: stopped by a restart, what it did is not known.
+                output.set_phase("running the command");
+                Some(run_local(shell, Some(directory), None, false, None, output).await?)
             }
             Work::ReadFile(path) => {
+                if self.holds_secret(path).await {
+                    return Err(ToolError::Protected(path.clone()));
+                }
                 output.text(&within(files::read(path, protected)).await?);
                 None
             }
@@ -151,17 +274,58 @@ impl Executor {
                 None
             }
             Work::ChangeFile(file) => {
-                let planned = file
-                    .planned
-                    .as_ref()
-                    .ok_or_else(|| crate::invalid("the change was not planned"))?;
-                change::apply(planned, backups, output).await?;
+                let planned = file.planned.as_ref().ok_or_else(not_planned)?;
+                backup = change::apply(planned, backups, output).await?;
+                records.push(planned.recorded());
+                None
+            }
+            Work::Service(change) => {
+                let planned = change.planned.as_ref().ok_or_else(not_planned)?;
+                records.push(service::apply(change, planned, self.os(), output).await?);
+                None
+            }
+            Work::Packages(change) => {
+                let planned = change.planned.as_ref().ok_or_else(not_planned)?;
+                records = package::apply(change, planned, output).await?;
+                None
+            }
+            Work::Database(change) => {
+                let planned = change.planned.as_ref().ok_or_else(not_planned)?;
+                database::apply(change, planned, secrets, output).await?;
+                None
+            }
+            Work::Secret(name) => {
+                secrets.generate(name)?;
+                output.line(&format!(
+                    "Generated the secret {name}: write {} where it goes. Its value is never shown to you.",
+                    crate::secret::placeholder(name)
+                ));
+                None
+            }
+            Work::ReadMemory(page) => {
+                output.text(&within(memory::read(memory()?, page)).await?);
+                None
+            }
+            Work::Remember { page, note } => {
+                let today = kelpy_common::utc(kelpy_common::unix_now());
+                let today = today.split(' ').next().unwrap_or_default();
+                // A secret the model saw by mistake is not kept.
+                let note = secrets.redact(note);
+                output.line(&within(memory::remember(memory()?, page, &note, today)).await?);
+                None
+            }
+            Work::Plan(_) => {
+                output.line(
+                    "The administrator approved the plan: its steps run without asking again.",
+                );
                 None
             }
         };
         Ok(Ran {
             exit_code,
             output: output.snapshot().1,
+            records,
+            backup,
         })
     }
 
@@ -178,21 +342,43 @@ impl Executor {
     }
 }
 
-/// Runs one command on this computer, within `limit` if given, in English where the program allows it if `english`, else in
-/// the administrator's own language, its lines going to `output` as they come. Returns its exit code. What the
-/// command starts ends with it.
+/// Why an approved change cannot run.
+fn not_planned() -> ToolError {
+    crate::invalid("the change was not planned")
+}
+
+/// Runs `command` within `limit`, in English, with `input` on its standard input if given: its exit code and what
+/// it wrote.
+pub(crate) async fn captured(
+    command: &Command,
+    input: Option<&str>,
+    limit: Duration,
+) -> Result<(i32, String), ToolError> {
+    let said = Output::new();
+    let code = run_local(command, None, Some(limit), true, input, &said).await?;
+    Ok((code, said.snapshot().1))
+}
+
+/// Runs one command on this computer, within `limit` if given, in English where the program allows it if `english`,
+/// else in the administrator's own language, with `input` on its standard input if given, its lines going to
+/// `output` as they come. Returns its exit code. What the command starts ends with it.
 pub(crate) async fn run_local(
     command: &Command,
     directory: Option<&Path>,
     limit: Option<Duration>,
     english: bool,
+    input: Option<&str>,
     output: &Output,
 ) -> Result<i32, ToolError> {
     let mut process = tokio::process::Command::new(&command.program);
     process
         .args(&command.args)
         .envs(command.env.iter().map(|(name, value)| (name, value)))
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Stopping the answer drops the future, which ends the program.
@@ -215,9 +401,17 @@ pub(crate) async fn run_local(
         source,
     })?;
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let stdin = child.stdin.take();
     let finished = async {
         let reading = async {
+            let feeding = async {
+                // Closed once written: the program reads its end.
+                if let (Some(mut stdin), Some(input)) = (stdin, input) {
+                    let _ = stdin.write_all(input.as_bytes()).await;
+                }
+            };
             tokio::join!(
+                feeding,
                 output.pump(stdout, Stream::Out),
                 output.pump(stderr, Stream::Err)
             )
@@ -259,7 +453,12 @@ mod tests {
             reason: String::new(),
             summary: String::new(),
             work,
+            already: None,
         }
+    }
+
+    async fn run(executor: &Executor, action: &Prepared) -> Result<Ran, ToolError> {
+        executor.run(action, &Secrets::new(), &Output::new()).await
     }
 
     fn command(program: &str, args: &[&str]) -> Command {
@@ -306,27 +505,25 @@ mod tests {
                 command("sh", &["-c", "echo oops >&2; exit 3"]),
             )
         };
-        let ran = executor
-            .run(
-                &prepared(Work::Commands(vec![vec![ok], vec![failing]])),
-                &Output::new(),
-            )
-            .await
-            .unwrap();
+        let ran = run(
+            &executor,
+            &prepared(Work::Commands(vec![vec![ok], vec![failing]])),
+        )
+        .await
+        .unwrap();
         assert_eq!(ran.exit_code, Some(3));
         assert!(ran.output.contains("hello"), "{}", ran.output);
         assert!(ran.output.contains("oops"), "{}", ran.output);
 
-        let missing = executor
-            .run(
-                &prepared(Work::Commands(vec![vec![command(
-                    "kelpy-no-such-program",
-                    &[],
-                )]])),
-                &Output::new(),
-            )
-            .await
-            .unwrap_err();
+        let missing = run(
+            &executor,
+            &prepared(Work::Commands(vec![vec![command(
+                "kelpy-no-such-program",
+                &[],
+            )]])),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(&missing, ToolError::Start { program, .. } if program == "kelpy-no-such-program"),
             "{missing}"
@@ -347,7 +544,7 @@ mod tests {
             folder.path().to_owned(),
         ));
         executor.resolve(&mut action).unwrap();
-        let ran = executor.run(&action, &Output::new()).await.unwrap();
+        let ran = run(&executor, &action).await.unwrap();
         let name = folder.path().file_name().unwrap().to_string_lossy();
         assert!(
             ran.output.trim_end().ends_with(name.as_ref()),
@@ -378,7 +575,12 @@ mod tests {
         executor.resolve(&mut action).unwrap();
         assert!(action.always_asks());
         assert_eq!(action.command_line().unwrap(), text);
-        let ran = executor.run(&action, &Output::new()).await.unwrap();
+        let output = Output::new();
+        let ran = executor
+            .run(&action, &Secrets::new(), &output)
+            .await
+            .unwrap();
+        assert_eq!(output.phase().as_deref(), Some("running the command"));
         assert_eq!(ran.exit_code, Some(4));
         let lines: Vec<&str> = ran.output.lines().collect();
         assert_eq!(lines[..2], ["it's \"quoted\" \\ here", "C:\\dir\\\" \\"]);
@@ -401,11 +603,7 @@ mod tests {
             command("sh", &["-c", "sleep 60 & echo started"])
         };
         let started = std::time::Instant::now();
-        let ran = executor
-            .run(
-                &prepared(Work::Commands(vec![vec![leaving]])),
-                &Output::new(),
-            )
+        let ran = run(&executor, &prepared(Work::Commands(vec![vec![leaving]])))
             .await
             .unwrap();
         assert_eq!(ran.output.trim(), "started");
@@ -414,5 +612,36 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn a_command_reads_what_kelpy_gives_it() {
+        let reading = if cfg!(windows) {
+            command("findstr", &["x"])
+        } else {
+            command("cat", &[])
+        };
+        let (code, said) = captured(&reading, Some("x marks the spot\n"), RUN_TIME)
+            .await
+            .unwrap();
+        assert_eq!((code, said.trim()), (0, "x marks the spot"));
+    }
+
+    #[tokio::test]
+    async fn a_secret_is_generated_once_and_never_shown() {
+        let executor = Executor::local(Vec::new(), PathBuf::from("backups"));
+        let secrets = Secrets::new();
+        let mut action = prepared(Work::Secret("db".into()));
+        executor.plan(&mut action, &secrets).await.unwrap();
+        assert_eq!(action.already, None);
+        let ran = executor
+            .run(&action, &secrets, &Output::new())
+            .await
+            .unwrap();
+        assert!(ran.output.contains("{{secret:db}}"), "{}", ran.output);
+        let (value, _) = secrets.fill("{{secret:db}}").unwrap();
+        assert!(!ran.output.contains(&value));
+        executor.plan(&mut action, &secrets).await.unwrap();
+        assert!(action.already.unwrap().contains("exists already"));
     }
 }

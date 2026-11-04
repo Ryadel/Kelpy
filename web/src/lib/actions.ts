@@ -43,7 +43,55 @@ export const stateLabels: Record<ActionState, string> = {
   done: 'Done',
   failed: 'Failed',
   denied: 'Denied',
+  uncertain: 'Outcome uncertain',
 };
+
+/** Where a step of a plan is: not carried out yet, or as the last action that carried it out. */
+export type StepState = 'pending' | ActionState;
+
+/** The state of each step of `plan`, from the `actions` of the conversation that carried them out. */
+export function stepStates(plan: Action, actions: Action[]): StepState[] {
+  const states: StepState[] = (plan.plan?.steps ?? []).map(() => 'pending');
+  for (const action of actions) {
+    if (action.plan_step?.plan_id === plan.id && action.plan_step.step < states.length) {
+      states[action.plan_step.step] = action.state;
+    }
+  }
+  return states;
+}
+
+/** Whether the file a change wrote can be put back from its backup: the change ran and was backed up. */
+export const restorable = (action: Action) => action.state === 'done' && Boolean(action.change?.backup);
+
+/**
+ * The administrator's operations as read, with those this page learned of meanwhile: an operation that ended while
+ * the conversation was read keeps its end, and one that started meanwhile is kept.
+ */
+export function mergeOperations(read: Action[], shown: Action[]): Action[] {
+  const merged = read.map((action) => {
+    const known = shown.find((other) => other.id === action.id);
+    return known && action.state === 'running' && known.state !== 'running' ? known : action;
+  });
+  const later = shown.filter((action) => !read.some((other) => other.id === action.id));
+  return [...merged, ...later].sort((one, other) => one.id - other.id);
+}
+
+/** Every action of a conversation, the answers' and the administrator's, in the order they were asked for. */
+export function commandLog(messages: Message[], administrator: Action[]): Action[] {
+  return [...messages.flatMap((message) => message.actions), ...administrator].sort((one, other) => one.id - other.id);
+}
+
+/** The colour of a diff's line: added, removed, a hunk's header. */
+export function diffLine(line: string): string {
+  if (line.startsWith('+')) return 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400';
+  if (line.startsWith('-')) return 'bg-red-500/10 text-red-700 dark:text-red-400';
+  if (line.startsWith('@@')) return 'text-muted-foreground';
+  return '';
+}
+
+/** A diff's lines, without its two header lines: the path is said apart. */
+export const diffLines = (diff: string) =>
+  diff.split('\n').filter((line) => line !== '' && !line.startsWith('--- ') && !line.startsWith('+++ '));
 
 /** A duration in milliseconds, as `340 ms`, `2.4 s`, `3 min 5 s` or `1 h 2 min`. */
 export function duration(milliseconds: number): string {

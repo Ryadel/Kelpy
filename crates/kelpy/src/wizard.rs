@@ -112,6 +112,21 @@ struct OllamaStatus {
     suggestions: Vec<Suggestion>,
 }
 
+/// How Ollama would be installed, as `POST /api/ollama/install` shows it.
+#[derive(Deserialize)]
+struct Installer {
+    command: String,
+    notes: Vec<String>,
+}
+
+/// An installation's progress.
+#[derive(Deserialize)]
+struct Installation {
+    output: String,
+    done: bool,
+    error: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct LocalModel {
     name: String,
@@ -708,9 +723,12 @@ impl Setup {
                     status.error.as_deref().unwrap_or("no details")
                 );
             } else {
+                println!("Ollama is not installed on this computer.");
+                if self.install_ollama()? {
+                    continue;
+                }
                 println!(
-                    "Ollama is not installed on this computer: download it from https://ollama.com/download, or \
-                     enter the address of a computer running it."
+                    "Download it from https://ollama.com/download, or enter the address of a computer running it."
                 );
             }
             if !prompt::confirm("Check again?", true)? {
@@ -780,6 +798,48 @@ impl Setup {
             base_url: Some(address).filter(|address| !address.is_empty()),
             api_key: None,
         })
+    }
+
+    /// Offers to install Ollama on this computer, showing the command first. Returns whether it was installed.
+    fn install_ollama(&self) -> Result<bool> {
+        let Ok(installer) =
+            self.post::<Installer>("/api/ollama/install", &json!({ "preview": true }))
+        else {
+            return Ok(false);
+        };
+        println!("Kelpy can install it: {}", installer.command);
+        for note in &installer.notes {
+            println!("  {note}");
+        }
+        if !prompt::confirm("Install Ollama now?", false)? {
+            return Ok(false);
+        }
+        let mut shown = 0;
+        let mut failed = None;
+        self.runtime.block_on(self.client.events(
+            "/api/ollama/install",
+            &json!({}),
+            |installation: Installation| {
+                // The output so far comes each time: only what is new is printed.
+                if let Some(new) = installation.output.get(shown..) {
+                    print!("{new}");
+                    shown = installation.output.len();
+                }
+                if installation.done {
+                    failed = installation.error;
+                }
+            },
+        ))?;
+        match failed {
+            None => {
+                println!("Ollama is installed and answers.");
+                Ok(true)
+            }
+            Some(error) => {
+                println!("The installation did not complete: {error}");
+                Ok(false)
+            }
+        }
     }
 
     fn download(&self, base_url: &str, model: &str) -> Result<()> {

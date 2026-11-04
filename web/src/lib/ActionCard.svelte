@@ -5,11 +5,12 @@
   import ShieldAlertIcon from '@lucide/svelte/icons/shield-alert';
   import ClockIcon from '@lucide/svelte/icons/clock';
   import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
+  import TriangleAlertIcon from '@lucide/svelte/icons/triangle-alert';
   import XIcon from '@lucide/svelte/icons/x';
   import { Button } from '$lib/components/ui/button';
   import { cn } from '$lib/utils';
   import Elapsed from './Elapsed.svelte';
-  import { duration, stateLabels } from './actions';
+  import { diffLine, diffLines as linesOf, duration, stateLabels } from './actions';
   import type { Action, Approval } from './api';
 
   interface Props {
@@ -31,16 +32,13 @@
   /** A command the model wrote: it always asks, whatever the Approval mode. */
   const written = $derived(action.tool === 'run_command');
   /** The diff's lines, without its two header lines: the path is in the heading. */
-  const diffLines = $derived(
-    (action.change?.diff ?? '')
-      .split('\n')
-      .filter((line) => line !== '' && !line.startsWith('--- ') && !line.startsWith('+++ ')),
-  );
+  const diffLines = $derived(linesOf(action.change?.diff ?? ''));
   /** A command that ran and reported a failure. */
   const exitedBadly = $derived(action.state === 'done' && action.exit_code !== null && action.exit_code !== 0);
+  /** An inspection shows its command; a change says what it does, its commands below. */
   const heading = $derived(
     waiting
-      ? action.command && !written
+      ? action.command && !written && !action.change
         ? 'Kelpy wants to run'
         : `Kelpy wants to ${action.summary.charAt(0).toLowerCase()}${action.summary.slice(1)}`
       : action.summary,
@@ -71,12 +69,6 @@
     }
   }
 
-  function diffLine(line: string): string {
-    if (line.startsWith('+')) return 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400';
-    if (line.startsWith('-')) return 'bg-red-500/10 text-red-700 dark:text-red-400';
-    if (line.startsWith('@@')) return 'text-muted-foreground';
-    return '';
-  }
 
   async function decide(decision: 'approve' | 'deny', switchTo?: Approval) {
     deciding = true;
@@ -107,6 +99,8 @@
       <XIcon class="text-destructive size-4 shrink-0" />
     {:else if action.state === 'denied'}
       <BanIcon class="text-muted-foreground size-4 shrink-0" />
+    {:else if action.state === 'uncertain'}
+      <TriangleAlertIcon class="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
     {:else if exitedBadly}
       <CircleAlertIcon class="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
     {:else}
@@ -142,8 +136,23 @@
       <ShieldAlertIcon class="mt-px size-3.5 shrink-0" />{action.change.floor}
     </p>
   {/if}
+  {#if action.state === 'running' && action.phase}
+    <p class="text-muted-foreground mt-2 text-xs">Now {action.phase}…</p>
+  {/if}
   {#if action.error}
-    <p class={cn('mt-2', action.state === 'failed' ? 'text-destructive' : 'text-muted-foreground')}>{action.error}</p>
+    <p
+      class={cn(
+        'mt-2',
+        action.state === 'failed'
+          ? 'text-destructive'
+          : action.state === 'uncertain'
+            ? 'text-amber-700 dark:text-amber-400'
+            : 'text-muted-foreground',
+      )}
+    >
+      {action.error}{#if action.state === 'uncertain'}. Kelpy will not do it again by itself: check the system
+        first.{/if}
+    </p>
   {/if}
   {#if waiting && written}
     <p class="text-muted-foreground mt-2 text-xs">

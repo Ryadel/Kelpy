@@ -4,17 +4,28 @@
 //! A download belongs to Ollama, not to Kelpy: Kelpy starts it and follows its progress. When Kelpy stops, it stops
 //! following and the connection closes; Ollama keeps what it downloaded, and the next download of the same model
 //! resumes from there.
+//!
+//! Ollama itself is installed through the engine, as the administrator's own operation: the command is shown first
+//! (Ollama's installer on Linux, winget on Windows), runs with its output shown as it comes, and Kelpy then waits for
+//! Ollama to answer.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kelpy_common::lock;
 use kelpy_providers::ollama::LocalModel;
 use kelpy_providers::{Kind, Provider};
+use kelpy_tools::{Executor, Os, Output, Secrets, Tools};
 use serde::Serialize;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+
+/// How long Ollama may take to answer once installed.
+const ANSWER_TIME: Duration = Duration::from_secs(60);
+/// How often an installation's output is passed on.
+const PROGRESS_EVERY: Duration = Duration::from_millis(500);
 
 /// A model worth downloading, for a computer with at least `memory` bytes of RAM.
 #[derive(Debug, Serialize)]
@@ -97,9 +108,41 @@ pub struct Download {
 #[error("Kelpy is stopping: no new downloads can start")]
 pub struct Stopping;
 
+/// How Ollama would be installed on this computer, for the administrator to approve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Installer {
+    /// The command, as it runs.
+    pub command: String,
+    pub notes: Vec<String>,
+}
+
+/// An installation's progress.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Installation {
+    pub command: String,
+    /// What the installer wrote so far.
+    pub output: String,
+    pub done: bool,
+    /// Why it failed, once it has.
+    pub error: Option<String>,
+}
+
+/// Why Ollama cannot be installed by Kelpy.
+#[derive(Debug, thiserror::Error)]
+pub enum InstallError {
+    #[error("{0}")]
+    Unsupported(String),
+    #[error("Kelpy is stopping: nothing can be installed")]
+    Stopping,
+}
+
 pub struct Ollama {
     provider: Provider,
+    /// Where Ollama's installer runs.
+    executor: Executor,
     downloads: Mutex<Downloads>,
+    /// The installation under way, or the last one.
+    installation: Mutex<Option<watch::Receiver<Installation>>>,
     /// Where downloads run, so that stopping Kelpy can wait for them.
     tasks: TaskTracker,
     /// Ends the downloads under way: Kelpy is stopping.
@@ -115,13 +158,149 @@ struct Downloads {
 }
 
 impl Ollama {
-    /// Downloads run in `tasks`.
-    pub fn new(provider: Provider, tasks: TaskTracker) -> Self {
+    /// Downloads and the installation run in `tasks`; the installer through `executor`.
+    pub fn new(provider: Provider, tasks: TaskTracker, executor: Executor) -> Self {
         Self {
             provider,
+            executor,
             downloads: Mutex::new(Downloads::default()),
+            installation: Mutex::new(None),
             tasks,
             stop: CancellationToken::new(),
+        }
+    }
+
+    /// How Ollama would be installed here; an error says why Kelpy cannot install it.
+    pub fn installer(&self) -> Result<Installer, InstallError> {
+        let command = match self.executor.os() {
+            Os::Linux => "curl -fsSL https://ollama.com/install.sh | sh",
+            Os::Windows => {
+                "winget install --id Ollama.Ollama --exact --silent --accept-package-agreements \
+                 --accept-source-agreements"
+            }
+            Os::MacOs => {
+                return Err(InstallError::Unsupported(
+                    "On macOS, download Ollama from https://ollama.com/download".into(),
+                ));
+            }
+        };
+        Ok(Installer {
+            command: command.to_owned(),
+            notes: vec![
+                "Ollama's own installer, from ollama.com, as the account that started Kelpy; on Linux it sets Ollama \
+                 up as a service."
+                    .to_owned(),
+                "Kelpy then waits up to a minute for Ollama to answer on this computer.".to_owned(),
+            ],
+        })
+    }
+
+    /// Installs Ollama, or follows the installation under way. `guard` is kept until it ends.
+    pub fn install(
+        self: &Arc<Self>,
+        guard: impl Send + 'static,
+    ) -> Result<watch::Receiver<Installation>, InstallError> {
+        let installer = self.installer()?;
+        let base_url = Kind::Ollama
+            .default_base_url()
+            .unwrap_or_default()
+            .to_owned();
+        self.install_with(installer.command, base_url, guard)
+    }
+
+    /// Runs `command` as Ollama's installer, then waits for Ollama to answer at `base_url`.
+    fn install_with(
+        self: &Arc<Self>,
+        command: String,
+        base_url: String,
+        guard: impl Send + 'static,
+    ) -> Result<watch::Receiver<Installation>, InstallError> {
+        let mut installation = lock(&self.installation);
+        if let Some(under_way) = installation
+            .as_ref()
+            .filter(|under_way| !under_way.borrow().done)
+        {
+            return Ok(under_way.clone());
+        }
+        if lock(&self.downloads).closed {
+            return Err(InstallError::Stopping);
+        }
+        let (progress, follower) = watch::channel(Installation {
+            command: command.clone(),
+            ..Installation::default()
+        });
+        *installation = Some(follower.clone());
+        let ollama = Arc::clone(self);
+        self.tasks.spawn(async move {
+            let _guard = guard;
+            let error = ollama
+                .run_installer(&command, &base_url, &progress)
+                .await
+                .err();
+            progress.send_modify(|installation| {
+                installation.done = true;
+                installation.error = error;
+            });
+        });
+        Ok(follower)
+    }
+
+    /// Runs the installer, passing its output on, then waits for Ollama to answer.
+    async fn run_installer(
+        &self,
+        command: &str,
+        base_url: &str,
+        progress: &watch::Sender<Installation>,
+    ) -> Result<(), String> {
+        let tools = Tools::new(self.executor.os());
+        let call = serde_json::json!({ "command": command, "directory": std::env::temp_dir() });
+        let mut prepared = tools
+            .prepare("run_command", &call.to_string())
+            .map_err(|error| error.to_string())?;
+        self.executor
+            .resolve(&mut prepared)
+            .map_err(|error| error.to_string())?;
+        let output = Output::new();
+        let secrets = Secrets::new();
+        let run = self.executor.run(&prepared, &secrets, &output);
+        tokio::pin!(run);
+        let mut tick = tokio::time::interval(PROGRESS_EVERY);
+        let ran = loop {
+            tokio::select! {
+                ran = &mut run => break ran,
+                () = self.stop.cancelled() => return Err("Kelpy stopped during the installation".to_owned()),
+                _ = tick.tick() => {
+                    let text = output.snapshot().1;
+                    progress.send_modify(|installation| installation.output = text);
+                }
+            }
+        };
+        let text = output.snapshot().1;
+        progress.send_modify(|installation| installation.output = text);
+        match ran {
+            Ok(ran) if ran.exit_code == Some(0) => {}
+            Ok(ran) => {
+                return Err(format!(
+                    "the installer ended with exit code {}",
+                    ran.exit_code.unwrap_or(-1)
+                ));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        let deadline = tokio::time::Instant::now() + ANSWER_TIME;
+        loop {
+            if self.provider.ollama_models(base_url).await.is_ok() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "Ollama is installed but does not answer at {base_url}: start it, then choose Check"
+                ));
+            }
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(2)) => {}
+                () = self.stop.cancelled() => return Err("Kelpy stopped".to_owned()),
+            }
         }
     }
 
@@ -315,7 +494,7 @@ mod tests {
         let body = lines.map(|line| format!("{line}\n")).concat();
         let server = FakeServer::start(vec![("POST /api/pull", "200 OK", body)]).await;
         let gate = server.hold("POST /api/pull");
-        let ollama = Arc::new(Ollama::new(Provider::new().unwrap(), TaskTracker::new()));
+        let ollama = Arc::new(ollama());
 
         let mut first = ollama.download(&server.url, "qwen3:8b", ()).unwrap();
         let _second = ollama.download(&server.url, "qwen3:8b", ()).unwrap();
@@ -342,9 +521,55 @@ mod tests {
         assert!(ollama.status(Some(&server.url)).await.downloads.is_empty());
     }
 
+    fn ollama() -> Ollama {
+        Ollama::new(
+            Provider::new().unwrap(),
+            TaskTracker::new(),
+            Executor::local(Vec::new(), std::env::temp_dir()),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_installer_runs_with_its_output_shown_then_ollama_must_answer() {
+        let tags = json!({ "models": [] }).to_string();
+        let server = FakeServer::start(vec![("GET /api/tags", "200 OK", tags)]).await;
+        let ollama = Arc::new(ollama());
+        let installer = ollama.installer();
+        match Os::current() {
+            Os::MacOs => assert!(installer.is_err()),
+            _ => assert!(installer.unwrap().command.to_lowercase().contains("ollama")),
+        }
+
+        let mut installed = ollama
+            .install_with("echo installing".into(), server.url.clone(), ())
+            .unwrap();
+        let done = installed
+            .wait_for(|installation| installation.done)
+            .await
+            .unwrap()
+            .clone();
+        assert_eq!(done.error, None);
+        assert!(done.output.contains("installing"), "{}", done.output);
+
+        // An installer that fails says so; Ollama is not waited for.
+
+        let mut failed = ollama
+            .install_with("exit 3".into(), server.url.clone(), ())
+            .unwrap();
+        let done = failed
+            .wait_for(|installation| installation.done)
+            .await
+            .unwrap()
+            .clone();
+        assert_eq!(
+            done.error.as_deref(),
+            Some("the installer ended with exit code 3")
+        );
+    }
+
     #[tokio::test]
     async fn an_ollama_that_does_not_answer_is_reported() {
-        let ollama = Ollama::new(Provider::new().unwrap(), TaskTracker::new());
+        let ollama = ollama();
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()

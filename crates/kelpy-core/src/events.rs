@@ -6,7 +6,7 @@
 //! is bounded by the answer itself. Each subscriber has a bounded queue; one that falls behind receives
 //! [`Event::Resync`] in place of the events it missed, and reads again what it shows.
 
-use kelpy_storage::{Message, Session};
+use kelpy_storage::{Action, Message, Session};
 use serde::Serialize;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_util::sync::CancellationToken;
@@ -42,6 +42,14 @@ pub enum Event {
         /// The last message the conversation's summary covers, if its older part is summarised for the model.
         summarised_through: Option<i64>,
     },
+    /// An operation the administrator asked for started or ended: it is not part of an answer.
+    ActionChanged {
+        session_id: i64,
+        action: Box<Action>,
+    },
+    /// Differences between what Kelpy left on the server and what is there were found or settled: the interfaces
+    /// read them again.
+    DifferencesChanged,
     /// The provider, or what it needs to answer (a sign-in, a key), changed: the interfaces read it again.
     ProviderChanged,
     /// Some events were missed by a subscriber that fell behind: it reads again everything it shows.
@@ -59,6 +67,8 @@ impl Event {
             Self::SessionDeleted { .. } => "session_deleted",
             Self::AnswerStarted { .. } => "answer_started",
             Self::AnswerEnded { .. } => "answer_ended",
+            Self::ActionChanged { .. } => "action_changed",
+            Self::DifferencesChanged => "differences_changed",
             Self::ProviderChanged => "provider_changed",
             Self::Resync => "resync",
             Self::Stopping => "stopping",
