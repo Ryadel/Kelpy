@@ -913,6 +913,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "webpki-root-certs",
 ]
 
 [[package]]

@@ -1,0 +1,141 @@
+# Publishes a release when a version tag is pushed:
+#
+#   git tag -a v0.1.0 -m "Release notes"
+#   git push origin v0.1.0
+#
+# The tag annotation becomes the release notes. The release appears only when every file is built, so
+# `releases/latest/download/` never points at a release with a file missing. The file names are what
+# https://kelpy.io/install.sh and install.ps1 download: renaming one breaks the install command.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  web:
+    name: Web UI
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun test
+      - run: bun run build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  build:
+    name: ${{ matrix.asset }}
+    needs: web
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: kelpy-linux-x86_64
+            binary: kelpy
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            asset: kelpy-windows-x86_64.exe
+            binary: kelpy.exe
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check that the tag matches the version in Cargo.toml
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+
+      # The Web UI is embedded at build time; without web/dist the executable would ship without it.
+      - uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist
+      - run: test -f web/dist/index.html
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked -p kelpy --target ${{ matrix.target }}
+
+      - name: Check that the executable stands alone
+        run: |
+          exe="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          if [ "$RUNNER_OS" = Linux ]; then
+            file "$exe" | grep -q 'static' || { file "$exe"; echo "::error::not statically linked"; exit 1; }
+          else
+            vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+            dumpbin="$("$vswhere" -latest -find 'VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe' | head -n 1)"
+            imports="$("$dumpbin" -nologo -dependents "$exe")"
+            if echo "$imports" | grep -qi 'vcruntime\|api-ms-win-crt'; then
+              echo "$imports"; echo "::error::depends on the Visual C++ runtime"; exit 1
+            fi
+          fi
+          "$exe" --version
+
+      - run: |
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      # The checkout keeps the tag without its annotation, which is the release notes.
+      - run: git fetch --force --depth=1 origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: kelpy-*
+          path: dist
+          merge-multiple: true
+      - name: Add the install scripts and the checksums
+        working-directory: dist
+        run: |
+          cp ../scripts/install.sh ../scripts/install.ps1 .
+          sha256sum kelpy-linux-x86_64 kelpy-windows-x86_64.exe install.sh install.ps1 > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag --title "Kelpy ${GITHUB_REF_NAME#v}" \
+            dist/kelpy-linux-x86_64 dist/kelpy-windows-x86_64.exe dist/install.sh dist/install.ps1 dist/SHA256SUMS

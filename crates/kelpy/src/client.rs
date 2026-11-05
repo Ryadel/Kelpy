@@ -17,10 +17,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(url: String, token: String) -> Result<Self> {
-        kelpy_core::providers::install_tls();
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .build()
+        let http = kelpy_core::providers::http_client(|builder| builder.no_proxy())
             .context("cannot create the HTTP client")?;
         Ok(Self { http, url, token })
     }

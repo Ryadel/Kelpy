@@ -484,22 +484,43 @@ pub struct Provider {
 }
 
 /// Installs the TLS backend of every HTTP client in the program: rustls with `ring`, which builds everywhere
-/// without extra tools. Call it before building any `reqwest` client, even one for plain HTTP.
-pub fn install_tls() {
+/// without extra tools. Called before building any `reqwest` client, even one for plain HTTP.
+pub(crate) fn install_tls() {
     // Fails only if a backend is already installed, which is just as good.
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Builds an HTTP client, every one in the program. Servers are checked against the system's certificate
+/// authorities, so a company's own authority is trusted too. A system without any (a minimal container) gets
+/// Mozilla's, built into Kelpy: otherwise building fails, even a client that only speaks plain HTTP.
+pub fn http_client(
+    configure: impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> reqwest::Result<reqwest::Client> {
+    install_tls();
+    configure(reqwest::Client::builder())
+        .build()
+        .or_else(|error| {
+            // The authorities are the only difference, so if this works they were the reason.
+            let mozilla = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .filter_map(|der| reqwest::Certificate::from_der(der).ok());
+            configure(reqwest::Client::builder())
+                .tls_certs_only(mozilla)
+                .build()
+                .map_err(|_| error)
+        })
+}
+
 impl Provider {
     pub fn new() -> Result<Self, ProviderError> {
-        install_tls();
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("Kelpy/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(20))
-            // Between two pieces of a streamed answer; providers send keep-alive events while the model thinks.
-            .read_timeout(Duration::from_secs(300))
-            .build()
-            .map_err(|error| ProviderError::Network(error.to_string()))?;
+        let client = http_client(|builder| {
+            builder
+                .user_agent(concat!("Kelpy/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(20))
+                // Between two pieces of a streamed answer; providers send keep-alive events while the model thinks.
+                .read_timeout(Duration::from_secs(300))
+        })
+        .map_err(|error| ProviderError::Network(error.to_string()))?;
         Ok(Self { client })
     }
 

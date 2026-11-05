@@ -1,0 +1,4 @@
+# The C runtime is linked into the executable: a fresh Windows Server has no VCRUNTIME140.dll, and Kelpy must run
+# there as it is downloaded.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
