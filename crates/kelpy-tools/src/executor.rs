@@ -582,7 +582,12 @@ mod tests {
             .unwrap();
         assert_eq!(output.phase().as_deref(), Some("running the command"));
         assert_eq!(ran.exit_code, Some(4));
-        let lines: Vec<&str> = ran.output.lines().collect();
+        // Output and errors come through two pipes, so the error may land anywhere between the output lines.
+        let lines: Vec<&str> = ran
+            .output
+            .lines()
+            .filter(|line| !line.contains("oops"))
+            .collect();
         assert_eq!(lines[..2], ["it's \"quoted\" \\ here", "C:\\dir\\\" \\"]);
         // Errors as text, not as PowerShell's XML, and without Kelpy's own lines.
         assert!(ran.output.contains("oops"), "{}", ran.output);

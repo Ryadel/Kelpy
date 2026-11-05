@@ -56,6 +56,8 @@ jobs:
       # Azure sign-in for Windows signing, through the federated credential.
       id-token: write
     strategy:
+      # One platform failing must not hide how the others went.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
