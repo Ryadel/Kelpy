@@ -131,3 +131,19 @@
     @apply bg-background text-foreground font-sans text-[15px] antialiased;
   }
 }
+
+/* The mark is the black one in both themes: on the dark one a soft turquoise glow lifts it from the background. */
+.mark-glow {
+  position: absolute;
+  pointer-events: none;
+  border-radius: 9999px;
+  background: radial-gradient(
+    closest-side,
+    color-mix(in srgb, var(--primary) 20%, transparent),
+    color-mix(in srgb, var(--primary) 6%, transparent) 60%,
+    transparent
+  );
+}
+:root:not(.dark) .mark-glow {
+  display: none;
+}

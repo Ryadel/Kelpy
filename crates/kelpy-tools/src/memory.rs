@@ -7,8 +7,15 @@
 //! it, never writes it.
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+use tokio::io::AsyncWriteExt;
 
 use crate::{ToolError, invalid};
+
+/// Serialises Kelpy's writes to its memory: a note reads its page and the index, adds to them and writes them back,
+/// so two notes at once would otherwise keep one. Process-wide, as one Kelpy runs for a home (the runtime lock).
+static WRITER: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
 
 /// The index of the pages.
 pub const INDEX: &str = "MEMORY.md";
@@ -80,6 +87,7 @@ pub(crate) async fn remember(
             "server.md is written by Kelpy from what it changed: note facts on another page",
         ));
     }
+    let _writing = WRITER.lock().await;
     let path = folder.join(format!("{name}.md"));
     let written = |source| ToolError::Write {
         path: path.clone(),
@@ -98,8 +106,7 @@ pub(crate) async fn remember(
         content.push('\n');
     }
     content.push_str(&format!("- {today}: {note}\n"));
-    tokio::fs::write(&path, &content).await.map_err(written)?;
-    restrict(&path).await;
+    replace(&path, &content).await.map_err(written)?;
     list(folder, name).await?;
     Ok(format!("Remembered on memory/{name}.md."))
 }
@@ -119,7 +126,7 @@ async fn list(folder: &Path, name: &str) -> Result<(), ToolError> {
     } else {
         format!("{}\n{entry}\n", index.trim_end())
     };
-    tokio::fs::write(&path, index)
+    replace(&path, &index)
         .await
         .map_err(|source| ToolError::Write { path, source })
 }
@@ -162,19 +169,32 @@ pub async fn trusted(path: &Path) -> Result<(), ToolError> {
     Ok(())
 }
 
-/// Makes a page Kelpy wrote readable and writable by its owner only.
-async fn restrict(path: &Path) {
+/// Replaces the file at `path` with `content`, readable and writable by its owner only: written beside it, then
+/// renamed over it, so that a reader never sees it half written.
+async fn replace(path: &Path, content: &str) -> std::io::Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let staged = path.with_file_name(format!(".{name}.kelpy-{}", std::process::id()));
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
+    options.mode(0o600);
+    let made = async {
+        let mut file = options.open(&staged).await?;
+        file.write_all(content.as_bytes()).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&staged, path).await
     }
-    #[cfg(not(unix))]
-    let _ = path;
+    .await;
+    if made.is_err() {
+        let _ = tokio::fs::remove_file(&staged).await;
+    }
+    made
 }
 
 /// Writes Kelpy's own page, `server.md`.
 pub async fn write_server_page(folder: &Path, content: &str) -> std::io::Result<PathBuf> {
+    let _writing = WRITER.lock().await;
     let path = folder.join(format!("{SERVER_PAGE}.md"));
     let untrusted = |why: String| std::io::Error::new(std::io::ErrorKind::PermissionDenied, why);
     trusted(&path)
@@ -186,8 +206,7 @@ pub async fn write_server_page(folder: &Path, content: &str) -> std::io::Result<
     {
         return Err(untrusted(format!("{} is a link", path.display())));
     }
-    tokio::fs::write(&path, content).await?;
-    restrict(&path).await;
+    replace(&path, content).await?;
     Ok(path)
 }
 
@@ -242,6 +261,34 @@ mod tests {
         assert!(page("../etc/passwd").is_err() && page("Nginx").is_err());
         assert_eq!(page("nginx.md").unwrap(), "nginx");
         assert_eq!(note("  two\n lines ").unwrap(), "two lines");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn notes_made_at_once_are_all_kept() {
+        let folder = tempfile::tempdir().unwrap();
+        fs::write(folder.path().join(INDEX), "# Memory\n\n_None yet._\n").unwrap();
+        let notes = (0..16).map(|number| {
+            let folder = folder.path().to_owned();
+            tokio::spawn(async move {
+                let page = if number % 2 == 0 { "nginx" } else { "backups" };
+                remember(&folder, page, &format!("Fact {number}."), "2026-11-04").await
+            })
+        });
+        for note in notes.collect::<Vec<_>>() {
+            note.await.unwrap().unwrap();
+        }
+        let pages = ["nginx", "backups"]
+            .map(|page| fs::read_to_string(folder.path().join(format!("{page}.md"))).unwrap());
+        let kept = pages
+            .iter()
+            .flat_map(|page| page.lines())
+            .filter(|line| line.starts_with("- "));
+        assert_eq!(kept.count(), 16, "{pages:?}");
+        let index = fs::read_to_string(folder.path().join(INDEX)).unwrap();
+        assert!(
+            index.contains("(nginx.md)") && index.contains("(backups.md)"),
+            "{index}"
+        );
     }
 
     #[cfg(unix)]

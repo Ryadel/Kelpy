@@ -12,12 +12,12 @@
 //! | `POST /api/sessions/{id}/cancel` | stop the answer being written |
 //! | `POST /api/sessions/{id}/actions/{action}` | approve or deny an action waiting for a decision |
 //! | `POST /api/sessions/{id}/actions/{action}/stop` | stop an action running; the answer goes on |
-//! | `POST /api/sessions/{id}/actions/{action}/restore` | put a file back from the backup of a change; `preview` only shows it |
+//! | `POST /api/sessions/{id}/actions/{action}/restore` | put a file back from the backup of a change: `preview` shows it, `fingerprint` runs what was shown |
 //! | `GET /api/sessions/{id}/report` | the handover report, in Markdown |
 //! | `GET /api/sessions/{id}/export` | the operations that succeeded, as JSON |
 //! | `GET /api/differences`, `POST /api/differences/check` | changes made outside Kelpy; check again now |
 //! | `POST /api/differences/{id}/accept` | keep what was found |
-//! | `POST /api/sessions/{id}/differences/{difference}/put-back` | put Kelpy's version back; `preview` only shows it |
+//! | `POST /api/sessions/{id}/differences/{difference}/put-back` | put Kelpy's version back: `preview` shows it, `fingerprint` runs what was shown |
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -343,19 +343,23 @@ async fn stop_action(
     }
 }
 
-/// An operation of the administrator: shown first with `preview`, then run.
-#[derive(Deserialize, Default)]
+/// An operation of the administrator: shown first with `preview`, then run with the `fingerprint` the preview gave.
+#[derive(Deserialize)]
 struct Operation {
     #[serde(default)]
     preview: bool,
+    fingerprint: Option<String>,
 }
 
-/// The body is optional: empty runs the operation.
-fn operation(body: &[u8]) -> Result<Operation, serde_json::Error> {
-    if body.iter().all(u8::is_ascii_whitespace) {
-        return Ok(Operation::default());
+/// What the operation is asked to do: `None` to show it, else the fingerprint of the change shown, to run it. Fails
+/// with why the body is not one of the two.
+fn operation(body: &[u8]) -> Result<Option<String>, String> {
+    let operation: Operation = serde_json::from_slice(body).map_err(|parse| parse.to_string())?;
+    match (operation.preview, operation.fingerprint) {
+        (true, None) => Ok(None),
+        (false, Some(fingerprint)) => Ok(Some(fingerprint)),
+        _ => Err("send either `preview`, or the `fingerprint` of the change shown".into()),
     }
-    serde_json::from_slice(body)
 }
 
 async fn restore(
@@ -363,13 +367,13 @@ async fn restore(
     Path((id, action)): Path<(i64, i64)>,
     body: axum::body::Bytes,
 ) -> Response {
-    let operation = match operation(&body) {
-        Ok(operation) => operation,
-        Err(parse) => return error(StatusCode::BAD_REQUEST, "invalid", parse.to_string()),
+    let confirmed = match operation(&body) {
+        Ok(confirmed) => confirmed,
+        Err(why) => return error(StatusCode::BAD_REQUEST, "invalid", why),
     };
     // Kelpy does not stop for inactivity while it changes a file.
     let _busy = state.activity.busy();
-    match state.agent.restore(id, action, operation.preview).await {
+    match state.agent.restore(id, action, confirmed).await {
         Ok(operated) => Json(operated).into_response(),
         Err(error) => failure(&error),
     }
@@ -380,16 +384,12 @@ async fn put_back(
     Path((id, difference)): Path<(i64, i64)>,
     body: axum::body::Bytes,
 ) -> Response {
-    let operation = match operation(&body) {
-        Ok(operation) => operation,
-        Err(parse) => return error(StatusCode::BAD_REQUEST, "invalid", parse.to_string()),
+    let confirmed = match operation(&body) {
+        Ok(confirmed) => confirmed,
+        Err(why) => return error(StatusCode::BAD_REQUEST, "invalid", why),
     };
     let _busy = state.activity.busy();
-    match state
-        .agent
-        .put_back(id, difference, operation.preview)
-        .await
-    {
+    match state.agent.put_back(id, difference, confirmed).await {
         Ok(operated) => Json(operated).into_response(),
         Err(error) => failure(&error),
     }

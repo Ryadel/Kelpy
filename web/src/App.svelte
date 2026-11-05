@@ -288,9 +288,11 @@
 
 {#snippet brand()}
   <h1 class="flex shrink-0 items-center gap-2.5 px-1.5 text-[17px] font-semibold tracking-tight">
-    <!-- The logo follows the Web UI's theme, which the user may set apart from the system's. -->
-    <img src="/brand/kelpy-light.svg" alt="" width="28" height="28" class="size-7 object-contain dark:hidden" />
-    <img src="/brand/kelpy-dark.svg" alt="" width="28" height="28" class="hidden size-7 object-contain dark:block" />
+    <!-- The black mark in both themes; on the dark one a faint turquoise glow lifts it from the background. -->
+    <span class="relative inline-grid size-7 shrink-0 place-items-center">
+      <span class="mark-glow -inset-3" aria-hidden="true"></span>
+      <img src="/brand/kelpy-light.svg" alt="" width="28" height="28" class="relative size-7 object-contain" />
+    </span>
     Kelpy
   </h1>
 {/snippet}

@@ -1,0 +1,2 @@
+# Shell scripts run on Linux as they are checked out: a CR at a line end breaks them.
+*.sh text eol=lf

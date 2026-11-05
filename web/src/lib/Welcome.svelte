@@ -22,8 +22,10 @@
 <div class="flex flex-1 flex-col items-center justify-center overflow-y-auto px-4 pb-[12vh]">
   <div class="w-full max-w-3xl">
     <div class="mb-7 flex flex-col items-center text-center">
-      <img src="/brand/kelpy-light.svg" alt="" width="96" height="96" class="mb-4 size-24 object-contain dark:hidden" />
-      <img src="/brand/kelpy-dark.svg" alt="" width="96" height="96" class="mb-4 hidden size-24 object-contain dark:block" />
+      <span class="relative mb-4 inline-grid size-24 place-items-center">
+        <span class="mark-glow -inset-8" aria-hidden="true"></span>
+        <img src="/brand/kelpy-light.svg" alt="" width="96" height="96" class="relative size-24 object-contain" />
+      </span>
       <h2 class="text-[28px] font-semibold tracking-tight">What do you need to do?</h2>
     </div>
     {@render children()}

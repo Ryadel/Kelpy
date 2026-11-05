@@ -13,15 +13,15 @@
     title: string;
     /** The button that runs it. */
     confirm: string;
-    /** Asks Kelpy what the operation would change, or runs it. */
-    operate: (preview: boolean) => Promise<Operated>;
+    /** Asks Kelpy what the operation would change (`null`), or runs the change shown (its fingerprint). */
+    operate: (fingerprint: string | null) => Promise<Operated>;
     /** Called with the action once it ran, or failed. */
     onDone: (action: Action) => void;
   }
 
   let { open = $bindable(), title, confirm, operate, onDone }: Props = $props();
 
-  let preview = $state<{ summary: string; change: Change } | null>(null);
+  let preview = $state<{ summary: string; change: Change; fingerprint: string } | null>(null);
   let error = $state<string | null>(null);
   let working = $state(false);
 
@@ -39,7 +39,7 @@
     preview = null;
     error = null;
     try {
-      const operated = await operate(true);
+      const operated = await operate(null);
       if (operated.outcome === 'preview') {
         preview = operated;
       }
@@ -49,10 +49,11 @@
   }
 
   async function run() {
+    if (!preview) return;
     working = true;
     error = null;
     try {
-      const operated = await operate(false);
+      const operated = await operate(preview.fingerprint);
       if (operated.outcome === 'done') {
         onDone(operated.action);
         if (operated.action.state === 'done') {

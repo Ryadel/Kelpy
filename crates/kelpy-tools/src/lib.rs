@@ -39,7 +39,7 @@ pub use executor::{Executor, Observed, Ran};
 pub use output::Output;
 pub use package::PackageChange;
 pub use script::MAX_SCRIPT;
-pub use secret::Secrets;
+pub use secret::{Registry, Secrets};
 pub use service::{ServiceAction, ServiceChange};
 
 /// Why an action could not be prepared or run. Its text is the call's result for the model, and is shown in the
@@ -556,7 +556,9 @@ impl Tools {
                 "write_file",
                 format!(
                     "Creates a text file, or replaces all its content; its folder must exist. To change part of an \
-                     existing file, use edit_file. {checked}"
+                     existing file, use edit_file. An existing file keeps its owner and permissions. On Linux and \
+                     macOS a new file that may hold secrets, or holds one, is readable by Kelpy's account only (mode \
+                     600): give the service that reads it access with run_command, such as chown or chmod. {checked}"
                 ),
                 &[
                     ("path", "The file's absolute path."),

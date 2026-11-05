@@ -45,11 +45,22 @@ and troubleshooting.
 
 ## Getting started
 
-Run the executable:
+On Linux (x86-64):
 
-```text
-kelpy
+```sh
+curl -fsSL https://kelpy.io/install.sh | sh
 ```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://kelpy.io/install.ps1 | iex
+```
+
+The command downloads the executable from the latest [release](https://github.com/Ryadel/Kelpy/releases), checks
+it against the release's SHA-256 checksums and starts it. To download it yourself, take the file for your platform
+from the release and run it. The [wiki](https://github.com/Ryadel/Kelpy/wiki/Installation-and-first-run) has both
+ways in full, and the variant for Windows Server 2016.
 
 The first run asks where Kelpy should live (by default `~/Kelpy`), installs itself there and, if you want, adds
 that folder to your PATH, with no administrator rights needed. Everything Kelpy owns stays in that one folder:
@@ -64,16 +75,19 @@ Kelpy/
   logs/
 ```
 
-Later runs start straight away and print the Web UI address with a one-click sign-in link, and the access code
-for signing in from another browser. The code is new at every start:
+Later runs start straight away and print the Web UI address with a one-click sign-in link, the access code for
+signing in from another browser (new at every start), the AI provider with whether answers can start, and the
+account Kelpy runs as:
 
 ```text
 Kelpy v0.1.0
 
 Agent runtime started.
-Web UI: http://127.0.0.1:54321/#code=K7QM-4ZP2
-Code:   K7QM-4ZP2  (to sign in from another browser)
-Home:   C:\Users\you\Kelpy
+Web UI:   http://127.0.0.1:54321/#code=K7QM-4ZP2
+Code:     K7QM-4ZP2  (to sign in from another browser)
+Home:     C:\Users\you\Kelpy
+Provider: Ollama (qwen3.5:9b) - ready (no API key needed)
+Account:  you (elevated)
 
 Press Ctrl+C to stop.
 ```

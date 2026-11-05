@@ -115,7 +115,7 @@ fn first_run(executable: &Path, executable_dir: &Path, options: &Options<'_>) ->
             )?);
 
     let home = install(executable, &target, in_place, add_to_path)?;
-    if !in_place {
+    if !in_place && !temporary_installer() {
         if interactive {
             offer_installer_removal(executable, &home)?;
         } else {
@@ -249,6 +249,13 @@ fn report_path_change(change: std::io::Result<PathChange>, target: &Path) {
         }
         Err(error) => println!("! Could not add Kelpy to your PATH: {error}"),
     }
+}
+
+/// Set by the install scripts (`scripts/install.sh`, `scripts/install.ps1`), which download Kelpy into a temporary
+/// folder and remove it when Kelpy exits: there is no installer file to offer to delete, nor to point back home.
+/// An environment variable rather than an option, because an older installed copy receives the same arguments.
+fn temporary_installer() -> bool {
+    env::var_os("KELPY_TEMPORARY_INSTALLER").is_some_and(|value| value == "1")
 }
 
 fn offer_installer_removal(installer: &Path, home: &Home) -> Result<()> {

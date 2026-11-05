@@ -2,9 +2,9 @@
 //!
 //! Before approval Kelpy reads which of the packages are installed and asks apt what the change would do, without
 //! doing it (`apt-get -s`): the card lists the packages installed or removed with them. Once approved ([`apply`]) it
-//! refreshes the package lists when they are old, makes the change, and checks each package. An installation that
-//! fails removes the packages it added, those that were not installed before. Removing always asks: a package's data
-//! may go with it.
+//! refreshes the package lists when they are old, asks apt again and stops if installing would now remove a package
+//! the card did not show, makes the change, and checks each package. An installation that fails removes the
+//! packages it added, those that were not installed before. Removing always asks: a package's data may go with it.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
@@ -56,7 +56,8 @@ impl PackageChange {
         if planned.refresh {
             notes.push(
                 "The package lists are refreshed first (apt-get update): what is installed may then differ a \
-                 little from the list above."
+                 little from the list above. If it would remove a package the list does not show, nothing is \
+                 installed."
                     .to_owned(),
             );
         }
@@ -129,9 +130,7 @@ pub async fn plan(
     if change.install && !refresh {
         virtual_packages(&change.packages, &versions).await?;
     }
-    let mut simulate = vec!["-s", "-y", verb];
-    simulate.extend(change.packages.iter().map(String::as_str));
-    let (code, said) = captured(&run("apt-get", &simulate), None, RUN_TIME).await?;
+    let (code, said) = captured(&simulation(change), None, RUN_TIME).await?;
     let preview = if code == 0 {
         preview(&said)
     } else if refresh {
@@ -167,9 +166,9 @@ pub async fn plan(
         None
     };
     Ok(Ok(PackagePlanned {
+        command: command(change, !removed(&preview).is_empty()),
         preview,
         refresh,
-        command: command(change),
         floor,
     }))
 }
@@ -236,6 +235,9 @@ pub async fn apply(
                 "the package lists could not be refreshed: nothing was installed".to_owned(),
             ));
         }
+    }
+    if change.install {
+        unshown_removals(change, planned).await?;
     }
     let before = everything_installed().await?;
     output.set_phase(if change.install {
@@ -323,17 +325,69 @@ pub async fn apply(
     )))
 }
 
-/// The command that makes the change, without questions.
-fn command(change: &PackageChange) -> Command {
+/// Fails when installing would now remove a package the approved preview did not show: after the refresh, or
+/// because the server changed while the card waited. The command's `--no-remove` covers the case where the preview
+/// removed nothing; this check covers the others, and says why before anything is done.
+async fn unshown_removals(
+    change: &PackageChange,
+    planned: &PackagePlanned,
+) -> Result<(), ToolError> {
+    let (code, said) = captured(&simulation(change), None, RUN_TIME).await?;
+    if code != 0 {
+        // The installation fails the same way, and says why.
+        return Ok(());
+    }
+    let approved = removed(&planned.preview);
+    let now = preview(&said);
+    let unshown: Vec<&str> = removed(&now)
+        .into_iter()
+        .filter(|name| !approved.contains(name))
+        .collect();
+    if unshown.is_empty() {
+        Ok(())
+    } else {
+        Err(ToolError::Unverified(format!(
+            "installing them would now also remove {}, which the approved change did not show: nothing was              installed, plan it again",
+            unshown.join(", ")
+        )))
+    }
+}
+
+/// apt's simulation of the change (`apt-get -s`): what it would install and remove, without doing it.
+fn simulation(change: &PackageChange) -> Command {
+    let mut args = vec![
+        "-s",
+        "-y",
+        if change.install { "install" } else { "remove" },
+    ];
+    args.extend(change.packages.iter().map(String::as_str));
+    run("apt-get", &args)
+}
+
+/// The packages a [`preview`] shows removed.
+fn removed(preview: &str) -> BTreeSet<&str> {
+    preview
+        .lines()
+        .filter_map(|line| line.strip_prefix('-')?.split_whitespace().next())
+        .collect()
+}
+
+/// The command that makes the change, without questions. An installation whose preview removes nothing gets
+/// `--no-remove`: apt then stops rather than remove a package nobody approved.
+fn command(change: &PackageChange, removes: bool) -> Command {
     let mut args = if change.install {
-        vec![
+        let mut args = vec![
             "install",
             "-y",
             "-o",
             "Dpkg::Options::=--force-confdef",
             "-o",
             "Dpkg::Options::=--force-confold",
-        ]
+        ];
+        if !removes {
+            args.push("--no-remove");
+        }
+        args
     } else {
         vec!["remove", "-y"]
     };
@@ -483,9 +537,34 @@ Remv nano [7.2-2build1]
             planned: None,
         };
         assert_eq!(
-            command(&removal).display,
+            command(&removal, true).display,
             "DEBIAN_FRONTEND=noninteractive apt-get remove -y nginx"
         );
         assert_eq!(removal.summary(), "Remove nginx");
+    }
+
+    #[test]
+    fn an_installation_removes_only_what_its_preview_shows() {
+        let install = PackageChange {
+            packages: vec!["nginx".into()],
+            install: true,
+            planned: None,
+        };
+        assert!(
+            command(&install, false)
+                .display
+                .ends_with(" --no-remove nginx")
+        );
+        assert!(!command(&install, true).display.contains("--no-remove"));
+        assert_eq!(
+            removed(
+                "+nginx 1.24
+-nano 7.2-2build1
+-vim"
+            ),
+            BTreeSet::from(["nano", "vim"])
+        );
+        assert!(removed("apt would change no package.").is_empty());
+        assert!(removed("Not known until the package lists are refreshed.").is_empty());
     }
 }

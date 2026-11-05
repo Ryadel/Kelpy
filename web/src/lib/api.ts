@@ -105,10 +105,15 @@ export interface PlanStep {
   floor: string | null;
 }
 
-/** What an operation of the administrator would do, or did. */
+/** What an operation of the administrator would do, or did. Running a preview takes its `fingerprint` back: it
+ * runs only while the file is as shown. */
 export type Operated =
-  | { outcome: 'preview'; summary: string; change: Change }
+  | { outcome: 'preview'; summary: string; change: Change; fingerprint: string }
   | { outcome: 'done'; action: Action };
+
+/** The body of an operation: shown without a fingerprint, run with the one its preview gave. */
+const operation = (fingerprint: string | null) =>
+  JSON.stringify(fingerprint === null ? { preview: true } : { fingerprint });
 
 /** A difference between what Kelpy left on the server and what is there: changed outside Kelpy. */
 export interface Difference {
@@ -627,11 +632,11 @@ export async function stopAction(sessionId: number, actionId: number): Promise<v
   await request(`/api/sessions/${sessionId}/actions/${actionId}/stop`, { method: 'POST' });
 }
 
-/** Puts a file back from the backup of a change: with `preview`, only shows what would change. */
-export const restoreAction = (sessionId: number, actionId: number, preview: boolean) =>
+/** Puts a file back from the backup of a change: without `fingerprint`, only shows what would change. */
+export const restoreAction = (sessionId: number, actionId: number, fingerprint: string | null) =>
   json<Operated>(`/api/sessions/${sessionId}/actions/${actionId}/restore`, {
     method: 'POST',
-    body: JSON.stringify({ preview }),
+    body: operation(fingerprint),
   });
 
 export const fetchDifferences = () => json<Difference[]>('/api/differences');
@@ -644,11 +649,11 @@ export async function acceptDifference(id: number): Promise<void> {
   await request(`/api/differences/${id}/accept`, { method: 'POST' });
 }
 
-/** Puts Kelpy's version of a file back, as an operation in the conversation: with `preview`, only shows it. */
-export const putBack = (sessionId: number, id: number, preview: boolean) =>
+/** Puts Kelpy's version of a file back, as an operation in the conversation: without `fingerprint`, only shows it. */
+export const putBack = (sessionId: number, id: number, fingerprint: string | null) =>
   json<Operated>(`/api/sessions/${sessionId}/differences/${id}/put-back`, {
     method: 'POST',
-    body: JSON.stringify({ preview }),
+    body: operation(fingerprint),
   });
 
 /** The handover report of a conversation, in Markdown. */

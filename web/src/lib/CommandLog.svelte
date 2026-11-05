@@ -168,7 +168,7 @@
     bind:open={dialog}
     title="Restore the file?"
     confirm="Restore"
-    operate={(preview) => restoreAction(sessionId, action.id, preview)}
+    operate={(fingerprint) => restoreAction(sessionId, action.id, fingerprint)}
     onDone={onOperated}
   />
 {/if}

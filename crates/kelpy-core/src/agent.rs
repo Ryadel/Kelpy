@@ -52,7 +52,7 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error("an answer is already being written in this conversation")]
     Busy,
-    #[error("Kelpy is stopping: no new answers can start")]
+    #[error("Kelpy is stopping: nothing new can start")]
     Stopping,
     #[error("this conversation is being deleted")]
     Deleting,
@@ -152,26 +152,54 @@ impl Agent {
     }
 
     /// Puts back a file as Kelpy last wrote it, in place of the difference `id`, as an operation of the
-    /// administrator in the conversation `session_id`; only shown if `preview`.
+    /// administrator in the conversation `session_id`: shown without `confirmed`, run with the fingerprint the
+    /// preview gave, only while the file is as shown.
     pub async fn put_back(
         &self,
         session_id: i64,
         id: i64,
-        preview: bool,
+        confirmed: Option<String>,
     ) -> Result<Operated, AgentError> {
-        self.server.put_back(session_id, id, preview).await
+        self.operation(session_id, move |server| async move {
+            server.put_back(session_id, id, confirmed).await
+        })
+        .await
     }
 
     /// Puts a file back as it was before the change of an action, from its backup, as an operation of the
-    /// administrator; only shown if `preview`. The administrator's own request: it does not depend on the
-    /// conversation's System access or Approval mode, which govern what the model does.
+    /// administrator: shown without `confirmed`, run with the fingerprint the preview gave, only while the file is
+    /// as shown. The administrator's own request: it does not depend on the conversation's System access or
+    /// Approval mode, which govern what the model does.
     pub async fn restore(
         &self,
         session_id: i64,
         action_id: i64,
-        preview: bool,
+        confirmed: Option<String>,
     ) -> Result<Operated, AgentError> {
-        self.server.restore(session_id, action_id, preview).await
+        self.operation(session_id, move |server| async move {
+            server.restore(session_id, action_id, confirmed).await
+        })
+        .await
+    }
+
+    /// Runs an operation of the administrator in the conversation `session_id`, admitted like an answer: refused
+    /// once Kelpy is stopping or the conversation is being deleted, which then wait for it. It runs in a task of its
+    /// own, among the work [`Agent::close`] waits for: a caller that stops waiting cancels nothing, and the action
+    /// is saved however it ends.
+    async fn operation<Run, Ran>(&self, session_id: i64, run: Run) -> Result<Operated, AgentError>
+    where
+        Run: FnOnce(Arc<Server>) -> Ran,
+        Ran: Future<Output = Result<Operated, AgentError>> + Send + 'static,
+    {
+        let operating = self.turns.admit(session_id)?;
+        let ran = run(Arc::clone(&self.server));
+        self.tasks
+            .spawn(async move {
+                let _operating = operating;
+                ran.await
+            })
+            .await
+            .unwrap_or(Err(AgentError::NotStarted))
     }
 
     /// The operations the administrator asked for in a conversation, oldest first.
@@ -348,12 +376,13 @@ impl Agent {
     /// Deletes a conversation. From the start no new answer can begin in it; an answer being written is stopped
     /// and the deletion waits until it has ended, so that nothing is written for the conversation afterwards.
     pub async fn delete_session(&self, id: i64) -> Result<(), AgentError> {
-        let (_deletion, answer_end) = self.turns.begin_deletion(id)?;
-        if let Some(end) = answer_end
-            && tokio::time::timeout(STOP_WAIT, end.cancelled())
-                .await
-                .is_err()
-        {
+        let (_deletion, ends) = self.turns.begin_deletion(id)?;
+        let ended = async {
+            for end in &ends {
+                end.cancelled().await;
+            }
+        };
+        if tokio::time::timeout(STOP_WAIT, ended).await.is_err() {
             return Err(AgentError::Busy);
         }
         self.store
@@ -2249,6 +2278,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_secret_of_one_conversation_is_masked_in_another() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let log = folder.path().join("setup.log");
+        let server = model("Done.").await;
+        for queued in [
+            calling(
+                "generate_secret",
+                &json!({ "reason": "Database password", "name": "wp_db" }),
+            ),
+            calling(
+                "write_file",
+                &json!({ "reason": "Log", "path": log, "content": "password {{secret:wp_db}}\n" }),
+            ),
+        ] {
+            server.respond_once(CHAT, "200 OK", queued);
+        }
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let first = agent
+            .create_session(None, full(Approval::Auto))
+            .await
+            .unwrap();
+        collect(agent.send(first.id, "Set it up", ()).await.unwrap()).await;
+        let written = fs::read_to_string(&log).unwrap();
+        let value = written.trim().strip_prefix("password ").unwrap();
+        assert_eq!(value.len(), 32, "{written}");
+
+        // A program writes the password in a log of its own: Kelpy did not write it, so it is not held back.
+        let other = folder.path().join("app.log");
+        fs::write(&other, format!("Access denied (password {value})\n")).unwrap();
+        server.respond_once(
+            CHAT,
+            "200 OK",
+            calling("read_file", &json!({ "reason": "Look", "path": other })),
+        );
+        let second = agent
+            .create_session(None, full(Approval::Auto))
+            .await
+            .unwrap();
+        collect(
+            agent
+                .send(second.id, "What is in the log?", ())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let last = chat_requests(&server).pop().unwrap();
+        assert!(!last.contains(value), "{last}");
+        assert!(
+            last.contains("[a secret of another conversation]"),
+            "{last}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_secret_is_written_where_it_goes_and_never_reaches_the_model() {
         let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let config = folder.path().join("wp-config.php");
@@ -2323,8 +2406,11 @@ mod tests {
         let edited = actions_of(&events).pop().unwrap();
         assert!(edited.change.as_ref().unwrap().backup.is_some());
 
-        let Operated::Preview { change, .. } =
-            agent.restore(session.id, edited.id, true).await.unwrap()
+        let Operated::Preview {
+            change,
+            fingerprint,
+            ..
+        } = agent.restore(session.id, edited.id, None).await.unwrap()
         else {
             panic!("not a preview");
         };
@@ -2334,8 +2420,34 @@ mod tests {
             change.diff
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), "debug = false\n");
+
+        // Changed after the preview: what runs would not be what was shown.
+        fs::write(&path, "debug = false\nport = 81\n").unwrap();
+        let refused = agent
+            .restore(session.id, edited.id, Some(fingerprint.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("changed after it was shown"),
+            "{refused}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "debug = false\nport = 81\n"
+        );
+        assert!(
+            agent
+                .restore(session.id, edited.id, Some("sha256:other".into()))
+                .await
+                .is_err()
+        );
+        fs::write(&path, "debug = false\n").unwrap();
+
         let mut events = agent.subscribe();
-        let Operated::Done { action } = agent.restore(session.id, edited.id, false).await.unwrap()
+        let Operated::Done { action } = agent
+            .restore(session.id, edited.id, Some(fingerprint))
+            .await
+            .unwrap()
         else {
             panic!("not done");
         };
@@ -2359,6 +2471,35 @@ mod tests {
             last.contains("the administrator did this through Kelpy:\\n- Put back"),
             "{last}"
         );
+    }
+
+    #[tokio::test]
+    async fn no_operation_of_the_administrator_starts_once_kelpy_is_stopping() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let path = folder.path().join("app.ini");
+        fs::write(&path, "debug = true\n").unwrap();
+        let server = model("Done.").await;
+        let edit = json!({ "reason": "Off", "path": path, "old": "true", "new": "false" });
+        server.respond_once(CHAT, "200 OK", calling("edit_file", &edit));
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let session = agent
+            .create_session(None, full(Approval::Auto))
+            .await
+            .unwrap();
+        let events = collect(agent.send(session.id, "Turn it off", ()).await.unwrap()).await;
+        let edited = actions_of(&events).pop().unwrap();
+        let Operated::Preview { fingerprint, .. } =
+            agent.restore(session.id, edited.id, None).await.unwrap()
+        else {
+            panic!("not a preview");
+        };
+
+        assert!(agent.stop_all(Duration::from_secs(1)).await);
+        let refused = agent
+            .restore(session.id, edited.id, Some(fingerprint))
+            .await;
+        assert!(matches!(refused, Err(AgentError::Stopping)), "{refused:?}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "debug = false\n");
     }
 
     #[tokio::test]
@@ -2394,8 +2535,15 @@ mod tests {
         assert!(last.contains("+listen 8080;"));
 
         // Put back as Kelpy wrote it, then changed again and accepted.
+        let Operated::Preview { fingerprint, .. } = agent
+            .put_back(session.id, differences[0].id, None)
+            .await
+            .unwrap()
+        else {
+            panic!("not a preview");
+        };
         let Operated::Done { action } = agent
-            .put_back(session.id, differences[0].id, false)
+            .put_back(session.id, differences[0].id, Some(fingerprint))
             .await
             .unwrap()
         else {

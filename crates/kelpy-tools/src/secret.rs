@@ -2,8 +2,11 @@
 //! placeholder, `{{secret:name}}`, where the value goes; Kelpy puts the value in only where it writes it (a file, a
 //! database user) and puts the placeholder back in everything shown or given to the model. Secrets last while Kelpy
 //! runs: they are never written to Kelpy's database nor to its logs.
+//!
+//! A conversation fills in only its own secrets, but masks those of every conversation ([`Registry`]): a value
+//! written by one can turn up in what another reads, such as a log.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use kelpy_common::lock;
@@ -16,34 +19,57 @@ const CLOSE: &str = "}}";
 const LENGTH: usize = 32;
 const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
+/// What stands for a secret of another conversation in what is shown or given to the model.
+const ANOTHER: &str = "[a secret of another conversation]";
+
+/// Every secret generated while Kelpy runs, in any conversation: what is masked. Clones share it.
+#[derive(Debug, Clone, Default)]
+pub struct Registry(Arc<Mutex<BTreeSet<String>>>);
+
 /// The secrets of one conversation. Clones share them.
 #[derive(Debug, Clone, Default)]
-pub struct Secrets(Arc<Mutex<BTreeMap<String, String>>>);
+pub struct Secrets {
+    /// By name: what this conversation's placeholders stand for.
+    own: Arc<Mutex<BTreeMap<String, String>>>,
+    registry: Registry,
+}
 
 impl Secrets {
+    /// Secrets of their own, masking no others.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// A conversation's secrets, entered in `registry` and masking the others there.
+    pub fn sharing(registry: &Registry) -> Self {
+        Self {
+            own: Arc::default(),
+            registry: registry.clone(),
+        }
+    }
+
     /// Generates the secret `name`, unless it exists. Returns whether it is new.
     pub fn generate(&self, name: &str) -> Result<bool, ToolError> {
-        let mut secrets = lock(&self.0);
+        let mut secrets = lock(&self.own);
         if secrets.contains_key(name) {
             return Ok(false);
         }
-        secrets.insert(name.to_owned(), random()?);
+        let value = random()?;
+        // In the registry before it can be used: from now on it is masked everywhere.
+        lock(&self.registry.0).insert(value.clone());
+        secrets.insert(name.to_owned(), value);
         Ok(true)
     }
 
     /// The names of the secrets, in order.
     pub fn names(&self) -> Vec<String> {
-        lock(&self.0).keys().cloned().collect()
+        lock(&self.own).keys().cloned().collect()
     }
 
     /// `text` with each placeholder replaced by its secret, and whether there was any. Fails on a secret that does
     /// not exist.
     pub fn fill(&self, text: &str) -> Result<(String, bool), ToolError> {
-        let secrets = lock(&self.0);
+        let secrets = lock(&self.own);
         let mut filled = String::with_capacity(text.len());
         let mut rest = text;
         let mut any = false;
@@ -68,22 +94,28 @@ impl Secrets {
         Ok((filled, any))
     }
 
-    /// `text` with each secret replaced by its placeholder.
+    /// `text` with each of its secrets replaced by its placeholder, and those of other conversations by
+    /// [`ANOTHER`].
     pub fn redact(&self, text: &str) -> String {
-        let secrets = lock(&self.0);
         let mut redacted = text.to_owned();
-        for (name, value) in secrets.iter() {
+        for (name, value) in lock(&self.own).iter() {
             if redacted.contains(value.as_str()) {
                 redacted = redacted.replace(value.as_str(), &placeholder(name));
+            }
+        }
+        for value in lock(&self.registry.0).iter() {
+            if redacted.contains(value.as_str()) {
+                redacted = redacted.replace(value.as_str(), ANOTHER);
             }
         }
         redacted
     }
 
-    /// Whether `text` holds a secret.
+    /// Whether `text` holds a secret, of this conversation or another.
     pub fn holds_any(&self, text: &str) -> bool {
-        lock(&self.0)
+        lock(&self.own)
             .values()
+            .chain(lock(&self.registry.0).iter())
             .any(|value| text.contains(value.as_str()))
     }
 }
@@ -167,5 +199,24 @@ mod tests {
             .unwrap();
         let (first, second) = both.split_once(' ').unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_secret_of_another_conversation_is_masked_but_not_filled() {
+        let registry = Registry::default();
+        let (first, second) = (Secrets::sharing(&registry), Secrets::sharing(&registry));
+        first.generate("wp_db").unwrap();
+        let (value, _) = first.fill("{{secret:wp_db}}").unwrap();
+
+        let log = format!("Access denied for user 'wp' (using password: {value})");
+        assert_eq!(
+            second.redact(&log),
+            "Access denied for user 'wp' (using password: [a secret of another conversation])"
+        );
+        assert!(second.holds_any(&log));
+        assert!(second.fill("{{secret:wp_db}}").is_err());
+        assert_eq!(first.redact(&value), "{{secret:wp_db}}");
+        // Secrets outside the registry mask only their own.
+        assert_eq!(Secrets::new().redact(&value), value);
     }
 }

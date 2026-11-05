@@ -285,6 +285,10 @@ pub(super) struct Answers {
     /// Conversations being deleted, from the start of the deletion to its end.
     pub(super) deleting: HashSet<i64>,
     pub(super) running: HashMap<i64, Running>,
+    /// The administrator's operations under way, such as a Restore: by number, their conversation and the signal of
+    /// their end.
+    operations: HashMap<u64, (i64, CancellationToken)>,
+    last_operation: u64,
 }
 
 /// An answer being written: `stop` asks it to end, `done` fires once it has ended and been saved, `answer` is its
@@ -318,6 +322,21 @@ struct Registered {
 impl Drop for Registered {
     fn drop(&mut self) {
         lock(&self.turns.answers).running.remove(&self.session_id);
+        self.done.cancel();
+    }
+}
+
+/// An operation of the administrator admitted in its conversation. Dropping it, once the operation has ended,
+/// unregisters it and signals its end to whoever waits: stopping Kelpy, deleting the conversation.
+pub(super) struct Operating {
+    turns: Arc<Turns>,
+    number: u64,
+    done: CancellationToken,
+}
+
+impl Drop for Operating {
+    fn drop(&mut self) {
+        lock(&self.turns.answers).operations.remove(&self.number);
         self.done.cancel();
     }
 }
@@ -380,13 +399,24 @@ impl Turns {
             .is_some()
     }
 
-    /// Refuses new answers from now on and stops every answer being written. This happens at once, when called; the
-    /// returned future then waits, up to `limit`, until the answers are saved, and tells whether all were.
+    /// Refuses new answers and operations from now on and stops every answer being written. This happens at once,
+    /// when called; the returned future then waits, up to `limit`, until the answers are saved and the operations
+    /// under way have ended, and tells whether all have.
     pub(super) fn stop_all(&self, limit: Duration) -> impl Future<Output = bool> + use<> {
         let ends: Vec<CancellationToken> = {
             let mut answers = lock(&self.answers);
             answers.stopping = true;
-            answers.running.values().map(Running::ask_to_stop).collect()
+            let operations: Vec<CancellationToken> = answers
+                .operations
+                .values()
+                .map(|(_, done)| done.clone())
+                .collect();
+            answers
+                .running
+                .values()
+                .map(Running::ask_to_stop)
+                .chain(operations)
+                .collect()
         };
         async move {
             let all_ended = async {
@@ -405,21 +435,56 @@ impl Turns {
     }
 
     /// Marks a conversation as being deleted and stops its answer, in one critical section. Returns the mark and the
-    /// signal of the answer's end, if one was being written.
+    /// signals of the end of its answer, if one was being written, and of its operations under way.
     pub(super) fn begin_deletion(
         &self,
         session_id: i64,
-    ) -> Result<(Deletion<'_>, Option<CancellationToken>), AgentError> {
+    ) -> Result<(Deletion<'_>, Vec<CancellationToken>), AgentError> {
         let mut answers = lock(&self.answers);
         if !answers.deleting.insert(session_id) {
             return Err(AgentError::Deleting);
         }
-        let answer_end = answers.running.get(&session_id).map(Running::ask_to_stop);
+        let operations: Vec<CancellationToken> = answers
+            .operations
+            .values()
+            .filter(|(session, _)| *session == session_id)
+            .map(|(_, done)| done.clone())
+            .collect();
+        let ends = answers
+            .running
+            .get(&session_id)
+            .map(Running::ask_to_stop)
+            .into_iter()
+            .chain(operations)
+            .collect();
         let deletion = Deletion {
             turns: self,
             session_id,
         };
-        Ok((deletion, answer_end))
+        Ok((deletion, ends))
+    }
+
+    /// Admits an operation of the administrator in a conversation, unless Kelpy is stopping or the conversation is
+    /// being deleted: both then wait for it, until the returned [`Operating`] is dropped.
+    pub(super) fn admit(self: &Arc<Self>, session_id: i64) -> Result<Operating, AgentError> {
+        let mut answers = lock(&self.answers);
+        if answers.stopping {
+            return Err(AgentError::Stopping);
+        }
+        if answers.deleting.contains(&session_id) {
+            return Err(AgentError::Deleting);
+        }
+        answers.last_operation += 1;
+        let number = answers.last_operation;
+        let done = CancellationToken::new();
+        answers
+            .operations
+            .insert(number, (session_id, done.clone()));
+        Ok(Operating {
+            turns: Arc::clone(self),
+            number,
+            done,
+        })
     }
 
     /// Stores `text`, a [`message`], and starts its answer with `settings`. `guard` is kept alive until the answer

@@ -126,7 +126,7 @@
     bind:open={dialog}
     title="Put back Kelpy's version?"
     confirm="Put back"
-    operate={(preview) => putBack(sessionId, difference.id, preview)}
+    operate={(fingerprint) => putBack(sessionId, difference.id, fingerprint)}
     onDone={(action) => {
       onOperated(action);
       if (action.state === 'done') {

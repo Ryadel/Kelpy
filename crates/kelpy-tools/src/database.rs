@@ -4,7 +4,8 @@
 //! Before approval Kelpy asks the server, as the administrator's account, which of the two exist: both existing, there
 //! is nothing to do, and an existing user keeps its password. Once approved ([`apply`]) the statements go to the
 //! client on its standard input, never on a command line other accounts can read; then Kelpy signs in as the new user
-//! to check it. When that fails, what the change created is dropped.
+//! to check it. When a statement or that check fails, Kelpy asks again what exists and drops what the change
+//! created: each statement commits on its own, so a failure can leave the database without its user.
 
 use crate::executor::{RUN_TIME, captured};
 use crate::inspect::run;
@@ -72,7 +73,7 @@ impl DatabaseChange {
             ));
         }
         notes.push(
-            "Kelpy then signs in as the user to check it; if that fails, what this created is dropped.".to_owned(),
+            "Kelpy then signs in as the user to check it; if a step fails, what this created is dropped.".to_owned(),
         );
         notes
     }
@@ -122,23 +123,11 @@ pub async fn plan(
             invalid("MariaDB or MySQL is not installed here: install it first, such as the package mariadb-server")
         })?
         .to_owned();
-    let query = format!(
-        "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{}';\n\
-         SELECT COUNT(*) FROM mysql.user WHERE User = '{}' AND Host = 'localhost';",
-        change.name, change.user
-    );
-    let (code, said) = captured(&run(&client, &["-N", "-B"]), Some(&query), RUN_TIME).await?;
-    if code != 0 {
-        return Err(invalid(format!(
-            "{client} cannot be used as this account: {}",
-            said.trim()
-        )));
-    }
-    let counts: Vec<&str> = said.split_whitespace().collect();
+    let (database_exists, user_exists) = existing(change, &client).await.map_err(invalid)?;
     let planned = DatabasePlanned {
         client,
-        database_exists: counts.first() != Some(&"0"),
-        user_exists: counts.get(1) != Some(&"0"),
+        database_exists,
+        user_exists,
     };
     if planned.database_exists && planned.user_exists {
         // The configuration written with the secret works only if the user signs in with it.
@@ -157,23 +146,49 @@ pub async fn plan(
     Ok(Ok(planned))
 }
 
-/// Creates what is missing, then signs in as the user; drops what it created when that fails.
+/// Creates what is missing, then signs in as the user; drops what it created when a step fails.
 pub async fn apply(
     change: &DatabaseChange,
     planned: &DatabasePlanned,
     secrets: &Secrets,
     output: &Output,
 ) -> Result<(), ToolError> {
+    // What exists decides what the statements create, and what a failure drops: it must be as shown.
+    let now = existing(change, &planned.client)
+        .await
+        .map_err(ToolError::Unverified)?;
+    if now != (planned.database_exists, planned.user_exists) {
+        return Err(ToolError::Unverified(format!(
+            "the database {} or the user {} was created or dropped after the change was shown: nothing was done, \
+             plan it again",
+            change.name, change.user
+        )));
+    }
+    let Err(problem) = create(change, planned, secrets, output).await else {
+        return Ok(());
+    };
+    output.set_phase("dropping what the change created");
+    let undone = drop_created(change, planned).await;
+    Err(ToolError::Unverified(format!("{problem}: {undone}")))
+}
+
+/// Runs the statements and signs in as the user; on failure, what went wrong.
+async fn create(
+    change: &DatabaseChange,
+    planned: &DatabasePlanned,
+    secrets: &Secrets,
+    output: &Output,
+) -> Result<(), String> {
     output.set_phase("creating the database");
-    let (statements, _) = secrets.fill(&change.statements(Some(planned)))?;
-    let client = run(&planned.client, &[]);
-    let (code, said) = captured(&client, Some(&statements), RUN_TIME).await?;
+    let (statements, _) = secrets
+        .fill(&change.statements(Some(planned)))
+        .map_err(|error| error.to_string())?;
+    let (code, said) = captured(&run(&planned.client, &[]), Some(&statements), RUN_TIME)
+        .await
+        .map_err(|error| error.to_string())?;
     output.text(&secrets.redact(&said));
     if code != 0 {
-        return Err(ToolError::Unverified(format!(
-            "{} refused the statements",
-            planned.client
-        )));
+        return Err(format!("{} refused the statements", planned.client));
     }
     if !planned.database_exists {
         output.line(&format!("Created the database {}.", change.name));
@@ -182,7 +197,9 @@ pub async fn apply(
         output.line(&format!("Created the user {}@localhost.", change.user));
     }
     output.set_phase("checking the database");
-    let (code, said) = sign_in(change, &planned.client, secrets).await?;
+    let (code, said) = sign_in(change, &planned.client, secrets)
+        .await
+        .map_err(|error| error.to_string())?;
     if code == 0 {
         output.line(&format!(
             "Signed in as {} to {}: it works.",
@@ -195,25 +212,73 @@ pub async fn apply(
         change.user,
         secrets.redact(said.trim())
     ));
-    output.set_phase("dropping what the change created");
-    let mut drop = Vec::new();
-    if !planned.user_exists {
-        drop.push(format!("DROP USER '{}'@'localhost';", change.user));
-    }
-    if !planned.database_exists {
-        drop.push(format!("DROP DATABASE `{}`;", change.name));
-    }
-    let undone = if drop.is_empty() {
-        "nothing was created to drop".to_owned()
-    } else {
-        match captured(&client, Some(&drop.join("\n")), RUN_TIME).await {
-            Ok((0, _)) => "what it created was dropped".to_owned(),
-            _ => "what it created could not be dropped".to_owned(),
+    Err("the new user cannot sign in".to_owned())
+}
+
+/// Drops what exists now and did not before the change; says what came of it.
+async fn drop_created(change: &DatabaseChange, planned: &DatabasePlanned) -> String {
+    let (database, user) = match existing(change, &planned.client).await {
+        Ok(now) => now,
+        Err(error) => {
+            return format!("what it created could not be checked, nor dropped ({error})");
         }
     };
-    Err(ToolError::Unverified(format!(
-        "the new user cannot sign in: {undone}"
-    )))
+    let mut drop = Vec::new();
+    if user && !planned.user_exists {
+        drop.push(format!("DROP USER '{}'@'localhost';", change.user));
+    }
+    if database && !planned.database_exists {
+        drop.push(format!("DROP DATABASE `{}`;", change.name));
+    }
+    if drop.is_empty() {
+        return "it created nothing to drop".to_owned();
+    }
+    let client = run(&planned.client, &[]);
+    let dropped = matches!(
+        captured(&client, Some(&drop.join("\n")), RUN_TIME).await,
+        Ok((0, _))
+    );
+    format!(
+        "what it created {} ({})",
+        if dropped {
+            "was dropped"
+        } else {
+            "could not be dropped"
+        },
+        drop.join(" ")
+    )
+}
+
+/// Whether the database and the user exist, asked as the administrator's account.
+async fn existing(change: &DatabaseChange, client: &str) -> Result<(bool, bool), String> {
+    let query = format!(
+        "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{}';\n\
+         SELECT COUNT(*) FROM mysql.user WHERE User = '{}' AND Host = 'localhost';",
+        change.name, change.user
+    );
+    let (code, said) = captured(&run(client, &["-N", "-B"]), Some(&query), RUN_TIME)
+        .await
+        .map_err(|error| error.to_string())?;
+    if code != 0 {
+        return Err(format!(
+            "{client} cannot be used as this account: {}",
+            said.trim()
+        ));
+    }
+    counts(&said).ok_or_else(|| format!("{client} gave an unexpected answer: {}", said.trim()))
+}
+
+/// The two counts of [`existing`]'s query, as whether each exists.
+fn counts(said: &str) -> Option<(bool, bool)> {
+    let counts: Vec<u64> = said
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    match counts[..] {
+        [database, user] => Some((database > 0, user > 0)),
+        _ => None,
+    }
 }
 
 /// Signs in as the user, with the secret, to the database: the exit code and what the client said.
@@ -270,5 +335,62 @@ mod tests {
             user_exists: true,
         };
         assert!(!change.statements(Some(&existing)).contains("CREATE USER"));
+    }
+
+    /// A fake client: creating the database succeeds and commits, creating the user then fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failure_after_the_database_was_created_drops_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let created = dir.path().join("created");
+        let client = dir.path().join("mariadb");
+        std::fs::write(
+            &client,
+            format!(
+                "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n\
+                 *'SELECT COUNT'*) if [ -e '{0}' ]; then echo 1; else echo 0; fi; echo 0 ;;\n\
+                 *'DROP DATABASE'*) rm '{0}' ;;\n\
+                 *'CREATE DATABASE'*) touch '{0}'; echo 'ERROR 1396 at line 2: Operation CREATE USER failed'; \
+                 exit 1 ;;\nesac\n",
+                created.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let secrets = Secrets::new();
+        secrets.generate("wp_db").unwrap();
+        let change = DatabaseChange {
+            name: "wordpress".into(),
+            user: "wp".into(),
+            password: "{{secret:wp_db}}".into(),
+            planned: None,
+        };
+        let planned = DatabasePlanned {
+            client: client.to_string_lossy().into_owned(),
+            database_exists: false,
+            user_exists: false,
+        };
+
+        let error = apply(&change, &planned, &secrets, &Output::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("refused the statements")
+                && error.contains("was dropped (DROP DATABASE `wordpress`;)"),
+            "{error}"
+        );
+        assert!(!created.exists());
+    }
+
+    #[test]
+    fn what_exists_is_read_strictly() {
+        assert_eq!(counts("1\n0\n"), Some((true, false)));
+        assert_eq!(counts("0\t0"), Some((false, false)));
+        for unexpected in ["", "1", "1\n0\n1", "ERROR 1045"] {
+            assert_eq!(counts(unexpected), None, "{unexpected}");
+        }
     }
 }

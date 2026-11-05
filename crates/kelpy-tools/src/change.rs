@@ -305,7 +305,9 @@ pub async fn apply(
         source,
     };
     output.set_phase("writing the file");
-    write(real, &planned.after).await.map_err(written)?;
+    write(real, &planned.after, planned.secret)
+        .await
+        .map_err(written)?;
     if read(real).await? != planned.after {
         // Something else wrote it meanwhile.
         return Err(ToolError::ChangedMeanwhile(real.clone()));
@@ -334,7 +336,7 @@ pub async fn apply(
     }
     output.set_phase("putting the previous version back");
     match &planned.before {
-        Some(before) => write(real, before).await.map_err(written)?,
+        Some(before) => write(real, before, planned.secret).await.map_err(written)?,
         None => tokio::fs::remove_file(real).await.map_err(written)?,
     }
     output.line("The previous version was put back.");
@@ -364,10 +366,12 @@ async fn read(path: &Path) -> Result<String, ToolError> {
     String::from_utf8(bytes).map_err(|_| ToolError::NotText(path.to_owned()))
 }
 
-/// Writes `content` to `path`, keeping an existing file's owner, mode and permissions.
-async fn write(path: &Path, content: &str) -> io::Result<()> {
+/// Writes `content` to `path`, keeping an existing file's owner, mode and permissions. A new file that may hold
+/// secrets is readable by Kelpy's account only, from its creation: the service that needs it is then given access
+/// explicitly, never by the umask.
+async fn write(path: &Path, content: &str, secret: bool) -> io::Result<()> {
     let (path, content) = (path.to_owned(), content.to_owned());
-    tokio::task::spawn_blocking(move || write_now(&path, content.as_bytes()))
+    tokio::task::spawn_blocking(move || write_now(&path, content.as_bytes(), secret))
         .await
         .map_err(io::Error::other)?
 }
@@ -375,13 +379,17 @@ async fn write(path: &Path, content: &str) -> io::Result<()> {
 /// Unix: a new file beside the old one, given its mode and owner, then renamed over it, so that the file is never
 /// seen half written.
 #[cfg(unix)]
-fn write_now(path: &Path, content: &[u8]) -> io::Result<()> {
+fn write_now(path: &Path, content: &[u8], secret: bool) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut file = std::fs::File::create_new(path)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(if secret { 0o600 } else { 0o666 })
+                .open(path)?;
             file.write_all(content)?;
             return file.sync_all();
         }
@@ -407,9 +415,10 @@ fn write_now(path: &Path, content: &[u8]) -> io::Result<()> {
     made
 }
 
-/// Windows: written in place, which keeps the file's permissions (ACL) as they are.
+/// Windows: written in place, which keeps the file's permissions (ACL) as they are; a new file inherits its
+/// folder's.
 #[cfg(not(unix))]
-fn write_now(path: &Path, content: &[u8]) -> io::Result<()> {
+fn write_now(path: &Path, content: &[u8], _secret: bool) -> io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -811,6 +820,28 @@ mod tests {
         // Already invalid before: the change is not refused for it.
         fs::write(&json, "{").unwrap();
         assert!(planned(&write_all(&json, "{ ")).await.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_file_that_may_hold_secrets_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let env = dir.path().join(".env");
+        let planned = planned(&write_all(
+            &env,
+            "DB_PASSWORD=x
+",
+        ))
+        .await
+        .unwrap();
+        apply(&planned, backups.path(), &Output::new())
+            .await
+            .unwrap();
+        let mode = fs::metadata(&env).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
     }
 
     #[tokio::test]
