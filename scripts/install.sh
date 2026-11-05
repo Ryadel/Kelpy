@@ -17,7 +17,8 @@ fail() {
 
 case "$(uname -s)" in
     Linux) os=linux ;;
-    *) fail "Kelpy is available for Linux and Windows. This system is $(uname -s)." ;;
+    Darwin) os=macos ;;
+    *) fail "Kelpy is available for Linux, macOS and Windows. This system is $(uname -s)." ;;
 esac
 case "$(uname -m)" in
     x86_64 | amd64) arch=x86_64 ;;
