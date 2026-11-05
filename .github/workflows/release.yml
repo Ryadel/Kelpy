@@ -133,9 +133,26 @@ jobs:
           cp ../scripts/install.sh ../scripts/install.ps1 .
           sha256sum kelpy-linux-x86_64 kelpy-windows-x86_64.exe install.sh install.ps1 > SHA256SUMS
           cat SHA256SUMS
+      # Kelpy installs an update only with this signature, checked against the key built into it
+      # (scripts/release-key.pem is the same key). The private key is the RELEASE_SIGNING_KEY secret.
+      - name: Sign the checksums
+        working-directory: dist
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::error::The RELEASE_SIGNING_KEY secret is not set"
+            exit 1
+          fi
+          key="$RUNNER_TEMP/release-signing-key.pem"
+          (umask 077 && printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key")
+          openssl pkeyutl -sign -inkey "$key" -rawin -in SHA256SUMS -out SHA256SUMS.sig
+          rm -f "$key"
+          openssl pkeyutl -verify -pubin -inkey ../scripts/release-key.pem -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag --title "Kelpy ${GITHUB_REF_NAME#v}" \
-            dist/kelpy-linux-x86_64 dist/kelpy-windows-x86_64.exe dist/install.sh dist/install.ps1 dist/SHA256SUMS
+            dist/kelpy-linux-x86_64 dist/kelpy-windows-x86_64.exe dist/install.sh dist/install.ps1 \
+            dist/SHA256SUMS dist/SHA256SUMS.sig

@@ -411,7 +411,7 @@ async fn installed_version(installed: &Path) -> Result<String> {
 }
 
 /// Runs the installed copy with this process's arguments and returns its exit code.
-async fn run_installed(installed: &Path) -> Result<ExitCode> {
+pub(crate) async fn run_installed(installed: &Path) -> Result<ExitCode> {
     let mut child = tokio::process::Command::new(installed)
         .args(env::args_os().skip(1))
         .spawn()
@@ -429,7 +429,7 @@ async fn run_installed(installed: &Path) -> Result<ExitCode> {
 }
 
 /// Compares `major.minor.patch` versions, ignoring any pre-release or build suffix.
-fn compare_versions(left: &str, right: &str) -> Ordering {
+pub(crate) fn compare_versions(left: &str, right: &str) -> Ordering {
     fn parse(version: &str) -> Option<(u64, u64, u64)> {
         let core = version.split(['-', '+']).next()?;
         let mut parts = core.split('.').map(str::parse::<u64>);

@@ -13,11 +13,12 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 dirs = "7.0.0"
 futures-util = "0.3.34"
-kelpy-common = { version = "0.1.0", path = "../kelpy-common" }
-kelpy-core = { version = "0.1.0", path = "../kelpy-core" }
-kelpy-gateway = { version = "0.1.0", path = "../kelpy-gateway" }
+kelpy-common = { path = "../kelpy-common" }
+kelpy-core = { path = "../kelpy-core" }
+kelpy-gateway = { path = "../kelpy-gateway" }
 qrcode = { version = "0.14.1", default-features = false }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
+ring = "0.17.14"
 rpassword = "7.5.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -28,6 +29,7 @@ webbrowser = "1.2.5"
 
 
 [dev-dependencies]
+base64 = "0.23.1"
 tempfile = "3.27.0"
 
 [target."cfg(windows)".dependencies]

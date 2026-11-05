@@ -19,6 +19,10 @@ host = "127.0.0.1"
 # TCP port. 0: the port of the last start if it is free, otherwise one the operating system picks.
 port = 0
 
+[updates]
+# At start, ask GitHub for the latest release and offer to install it. `kelpy update` works either way.
+check = true
+
 # The AI provider, also editable from the Web UI and with `kelpy provider`. Example:
 # [provider]
 # kind = "anthropic"            # anthropic, chatgpt, openai, ollama or openai-compatible
@@ -32,6 +36,20 @@ port = 0
 pub struct Config {
     pub server: ServerConfig,
     pub provider: Option<ProviderConfig>,
+    pub updates: UpdatesConfig,
+}
+
+/// The `[updates]` section. Homes created before it existed have no such section, and check.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    pub check: bool,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self { check: true }
+    }
 }
 
 /// The `[provider]` section: which API and model to use. The API key is never stored here.
@@ -133,6 +151,7 @@ mod tests {
         let config = Config::parse(DEFAULT_CONFIG).unwrap();
         assert_eq!(config.server.host, ServerConfig::default().host);
         assert_eq!(config.server.port, 0);
+        assert!(config.updates.check);
     }
 
     #[test]
@@ -140,6 +159,13 @@ mod tests {
         let config = Config::parse("").unwrap();
         assert!(config.server.host.is_loopback());
         assert_eq!(config.server.port, 0);
+        assert!(config.updates.check);
+    }
+
+    #[test]
+    fn the_update_check_can_be_turned_off() {
+        let config = Config::parse("[updates]\ncheck = false\n").unwrap();
+        assert!(!config.updates.check);
     }
 
     #[test]

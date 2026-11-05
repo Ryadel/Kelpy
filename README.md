@@ -80,7 +80,7 @@ signing in from another browser (new at every start), the AI provider with wheth
 account Kelpy runs as:
 
 ```text
-Kelpy v0.1.0
+Kelpy v0.2.0
 
 Agent runtime started.
 Web UI:   http://127.0.0.1:54321/#code=K7QM-4ZP2

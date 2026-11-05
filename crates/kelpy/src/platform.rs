@@ -25,6 +25,22 @@ pub enum PathChange {
 pub fn replace_executable(source: &Path, target: &Path) -> io::Result<()> {
     let staged = target.with_extension("new");
     fs::copy(source, &staged)?;
+    swap_in(&staged, target)
+}
+
+/// Writes `content` over `target` as an executable, even while `target` is running, as `replace_executable` does.
+pub fn write_executable(content: &[u8], target: &Path) -> io::Result<()> {
+    let staged = target.with_extension("new");
+    fs::write(&staged, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
+    }
+    swap_in(&staged, target)
+}
+
+fn swap_in(staged: &Path, target: &Path) -> io::Result<()> {
     #[cfg(windows)]
     if target.exists() {
         let old = target.with_extension("old");
@@ -32,7 +48,7 @@ pub fn replace_executable(source: &Path, target: &Path) -> io::Result<()> {
         let _ = fs::remove_file(&old);
         fs::rename(target, &old)?;
     }
-    fs::rename(&staged, target)
+    fs::rename(staged, target)
 }
 
 /// Deletes leftovers of earlier updates and installer removals. Files still in use are skipped.

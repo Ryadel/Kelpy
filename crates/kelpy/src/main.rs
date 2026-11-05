@@ -7,6 +7,7 @@ mod platform;
 mod prompt;
 mod runtime;
 mod setup;
+mod update;
 mod wizard;
 
 use std::path::PathBuf;
@@ -61,6 +62,8 @@ enum Command {
     Chat,
     /// Remove Kelpy from this computer: its home with conversations and memory, the PATH entry, the user record.
     Cleanup,
+    /// Install the latest version of Kelpy, after checking its signature.
+    Update,
 }
 
 /// Without options, `kelpy provider` asks; with `--service`, it sets the provider without questions.
@@ -118,6 +121,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 
     match cli.command {
         None => {
+            if let Some(code) = update::at_start(&home, cli.yes).await {
+                return Ok(code);
+            }
             let limits = runtime::Limits {
                 after: cli.shutdown_after,
                 idle: cli.shutdown_idle,
@@ -129,6 +135,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Some(Command::Tui) => not_available("The terminal UI"),
         Some(Command::Stop) => runtime::stop(&home).await,
         Some(Command::Cleanup) => cleanup::run(&home, cli.yes),
+        Some(Command::Update) => update::command(&home, cli.yes).await,
         Some(Command::Provider(args)) => provider(&home, args).await,
         Some(Command::Config) => not_available("Configuration from the command line"),
         Some(Command::Chat) => not_available("Chat from the command line"),
