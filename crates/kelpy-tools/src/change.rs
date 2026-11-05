@@ -10,6 +10,7 @@
 //! placeholders. A file that may hold secrets can be written whole, never edited: an edit would tell the model
 //! whether a text occurs in it. Its current content is not shown in the diff.
 
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -504,6 +505,7 @@ fn check(os: Os, path: &Path) -> Option<Command> {
     if os == Os::Windows {
         return None;
     }
+    let path = as_known(os, path);
     let under = |folder: &str| path.starts_with(folder);
     if under("/etc/nginx") {
         Some(command("nginx", &["-t"]))
@@ -518,6 +520,20 @@ fn check(os: Os, path: &Path) -> Option<Command> {
     } else {
         None
     }
+}
+
+/// `path` as the administrator knows it. macOS keeps `/etc`, `/var` and `/tmp` in `/private` and links them there,
+/// so a resolved path reads `/private/etc/sudoers` where the rules here say `/etc/sudoers`.
+fn as_known(os: Os, path: &Path) -> Cow<'_, Path> {
+    if os == Os::MacOs
+        && let Ok(rest) = path.strip_prefix("/private")
+        && ["etc", "var", "tmp"]
+            .iter()
+            .any(|top| rest.starts_with(top))
+    {
+        return Cow::Owned(Path::new("/").join(rest));
+    }
+    Cow::Borrowed(path)
 }
 
 fn is_json(path: &Path) -> bool {
@@ -535,6 +551,7 @@ pub(crate) fn floor(os: Os, path: &Path) -> Option<String> {
         path.starts_with(system)
             .then_some("a Windows system file")?
     } else {
+        let path = as_known(os, path);
         const FLOOR: &[(&str, &str)] = &[
             ("/etc/ssh", "the SSH configuration"),
             ("/etc/sudoers", "the sudo rules"),
@@ -932,5 +949,24 @@ mod tests {
         assert!(sshd_floor.unwrap().contains("the SSH configuration"));
         assert!(linux("/etc/fstab").1.is_some());
         assert_eq!(linux("/srv/app/config.yml"), (None, None));
+    }
+
+    #[test]
+    fn on_macos_the_resolved_etc_is_still_etc() {
+        // Resolving `/etc/sudoers` on macOS gives `/private/etc/sudoers`: the floor and the check still apply.
+        let sudoers = Path::new("/private/etc/sudoers");
+        assert!(
+            floor(Os::MacOs, sudoers)
+                .unwrap()
+                .contains("the sudo rules")
+        );
+        assert_eq!(
+            check(Os::MacOs, sudoers).map(|check| check.display),
+            Some("visudo -c".into())
+        );
+        assert!(floor(Os::MacOs, Path::new("/etc/ssh/sshd_config")).is_some());
+        assert!(floor(Os::MacOs, Path::new("/private/home/etc/sudoers")).is_none());
+        // Elsewhere `/private` has no such meaning.
+        assert!(floor(Os::Linux, sudoers).is_none());
     }
 }
