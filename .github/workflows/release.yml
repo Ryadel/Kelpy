@@ -187,11 +187,13 @@ jobs:
           pattern: kelpy-*
           path: dist
           merge-multiple: true
-      - name: Add the install scripts and the checksums
+      # VERSION puts the version under the signature: Kelpy refuses a release whose VERSION is not the one it asked for.
+      - name: Add the install scripts, the version and the checksums
         working-directory: dist
         run: |
           cp ../scripts/install.sh ../scripts/install.ps1 .
-          sha256sum kelpy-* install.sh install.ps1 > SHA256SUMS
+          printf '%s\n' "${GITHUB_REF_NAME#v}" > VERSION
+          sha256sum VERSION kelpy-* install.sh install.ps1 > SHA256SUMS
           cat SHA256SUMS
       # Kelpy installs an update only with this signature, checked against the key built into it
       # (scripts/release-key.pem is the same key). The private key is the RELEASE_SIGNING_KEY secret.
@@ -216,15 +218,20 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag --title "Kelpy ${GITHUB_REF_NAME#v}" dist/*
 
   # The published release, installed with the command people copy, on clean runners: Kelpy must start, serve the
-  # Web UI, stop, and find itself up to date.
+  # Web UI, stop, and find itself up to date. Then the previous release's executable updates itself to this one, as
+  # people's copies will: through the download and the signature check.
   install:
     name: Install on ${{ matrix.os }}
     needs: release
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2022, windows-2025]
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Install and run (Linux, macOS)
         if: runner.os != 'Windows'
@@ -232,6 +239,7 @@ jobs:
         run: |
           export KELPY_VERSION="$GITHUB_REF_NAME"
           curl -fsSL https://kelpy.io/install.sh | sh -s -- --shutdown-after 10m > kelpy.log 2>&1 &
+          install=$!
           kelpy="$HOME/Kelpy/kelpy"
           for _ in $(seq 1 60); do
             if [ -x "$kelpy" ] && "$kelpy" status > status.txt 2>&1; then break; fi
@@ -242,9 +250,40 @@ jobs:
           url="$(sed -n 's/^ *URL: *//p' status.txt)"
           curl -fsS "$url/" | grep -q '<title>Kelpy</title>'
           "$kelpy" stop
-          wait
+          # At most a minute for the installer to end once Kelpy has stopped.
+          for _ in $(seq 1 30); do
+            kill -0 "$install" 2> /dev/null || break
+            sleep 2
+          done
+          if kill -0 "$install" 2> /dev/null; then
+            echo "::error::Kelpy did not stop"
+            exit 1
+          fi
           "$kelpy" update | tee update.txt
           grep -q 'is the latest version' update.txt
+
+      - name: Update from the previous release (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) asset="kelpy-linux-x86_64" ;;
+            Linux-aarch64) asset="kelpy-linux-aarch64" ;;
+            Darwin-arm64) asset="kelpy-macos-aarch64" ;;
+            Darwin-x86_64) asset="kelpy-macos-x86_64" ;;
+          esac
+          previous="$(gh release list --exclude-drafts --exclude-pre-releases --json tagName --jq '.[].tagName' \
+            | grep -vx "$GITHUB_REF_NAME" | head -n 1)"
+          if [ -z "$previous" ] || ! gh release view "$previous" --json assets --jq '.assets[].name' | grep -qx "$asset"; then
+            echo "::notice::No earlier release of $asset to update from"
+            exit 0
+          fi
+          kelpy="$HOME/Kelpy/kelpy"
+          gh release download "$previous" --pattern "$asset" --output "$kelpy" --clobber
+          chmod +x "$kelpy"
+          test "$("$kelpy" --version)" = "kelpy ${previous#v}"
+          "$kelpy" update --yes
+          test "$("$kelpy" --version)" = "kelpy ${GITHUB_REF_NAME#v}"
 
       # Windows PowerShell 5.1, as on Windows Server 2016.
       - name: Install and run (Windows)
@@ -257,24 +296,50 @@ jobs:
           $install = Start-Process powershell -PassThru -NoNewWindow -RedirectStandardInput empty.txt `
             -RedirectStandardOutput kelpy.log -RedirectStandardError kelpy.err `
             -ArgumentList '-NoProfile', '-Command', 'irm https://kelpy.io/install.ps1 | iex'
-          $kelpy = Join-Path $HOME 'Kelpy\kelpy.exe'
-          $status = $null
-          foreach ($attempt in 1..60) {
-            if (Test-Path $kelpy) {
-              $status = & $kelpy status 2>&1 | Out-String
-              if ($LASTEXITCODE -eq 0 -and $status -match 'is running') { break }
+          try {
+            $kelpy = Join-Path $HOME 'Kelpy\kelpy.exe'
+            $status = $null
+            foreach ($attempt in 1..60) {
+              if (Test-Path $kelpy) {
+                $status = & $kelpy status 2>&1 | Out-String
+                if ($LASTEXITCODE -eq 0 -and $status -match 'is running') { break }
+              }
+              Start-Sleep -Seconds 2
             }
-            Start-Sleep -Seconds 2
+            Get-Content kelpy.log, kelpy.err
+            $status
+            $version = & $kelpy --version
+            if ($version -ne "kelpy $($env:GITHUB_REF_NAME.TrimStart('v'))") { throw "Version: $version" }
+            $url = ([regex]::Match($status, 'URL:\s+(\S+)')).Groups[1].Value
+            $page = Invoke-WebRequest -Uri "$url/" -UseBasicParsing
+            if ($page.Content -notmatch '<title>Kelpy</title>') { throw 'The Web UI did not answer' }
+            # A native command's failure does not stop the script: each exit code is checked.
+            & $kelpy stop
+            if ($LASTEXITCODE -ne 0) { throw "kelpy stop failed ($LASTEXITCODE)" }
+            if (-not $install.WaitForExit(60000)) { throw 'Kelpy did not stop' }
+            $update = & $kelpy update | Out-String
+            $update
+            if ($LASTEXITCODE -ne 0) { throw "kelpy update failed ($LASTEXITCODE)" }
+            if ($update -notmatch 'is the latest version') { throw 'kelpy update did not find this release' }
+          } finally {
+            if (-not $install.HasExited) { taskkill /T /F /PID $install.Id | Out-Null }
           }
-          Get-Content kelpy.log, kelpy.err
-          $status
+
+      - name: Update from the previous release (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $asset = 'kelpy-windows-x86_64.exe'
+          $previous = gh release list --exclude-drafts --exclude-pre-releases --json tagName --jq '.[].tagName' |
+            Where-Object { $_ -ne $env:GITHUB_REF_NAME } | Select-Object -First 1
+          if (-not $previous) { Write-Output '::notice::No earlier release to update from'; exit 0 }
+          $kelpy = Join-Path $HOME 'Kelpy\kelpy.exe'
+          gh release download $previous --pattern $asset --output $kelpy --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Download of $previous failed" }
           $version = & $kelpy --version
-          if ($version -ne "kelpy $($env:GITHUB_REF_NAME.TrimStart('v'))") { throw "Version: $version" }
-          $url = ([regex]::Match($status, 'URL:\s+(\S+)')).Groups[1].Value
-          $page = Invoke-WebRequest -Uri "$url/" -UseBasicParsing
-          if ($page.Content -notmatch '<title>Kelpy</title>') { throw 'The Web UI did not answer' }
-          & $kelpy stop
-          $install.WaitForExit()
-          $update = & $kelpy update | Out-String
-          $update
-          if ($update -notmatch 'is the latest version') { throw 'kelpy update did not find this release' }
+          if ($version -ne "kelpy $($previous.TrimStart('v'))") { throw "Version before: $version" }
+          & $kelpy update --yes
+          if ($LASTEXITCODE -ne 0) { throw "kelpy update failed ($LASTEXITCODE)" }
+          $version = & $kelpy --version
+          if ($version -ne "kelpy $($env:GITHUB_REF_NAME.TrimStart('v'))") { throw "Version after: $version" }

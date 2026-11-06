@@ -79,7 +79,7 @@ impl RuntimeLock {
             .truncate(false)
             .read(true)
             .write(true)
-            .open(data_dir.join(LOCK_FILE))
+            .open(lock_path(home))
             .context("cannot open the runtime lock file")?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self {
@@ -110,6 +110,20 @@ pub fn is_running(home: &Home) -> Result<bool> {
     Ok(RuntimeLock::try_acquire(home)?.is_none())
 }
 
+/// The runtime's lock file. Deleting it while held would let a second runtime lock a new file of the same name, so
+/// only `cleanup` deletes it, once the folder is no longer a home.
+pub fn lock_path(home: &Home) -> PathBuf {
+    home.data_dir().join(LOCK_FILE)
+}
+
+/// While held, no runtime can start in this home: the executable can be replaced with nothing running it.
+pub struct Hold(#[allow(dead_code)] RuntimeLock);
+
+/// Holds the runtime's lock, or returns `None` if a runtime is running.
+pub fn hold(home: &Home) -> Result<Option<Hold>> {
+    Ok(RuntimeLock::try_acquire(home)?.map(Hold))
+}
+
 /// Automatic shutdown, from `--shutdown-after` and `--shutdown-idle`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Limits {
@@ -120,7 +134,7 @@ pub struct Limits {
 /// Runs the runtime and the Web server in the foreground until Ctrl+C, the end of the terminal session, or one
 /// of the `limits`. In every case new work is refused at once, and work in progress gets `SHUTDOWN_GRACE` to finish.
 pub async fn run_foreground(home: &Home, open_browser: bool, limits: Limits) -> Result<ExitCode> {
-    platform::remove_leftovers(home.root(), &home::executable_name());
+    platform::remove_leftovers(&home.root().join(home::executable_name()), &home.data_dir());
     let config = Config::load(&home.config_path())?;
 
     let Some(lock) = RuntimeLock::try_acquire(home)? else {
@@ -131,7 +145,8 @@ pub async fn run_foreground(home: &Home, open_browser: bool, limits: Limits) -> 
                     open_url(&info.sign_in_url());
                 }
             }
-            Ok(None) => println!("Kelpy is already running."),
+            // The lock without runtime.json: a runtime still starting, or an update in progress.
+            Ok(None) => println!("Kelpy is already running or being updated."),
             Err(error) => println!("Kelpy is already running. {}", unreadable(&error)),
         }
         return Ok(ExitCode::SUCCESS);

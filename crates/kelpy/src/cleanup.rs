@@ -21,13 +21,15 @@ use crate::{platform, prompt, runtime};
 
 pub fn run(home: &Home, assume_yes: bool) -> Result<ExitCode> {
     let root = home.root();
-    if runtime::is_running(home)? {
+    // Held to the end: no runtime and no update can start in this home while it is being removed.
+    let Some(hold) = runtime::hold(home)? else {
         println!(
-            "Kelpy is running from {}. Stop it first (`kelpy stop`), then run this again.",
+            "Kelpy is running or being updated from {}. Stop it first (`kelpy stop`), then run this again.",
             root.display()
         );
         return Ok(ExitCode::from(1));
-    }
+    };
+    let lock = runtime::lock_path(home);
 
     let entries = own_entries(home);
     println!("This removes Kelpy from this computer:");
@@ -82,7 +84,7 @@ pub fn run(home: &Home, assume_yes: bool) -> Result<ExitCode> {
             // This very executable: Unix deletes it; Windows moves it to the temp folder.
             platform::remove_running_executable(entry)
         } else if entry.is_dir() {
-            fs::remove_dir_all(entry)
+            remove_dir_keeping(entry, &lock)
         } else {
             fs::remove_file(entry)
         };
@@ -97,6 +99,12 @@ pub fn run(home: &Home, assume_yes: bool) -> Result<ExitCode> {
         println!("! Could not delete {}: {error}", marker.display());
         complete = false;
     } else {
+        // No longer a home, so nothing can start a runtime here: the lock can go, and its folder with it.
+        drop(hold);
+        let _ = fs::remove_file(&lock);
+        if let Some(dir) = lock.parent() {
+            let _ = fs::remove_dir(dir);
+        }
         complete &= remove_root(root);
     }
 
@@ -107,6 +115,27 @@ pub fn run(home: &Home, assume_yes: bool) -> Result<ExitCode> {
         println!("Kelpy has been removed in part: see the messages above.");
         Ok(ExitCode::from(1))
     }
+}
+
+/// Deletes `dir` with everything in it but `keep` and the folders that lead to it, which stay.
+fn remove_dir_keeping(dir: &Path, keep: &Path) -> io::Result<()> {
+    if !keep.starts_with(dir) {
+        return fs::remove_dir_all(dir);
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path == keep {
+            continue;
+        }
+        if keep.starts_with(&path) {
+            remove_dir_keeping(&path, keep)?;
+        } else if fs::symlink_metadata(&path)?.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Deletes the home folder if nothing else is left in it. Returns false if it is empty but could not be deleted.
@@ -127,15 +156,14 @@ fn remove_root(root: &Path) -> bool {
 
 /// What Kelpy keeps in its home, as far as it exists.
 fn own_entries(home: &Home) -> Vec<PathBuf> {
+    // Updates stage and park executables in the data folder, which is Kelpy's whole: nothing next to the
+    // executable is taken for Kelpy's by its name. Earlier versions parked one next to it, recognised by content.
     let executable = home.root().join(home::executable_name());
     [home.marker_path(), home.config_path()]
         .into_iter()
         .chain(home.own_dirs())
-        .chain([
-            executable.with_extension("new"),
-            executable.with_extension("old"),
-            executable,
-        ])
+        .chain(platform::legacy_previous(&executable))
+        .chain([executable])
         .filter(|path| fs::symlink_metadata(path).is_ok())
         .collect()
 }
@@ -247,6 +275,52 @@ mod tests {
             return None;
         }
         Some(guard)
+    }
+
+    #[test]
+    fn files_named_like_kelpys_next_to_it_are_not_kelpys() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Downloads");
+        fs::create_dir(&root).unwrap();
+        // There before the home: names earlier versions of Kelpy used next to the executable.
+        fs::write(root.join("kelpy.4242-0.new"), b"someone else's").unwrap();
+        fs::create_dir(root.join("kelpy.4242-1.new")).unwrap();
+        fs::write(root.join("kelpy.old"), b"someone else's").unwrap();
+        let home = Home::init(&root).unwrap();
+
+        run(&home, true).unwrap();
+        assert!(root.join("kelpy.4242-0.new").is_file());
+        assert!(root.join("kelpy.4242-1.new").is_dir());
+        assert!(root.join("kelpy.old").is_file());
+        assert!(!home.config_path().exists());
+    }
+
+    #[test]
+    fn cleanup_waits_for_a_runtime_or_an_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::init(dir.path().join("Kelpy")).unwrap();
+        let _update = runtime::hold(&home).unwrap().unwrap();
+
+        assert_eq!(run(&home, true).unwrap(), ExitCode::from(1));
+        assert!(home.config_path().exists());
+        assert!(home.data_dir().exists());
+    }
+
+    #[test]
+    fn the_lock_outlives_the_rest_of_the_data_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::init(dir.path().join("Kelpy")).unwrap();
+        let hold = runtime::hold(&home).unwrap().unwrap();
+        fs::write(home.data_dir().join("kelpy.db"), b"conversations").unwrap();
+        fs::create_dir(home.data_dir().join("backups")).unwrap();
+
+        remove_dir_keeping(&home.data_dir(), &runtime::lock_path(&home)).unwrap();
+        assert!(!home.data_dir().join("kelpy.db").exists());
+        assert!(!home.data_dir().join("backups").exists());
+        // The same lock, still held: no second owner while the first one lives.
+        assert!(runtime::hold(&home).unwrap().is_none());
+        drop(hold);
+        assert!(runtime::hold(&home).unwrap().is_some());
     }
 
     #[test]

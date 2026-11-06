@@ -25,7 +25,8 @@ on dark ones. Do not set the name in another font, capitalise it, change its spa
 - [`kelpy-lockup-horizontal-light.svg`](kelpy-lockup-horizontal-light.svg) and
   [`kelpy-lockup-horizontal-dark.svg`](kelpy-lockup-horizontal-dark.svg): the mark with the name on its right, for
   light and dark backgrounds. The name is drawn as paths, so the files need no font. Text size is 0.885 of the
-  mark's height and the gap 0.231 of it.
+  mark's height and the gap 0.231 of it. Both use the black mark over a soft turquoise glow, which lifts it from a
+  dark background; the glow is drawn into the file, so the lockup looks the same wherever it is shown.
 
 The Web UI shows the mark alone.
 

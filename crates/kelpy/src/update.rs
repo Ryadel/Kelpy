@@ -3,9 +3,10 @@
 //! `kelpy update` does the same on request.
 //!
 //! The release workflow signs each release's `SHA256SUMS` with Ed25519 (`SHA256SUMS.sig`, the 64 bytes of the
-//! signature). Kelpy installs an update only when that signature matches a key built into it and the download
-//! matches its line in `SHA256SUMS`: whoever could change a release on GitHub still could not change what Kelpy
-//! installs.
+//! signature). `SHA256SUMS` also lists `VERSION`, a file holding the release's version, so the signature covers the
+//! version too. Kelpy installs an update only when that signature matches a key built into it, `VERSION` is the
+//! version it asked for, and the download matches its line in `SHA256SUMS`: whoever could change a release on GitHub
+//! still could not change what Kelpy installs, nor pass an older release off as a newer one.
 
 use std::cmp::Ordering;
 use std::env;
@@ -34,6 +35,9 @@ const RELEASE_KEYS: &[[u8; 32]] = &[[
 
 /// How long the check at start may take: an offline server starts after this at most.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long downloading and checking an update may take in all, however slowly the server sends.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Where releases are, unless `KELPY_RELEASES_URL` names a copy (to test a release build against a local one; the
 /// signature is required all the same).
@@ -86,7 +90,23 @@ pub async fn at_start(home: &Home, assume_yes: bool) -> Option<ExitCode> {
         let _ = fs::write(&declined, &latest);
         return None;
     }
-    if let Err(error) = install(&installed, &latest, &releases(), RELEASE_KEYS).await {
+    // Kelpy may have started in another terminal while the question waited.
+    let Ok(Some(hold)) = runtime::hold(home) else {
+        println!("Kelpy started meanwhile: run `kelpy update` once it stops.");
+        return None;
+    };
+    let installed_now = install(
+        &installed,
+        &home.data_dir(),
+        &latest,
+        &releases(),
+        RELEASE_KEYS,
+        INSTALL_TIMEOUT,
+    )
+    .await;
+    // The updated Kelpy takes the lock itself.
+    drop(hold);
+    if let Err(error) = installed_now {
         eprintln!("Update failed: {error:#}. Starting Kelpy {VERSION}.");
         return None;
     }
@@ -113,11 +133,14 @@ pub async fn command(home: &Home, assume_yes: bool) -> Result<ExitCode> {
         println!("Kelpy {VERSION} is the latest version.");
         return Ok(ExitCode::SUCCESS);
     }
-    if runtime::is_running(home)? {
-        bail!(
+    let running = || {
+        anyhow::anyhow!(
             "Kelpy is running from {}. Stop it first (Ctrl+C in its window), then run this again.",
             home.root().display()
-        );
+        )
+    };
+    if runtime::is_running(home)? {
+        return Err(running());
     }
     if !assume_yes {
         if !prompt::interactive() {
@@ -130,7 +153,17 @@ pub async fn command(home: &Home, assume_yes: bool) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
     }
-    install(&installed, &latest, &releases(), RELEASE_KEYS).await?;
+    // Held until the new executable is in place, so that no Kelpy starts meanwhile.
+    let _hold = runtime::hold(home)?.ok_or_else(running)?;
+    install(
+        &installed,
+        &home.data_dir(),
+        &latest,
+        &releases(),
+        RELEASE_KEYS,
+        INSTALL_TIMEOUT,
+    )
+    .await?;
     let _ = fs::remove_file(declined_path(home));
     println!("✓ Updated Kelpy in {} to {latest}", home.root().display());
     Ok(ExitCode::SUCCESS)
@@ -175,8 +208,30 @@ fn tag_version(location: &str) -> Option<String> {
     valid.then(|| version.to_owned())
 }
 
-/// Downloads release `version`, checks it, and writes it over `installed`.
-async fn install(installed: &Path, version: &str, releases: &str, keys: &[[u8; 32]]) -> Result<()> {
+/// Downloads release `version`, checks it, and writes it over `installed`, staged in `scratch` (see
+/// `platform::write_executable`). Downloading and checking must end within `timeout`.
+async fn install(
+    installed: &Path,
+    scratch: &Path,
+    version: &str,
+    releases: &str,
+    keys: &[[u8; 32]],
+    timeout: Duration,
+) -> Result<()> {
+    let executable = tokio::time::timeout(timeout, download_checked(version, releases, keys))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "the download of release {version} did not end within {} seconds",
+                timeout.as_secs_f32()
+            )
+        })??;
+    platform::write_executable(&executable, installed, scratch)
+        .with_context(|| format!("cannot update {}", installed.display()))
+}
+
+/// This platform's executable of release `version`, once its signature, version and checksum are checked.
+async fn download_checked(version: &str, releases: &str, keys: &[[u8; 32]]) -> Result<Vec<u8>> {
     let client = kelpy_core::providers::http_client(|builder| {
         builder
             .connect_timeout(Duration::from_secs(20))
@@ -190,6 +245,9 @@ async fn install(installed: &Path, version: &str, releases: &str, keys: &[[u8; 3
         bail!("the signature of release {version} is not valid, so it was not installed");
     }
     let sums = String::from_utf8(sums).context("SHA256SUMS is not text")?;
+    if listed_digest(&sums, "VERSION") != Some(version_digest(version)) {
+        bail!("the signed files are not those of release {version}, so it was not installed");
+    }
     let expected = listed_digest(&sums, &asset)
         .with_context(|| format!("{asset} is not listed in SHA256SUMS"))?;
 
@@ -199,8 +257,12 @@ async fn install(installed: &Path, version: &str, releases: &str, keys: &[[u8; 3
     if actual != expected {
         bail!("checksum mismatch for {asset} (expected {expected}, got {actual})");
     }
-    platform::write_executable(&executable, installed)
-        .with_context(|| format!("cannot update {}", installed.display()))
+    Ok(executable)
+}
+
+/// The digest `SHA256SUMS` lists for `VERSION` in release `version`: the file holds the version and a newline.
+fn version_digest(version: &str) -> String {
+    hex(ring::digest::digest(&ring::digest::SHA256, format!("{version}\n").as_bytes()).as_ref())
 }
 
 async fn download(client: &reqwest::Client, url: &str, limit: usize) -> Result<Vec<u8>> {
@@ -321,14 +383,25 @@ mod tests {
         sums: String,
         signature: Vec<u8>,
         executable: Vec<u8>,
+        /// Sends the executable a byte at a time, with this pause before each.
+        drip: Option<Duration>,
     }
 
-    /// A release of `executable` with its checksums signed by a new key, which `keys` trusts.
+    /// Release 9.9.9 of `executable`, as `release_of` makes it.
     fn release(executable: &[u8]) -> (Release, Ed25519KeyPair) {
+        release_of("9.9.9", executable)
+    }
+
+    /// Release `version` of `executable`, with its checksums signed by a new key, which `keys` trusts.
+    fn release_of(version: &str, executable: &[u8]) -> (Release, Ed25519KeyPair) {
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
         let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
         let digest = hex(ring::digest::digest(&ring::digest::SHA256, executable).as_ref());
-        let sums = format!("{digest}  {}\n", asset_name());
+        let sums = format!(
+            "{}  VERSION\n{digest}  {}\n",
+            version_digest(version),
+            asset_name()
+        );
         let signature = pair.sign(sums.as_bytes()).as_ref().to_vec();
         let key: [u8; 32] = pair.public_key().as_ref().try_into().unwrap();
         let release = Release {
@@ -336,6 +409,7 @@ mod tests {
             sums,
             signature,
             executable: executable.to_vec(),
+            drip: None,
         };
         (release, pair)
     }
@@ -359,6 +433,7 @@ mod tests {
                         .unwrap_or_default()
                         .to_owned();
                     let file = path.rsplit('/').next().unwrap_or_default().to_owned();
+                    let drip = (file == asset_name()).then_some(release.drip).flatten();
                     let (head, body): (String, Vec<u8>) = if path.ends_with("/latest") {
                         (
                             "302 Found\r\nlocation: /releases/tag/v9.9.9".into(),
@@ -378,7 +453,19 @@ mod tests {
                         body.len()
                     );
                     let _ = socket.write_all(head.as_bytes()).await;
-                    let _ = socket.write_all(&body).await;
+                    match drip {
+                        None => {
+                            let _ = socket.write_all(&body).await;
+                        }
+                        Some(pause) => {
+                            for byte in body {
+                                tokio::time::sleep(pause).await;
+                                if socket.write_all(&[byte]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 });
             }
         });
@@ -401,7 +488,16 @@ mod tests {
         let installed = dir.path().join(home::executable_name());
         fs::write(&installed, b"the old kelpy").unwrap();
 
-        install(&installed, "9.9.9", &url, &keys).await.unwrap();
+        install(
+            &installed,
+            dir.path(),
+            "9.9.9",
+            &url,
+            &keys,
+            INSTALL_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert_eq!(fs::read(&installed).unwrap(), b"the new kelpy");
         #[cfg(unix)]
         {
@@ -421,9 +517,16 @@ mod tests {
         let installed = dir.path().join(home::executable_name());
         fs::write(&installed, b"the old kelpy").unwrap();
 
-        let error = install(&installed, "9.9.9", &url, &[trusted])
-            .await
-            .unwrap_err();
+        let error = install(
+            &installed,
+            dir.path(),
+            "9.9.9",
+            &url,
+            &[trusted],
+            INSTALL_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("signature"), "{error:#}");
         assert_eq!(fs::read(&installed).unwrap(), b"the old kelpy");
     }
@@ -438,8 +541,66 @@ mod tests {
         let installed = dir.path().join(home::executable_name());
         fs::write(&installed, b"the old kelpy").unwrap();
 
-        let error = install(&installed, "9.9.9", &url, &keys).await.unwrap_err();
+        let error = install(
+            &installed,
+            dir.path(),
+            "9.9.9",
+            &url,
+            &keys,
+            INSTALL_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("checksum mismatch"), "{error:#}");
+        assert_eq!(fs::read(&installed).unwrap(), b"the old kelpy");
+    }
+
+    #[tokio::test]
+    async fn an_older_release_under_a_newer_tag_is_refused() {
+        // Release 9.9.8, signed and intact, served as 9.9.9.
+        let (release, _) = release_of("9.9.8", b"the older kelpy");
+        let keys = release.keys.clone();
+        let url = serve(release).await;
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join(home::executable_name());
+        fs::write(&installed, b"the current kelpy").unwrap();
+
+        let error = install(
+            &installed,
+            dir.path(),
+            "9.9.9",
+            &url,
+            &keys,
+            INSTALL_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("release 9.9.9"), "{error:#}");
+        assert_eq!(fs::read(&installed).unwrap(), b"the current kelpy");
+    }
+
+    #[tokio::test]
+    async fn a_download_that_never_ends_is_stopped() {
+        // Each byte comes well within any read timeout, the whole file much later than the limit.
+        let (mut release, _) = release(b"the new kelpy");
+        release.drip = Some(Duration::from_millis(100));
+        let keys = release.keys.clone();
+        let url = serve(release).await;
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join(home::executable_name());
+        fs::write(&installed, b"the old kelpy").unwrap();
+
+        let error = install(
+            &installed,
+            dir.path(),
+            "9.9.9",
+            &url,
+            &keys,
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("did not end"), "{error:#}");
         assert_eq!(fs::read(&installed).unwrap(), b"the old kelpy");
     }
 }

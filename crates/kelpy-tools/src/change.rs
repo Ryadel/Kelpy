@@ -517,6 +517,9 @@ fn check(os: Os, path: &Path) -> Option<Command> {
         Some(command("sshd", &["-t"]))
     } else if under("/etc/sudoers") || under("/etc/sudoers.d") {
         Some(command("visudo", &["-c"]))
+    } else if os == Os::MacOs && (under("/etc/pf.conf") || under("/etc/pf.anchors")) {
+        // The main rules load the anchors: parsing them, without loading, checks both.
+        Some(command("pfctl", &["-nf", "/etc/pf.conf"]))
     } else {
         None
     }
@@ -576,6 +579,15 @@ pub(crate) fn floor(os: Os, path: &Path) -> Option<String> {
             ("/etc/crypttab", "the file systems mounted at start"),
             ("/etc/default/grub", "the boot configuration"),
             ("/boot", "the boot configuration"),
+            // macOS: the packet filter, the application firewall and the network settings.
+            ("/etc/pf.conf", "the firewall"),
+            ("/etc/pf.anchors", "the firewall"),
+            ("/etc/pf.os", "the firewall"),
+            ("/Library/Preferences/com.apple.alf.plist", "the firewall"),
+            (
+                "/Library/Preferences/SystemConfiguration",
+                "the network configuration",
+            ),
         ];
         FLOOR
             .iter()
@@ -968,5 +980,32 @@ mod tests {
         assert!(floor(Os::MacOs, Path::new("/private/home/etc/sudoers")).is_none());
         // Elsewhere `/private` has no such meaning.
         assert!(floor(Os::Linux, sudoers).is_none());
+    }
+
+    #[test]
+    fn on_macos_the_firewall_and_network_settings_always_ask() {
+        for path in [
+            "/etc/pf.conf",
+            "/private/etc/pf.conf",
+            "/private/etc/pf.anchors/com.apple",
+            "/Library/Preferences/com.apple.alf.plist",
+            "/Library/Preferences/SystemConfiguration/preferences.plist",
+        ] {
+            let why = floor(Os::MacOs, Path::new(path)).unwrap_or_else(|| panic!("{path}"));
+            assert!(
+                why.contains("firewall") || why.contains("network"),
+                "{path}: {why}"
+            );
+        }
+        for path in ["/private/etc/pf.conf", "/etc/pf.anchors/custom"] {
+            assert_eq!(
+                check(Os::MacOs, Path::new(path)).map(|check| check.display),
+                Some("pfctl -nf /etc/pf.conf".into()),
+                "{path}"
+            );
+        }
+        // Not a firewall file, and no `pfctl` on Linux.
+        assert!(floor(Os::MacOs, Path::new("/etc/pf.conf.bak")).is_none());
+        assert!(check(Os::Linux, Path::new("/etc/pf.conf")).is_none());
     }
 }

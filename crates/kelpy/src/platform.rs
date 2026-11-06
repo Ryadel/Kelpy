@@ -17,53 +17,116 @@ pub enum PathChange {
     Linked { link: PathBuf, on_path: bool },
 }
 
-/// Copies `source` over `target`, even while `target` is running.
+/// Copies `source` over `target`, even while `target` is running, as `write_executable` does.
+pub fn replace_executable(source: &Path, target: &Path, scratch: &Path) -> io::Result<()> {
+    write_executable(&fs::read(source)?, target, scratch)
+}
+
+/// Writes `content` over `target` as an executable, even while `target` is running.
 ///
-/// The copy is staged next to the target and then swapped in. On Windows a running executable cannot be
-/// overwritten but can be renamed, so the old one is moved aside to `<name>.old` first; `remove_leftovers`
-/// deletes it at a later start.
-pub fn replace_executable(source: &Path, target: &Path) -> io::Result<()> {
-    let staged = target.with_extension("new");
-    fs::copy(source, &staged)?;
-    swap_in(&staged, target)
+/// `scratch` is a folder of Kelpy's own on the same volume as `target` (the home's data folder): the content is
+/// staged there and then moved over `target`, so that no file next to `target` is ever created, overwritten or
+/// deleted but `target` itself. On Windows a running executable cannot be overwritten but can be moved, so the old
+/// one goes to `scratch` first, and `remove_leftovers` deletes it at a later start. If anything fails, `target` is
+/// left as it was and the staged file is deleted.
+pub fn write_executable(content: &[u8], target: &Path, scratch: &Path) -> io::Result<()> {
+    let staged = stage(content, scratch)?;
+    swap_in(&staged, target, scratch).inspect_err(|_| {
+        let _ = fs::remove_file(&staged);
+    })
 }
 
-/// Writes `content` over `target` as an executable, even while `target` is running, as `replace_executable` does.
-pub fn write_executable(content: &[u8], target: &Path) -> io::Result<()> {
-    let staged = target.with_extension("new");
-    fs::write(&staged, content)?;
+/// Creates `update-<process id>-<n>.new` in `scratch` with `content`: a new file, never one that was already there.
+fn stage(content: &[u8], scratch: &Path) -> io::Result<PathBuf> {
+    use std::io::Write;
+    let mut attempt = 0;
+    let (staged, mut file) = loop {
+        let staged = scratch.join(format!("update-{}-{attempt}.new", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+        {
+            Ok(file) => break (staged, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempt < 100 => {
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let written = file.write_all(content).and_then(|()| file.sync_all());
     #[cfg(unix)]
-    {
+    let written = written.and_then(|()| {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))
+    });
+    drop(file);
+    match written {
+        Ok(()) => Ok(staged),
+        Err(error) => {
+            let _ = fs::remove_file(&staged);
+            Err(error)
+        }
     }
-    swap_in(&staged, target)
 }
 
-fn swap_in(staged: &Path, target: &Path) -> io::Result<()> {
+/// Where the executable replaced by an update waits in `scratch` until it is no longer running (Windows only).
+fn previous(target: &Path, scratch: &Path) -> PathBuf {
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    scratch.join(format!("{name}.old"))
+}
+
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn swap_in(staged: &Path, target: &Path, scratch: &Path) -> io::Result<()> {
     #[cfg(windows)]
     if target.exists() {
-        let old = target.with_extension("old");
-        // A leftover of an earlier update, if any; if it is still in use the rename below reports it.
+        let old = previous(target, scratch);
+        // A leftover of an earlier update, if any; if it is still in use the move below reports it.
         let _ = fs::remove_file(&old);
         fs::rename(target, &old)?;
+        return fs::rename(staged, target).inspect_err(|_| {
+            // Without this, the home would be left with no executable at all.
+            let _ = fs::rename(&old, target);
+        });
     }
     fs::rename(staged, target)
 }
 
 /// Deletes leftovers of earlier updates and installer removals. Files still in use are skipped.
-pub fn remove_leftovers(home_root: &Path, executable_name: &str) {
-    let _ = fs::remove_file(home_root.join(executable_name).with_extension("old"));
+pub fn remove_leftovers(executable: &Path, scratch: &Path) {
+    let _ = fs::remove_file(previous(executable, scratch));
+    if let Some(legacy) = legacy_previous(executable) {
+        let _ = fs::remove_file(legacy);
+    }
     #[cfg(windows)]
     if let Ok(entries) = fs::read_dir(std::env::temp_dir()) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(windows::INSTALLER_PREFIX) && name.ends_with(".exe") {
+            if name.starts_with(windows::INSTALLER_PREFIX)
+                && name.ends_with(".exe")
+                && is_kelpy_executable(&entry.path())
+            {
                 let _ = fs::remove_file(entry.path());
             }
         }
     }
+}
+
+/// `<name>.old` next to the executable, where Kelpy 0.2.0 and earlier parked the replaced executable on Windows, if
+/// it is there and is a Kelpy executable.
+pub fn legacy_previous(executable: &Path) -> Option<PathBuf> {
+    let legacy = executable.with_extension("old");
+    (cfg!(windows) && is_kelpy_executable(&legacy)).then_some(legacy)
+}
+
+/// Whether `path` is a Windows executable that names the Kelpy home's marker: a file outside Kelpy's own folders is
+/// deleted only with this proof that Kelpy put it there, never by its name alone.
+fn is_kelpy_executable(path: &Path) -> bool {
+    let marker = kelpy_core::home::MARKER_FILE.as_bytes();
+    fs::read(path).is_ok_and(|content| {
+        content.starts_with(b"MZ") && content.windows(marker.len()).any(|window| window == marker)
+    })
 }
 
 /// Removes the installer that is running right now.
@@ -365,5 +428,79 @@ mod unix {
 
     pub fn is_removable(_path: &Path) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn writing_an_executable_replaces_it_and_touches_nothing_next_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("data");
+        fs::create_dir(&scratch).unwrap();
+        let name = kelpy_core::home::executable_name();
+        let target = dir.path().join(&name);
+        fs::write(&target, b"old").unwrap();
+        // Not Kelpy's: names Kelpy used next to the executable in earlier versions.
+        for other in ["kelpy.new", "kelpy.old", "kelpy.4242-0.new"] {
+            fs::write(dir.path().join(other), b"someone else's").unwrap();
+        }
+
+        write_executable(b"new", &target, &scratch).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        for other in ["kelpy.new", "kelpy.old", "kelpy.4242-0.new"] {
+            assert_eq!(fs::read(dir.path().join(other)).unwrap(), b"someone else's");
+        }
+        // Only the replaced executable may be left, in Kelpy's own folder, for `remove_leftovers`.
+        let left = names(&scratch);
+        assert!(left.iter().all(|left| left.ends_with(".old")), "{left:?}");
+        remove_leftovers(&target, &scratch);
+        assert!(names(&scratch).is_empty());
+    }
+
+    #[test]
+    fn an_old_executable_from_an_earlier_version_goes_only_if_it_is_kelpys() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("kelpy.exe");
+        let legacy = dir.path().join("kelpy.old");
+
+        fs::write(&legacy, b"MZ someone else's program").unwrap();
+        remove_leftovers(&executable, dir.path());
+        assert!(legacy.exists());
+
+        let kelpys = [
+            b"MZ".as_slice(),
+            b"...",
+            kelpy_core::home::MARKER_FILE.as_bytes(),
+        ]
+        .concat();
+        fs::write(&legacy, kelpys).unwrap();
+        remove_leftovers(&executable, dir.path());
+        // Only Windows versions left it there, so only Windows deletes it.
+        assert_eq!(legacy.exists(), !cfg!(windows));
+    }
+
+    #[test]
+    fn a_failed_swap_leaves_the_executable_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("kelpy");
+        fs::write(&target, b"old").unwrap();
+        // The swap cannot succeed: the staged file is gone.
+        let missing = dir.path().join("update-0-0.new");
+
+        assert!(swap_in(&missing, &target, dir.path()).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"old");
     }
 }

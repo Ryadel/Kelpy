@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -857,11 +857,11 @@ dependencies = [
 
 [[package]]
 name = "kelpy-common"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "kelpy-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dirs",
  "kelpy-common",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-gateway"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -903,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-providers"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "futures-util",
@@ -920,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-storage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "kelpy-common",
  "rusqlite",
@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-test-support"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "ring",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-tools"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "getrandom 0.4.3",
  "kelpy-common",

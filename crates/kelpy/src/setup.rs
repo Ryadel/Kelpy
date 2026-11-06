@@ -195,7 +195,7 @@ fn install(executable: &Path, target: &Path, in_place: bool, add_to_path: bool) 
 
     if !in_place {
         let name = home::executable_name();
-        platform::replace_executable(executable, &target.join(&name))
+        platform::replace_executable(executable, &target.join(&name), &home.data_dir())
             .with_context(|| format!("cannot copy Kelpy to {}", target.display()))?;
         println!("✓ Installed {name} to {}", target.display());
     }
@@ -376,14 +376,17 @@ async fn delegate(
                 options.assume_yes
             };
             if update {
-                if runtime::is_running(&Home::open(root)?)? {
+                // Held until the new executable is in place, so that no Kelpy starts meanwhile.
+                let home = Home::open(root)?;
+                let Some(hold) = runtime::hold(&home)? else {
                     bail!(
                         "Kelpy is running from {}. Stop it first (Ctrl+C in its window), then run this again.",
                         root.display()
                     );
-                }
-                platform::replace_executable(this_copy, installed)
+                };
+                platform::replace_executable(this_copy, installed, &home.data_dir())
                     .with_context(|| format!("cannot update {}", installed.display()))?;
+                drop(hold);
                 println!("✓ Updated Kelpy in {} to {VERSION}", root.display());
             }
         }
