@@ -283,7 +283,7 @@ fn page(records: &[&Record], differences: &[Difference]) -> String {
             })
             .collect();
         page.push_str(&format!(
-            "\n## Changed outside Kelpy, not settled\n\n{}\n",
+            "\n## Unexpected changes, not settled\n\n{}\n",
             lines.join("\n")
         ));
     }

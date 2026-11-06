@@ -71,7 +71,7 @@
         onclick={() => (open = !open)}
       >
         <TriangleAlertIcon class="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
-        <span class="font-medium">Changed outside Kelpy</span>
+        <span class="font-medium">Unexpected changes</span>
         <span class="text-muted-foreground">
           {differences.length === 1
             ? 'One thing Kelpy changed is no longer as it left it.'

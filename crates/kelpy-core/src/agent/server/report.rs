@@ -344,7 +344,7 @@ fn report(
             })
             .collect();
         report.push_str(&format!(
-            "\n## Changed outside Kelpy, not settled\n\n{}\n",
+            "\n## Unexpected changes, not settled\n\n{}\n",
             lines.join("\n")
         ));
     }

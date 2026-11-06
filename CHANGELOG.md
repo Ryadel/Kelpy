@@ -3,6 +3,11 @@
 Each release is on the [releases page](https://github.com/Ryadel/Kelpy/releases), with one executable per platform,
 the install scripts and the signed checksums. Versions follow [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+- **Unexpected changes** is the new name of what was *Changed outside Kelpy*: the bar above the conversation, and
+  its section in the handover report and in the memory page `server.md`.
+
 ## 0.3.0 (2026-11-06)
 
 Kelpy now runs on macOS and on Linux ARM64.

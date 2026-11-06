@@ -202,7 +202,7 @@ mod tests {
             assert!(log.contains(label), "{label}");
         }
         let differences = web("lib/Differences.svelte");
-        for label in [">Accept<", ">Put back<", "Changed outside Kelpy"] {
+        for label in [">Accept<", ">Put back<", "Unexpected changes"] {
             assert!(differences.contains(label), "{label}");
         }
         let app = web("App.svelte");
