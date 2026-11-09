@@ -3,7 +3,10 @@
 Each release is on the [releases page](https://github.com/Ryadel/Kelpy/releases), with one executable per platform,
 the install scripts and the signed checksums. Versions follow [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## 0.4.1 (2026-11-09)
+
+Fixes to the terminal UI's start screen and the Web UI, and a Windows install command that also runs from the
+Command Prompt.
 
 - **Updates**: when GitHub answers the check for the latest release with an error, such as 504, `kelpy update` names
   it.
@@ -12,6 +15,8 @@ the install scripts and the signed checksums. Versions follow [Semantic Versioni
 - **Web UI**: every button, menu item and tab shows the pointing hand.
 - **Install on Windows**: the command is now `powershell -c "irm https://kelpy.io/install.ps1 | iex"`, which runs from
   the Command Prompt as well as PowerShell.
+
+Updating from 0.4.0: Kelpy offers the update at its next start, or run `kelpy update`.
 
 ## 0.4.0 (2026-11-09)
 

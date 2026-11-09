@@ -1789,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1819,7 +1819,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-client"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "futures-util",
  "kelpy-providers",
@@ -1832,11 +1832,11 @@ dependencies = [
 
 [[package]]
 name = "kelpy-common"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "kelpy-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-gateway"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "axum",
  "futures-util",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-providers"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.23.1",
  "futures-util",
@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-remote"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-storage"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "kelpy-common",
  "rusqlite",
@@ -1935,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-test-support"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.23.1",
  "ring",
@@ -1945,7 +1945,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-tools"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aho-corasick",
  "getrandom 0.4.3",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "kelpy-tui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "crossterm",
