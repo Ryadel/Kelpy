@@ -3,7 +3,9 @@
 Each release is on the [releases page](https://github.com/Ryadel/Kelpy/releases), with one executable per platform,
 the install scripts and the signed checksums. Versions follow [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## 0.4.0 (2026-11-09)
+
+Kelpy now has a terminal UI, remote access over its own SSH server, and files and secrets.
 
 - **Remote access**: `kelpy --ssh [PORT]` also starts Kelpy's own SSH server: keys only, and each connection waits
   until you allow it in the terminal UI or the Web UI (`--allow-key` for unattended use). A connection gets the
