@@ -130,6 +130,24 @@
   body {
     @apply bg-background text-foreground font-sans text-[15px] antialiased;
   }
+  /* Everything that can be clicked shows the hand. Tailwind 4 gives buttons the default cursor, as a desktop
+     program would; in a browser that reads as something that does nothing. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="tab"],
+  [role="checkbox"]:not(:disabled),
+  [role="radio"]:not(:disabled),
+  [role="switch"]:not(:disabled),
+  summary,
+  input[type="checkbox"]:not(:disabled),
+  input[type="radio"]:not(:disabled),
+  input[type="file"]:not(:disabled),
+  label:has(input[type="checkbox"], input[type="radio"]) {
+    cursor: pointer;
+  }
+  label:has(input:disabled) {
+    cursor: not-allowed;
+  }
 }
 
 /* The mark is the black one in both themes: on the dark one a soft turquoise glow lifts it from the background. */

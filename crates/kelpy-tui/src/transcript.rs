@@ -379,7 +379,7 @@ pub(crate) fn action_lines(
 }
 
 /// A note without the backticks around its code, as in "Checked with `nginx -t`"; an unpaired backtick stays.
-fn unquoted(note: &str) -> String {
+pub(crate) fn unquoted(note: &str) -> String {
     if note.matches('`').count().is_multiple_of(2) {
         note.replace('`', "")
     } else {
@@ -411,6 +411,73 @@ fn push_detail(
         };
         push(lines, line, indent, width, Style::new().fg(colour));
     }
+}
+
+/// One line of the start screen's facts: `Home` and its folder, or a sentence without a label.
+pub(crate) struct Fact {
+    pub label: Option<String>,
+    pub value: String,
+    pub style: Style,
+}
+
+/// The facts in a start banner's notes, such as `Code: K7QM-4ZP2 (…) · Home: /root/Kelpy`: each part with a short
+/// label (`Home`, `Over SSH`) becomes a fact of its own; a sentence stays whole. Backticks around code are dropped.
+pub(crate) fn facts(notes: &[String], style: Style) -> Vec<Fact> {
+    let mut facts = Vec::new();
+    for note in notes {
+        for part in unquoted(note).split(" · ") {
+            let labelled = part
+                .split_once(": ")
+                .filter(|(label, value)| label.chars().count() <= 10 && !value.is_empty());
+            facts.push(match labelled {
+                Some((label, value)) => Fact {
+                    label: Some(label.to_owned()),
+                    value: value.to_owned(),
+                    style,
+                },
+                None => Fact {
+                    label: None,
+                    value: part.to_owned(),
+                    style,
+                },
+            });
+        }
+    }
+    facts
+}
+
+/// The facts in `width` columns: the labels in a column as wide as the longest, in `label_style`; a value that
+/// does not fit goes on under itself, never under its label. A fact without a label takes the whole width.
+pub(crate) fn fact_lines(facts: &[Fact], width: usize, label_style: Style) -> Vec<Line<'static>> {
+    let longest = facts
+        .iter()
+        .filter_map(|fact| fact.label.as_ref())
+        .map(|label| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    // The values keep at least half the width.
+    let column = (longest + 2).min(width / 2);
+    let mut lines = Vec::new();
+    for fact in facts {
+        let Some(label) = &fact.label else {
+            for line in wrap(&fact.value, width) {
+                lines.push(Line::styled(line, fact.style));
+            }
+            continue;
+        };
+        for (index, line) in wrap(&fact.value, width.saturating_sub(column))
+            .into_iter()
+            .enumerate()
+        {
+            let head = if index == 0 {
+                Span::styled(format!("{label:<column$}"), label_style)
+            } else {
+                Span::raw(" ".repeat(column))
+            };
+            lines.push(Line::from(vec![head, Span::styled(line, fact.style)]));
+        }
+    }
+    lines
 }
 
 /// `text` cut into lines of at most `width` columns, at spaces where it can.
@@ -597,6 +664,37 @@ mod tests {
             "Checked with nginx -t before and after."
         );
         assert_eq!(unquoted("A single ` stays."), "A single ` stays.");
+    }
+
+    #[test]
+    fn each_label_of_the_start_screen_stays_with_its_value_and_a_long_value_goes_on_under_itself() {
+        let notes = [
+            "Code: K7QM-4ZP2 (to sign in from another browser) · Home: /root/Kelpy".to_owned(),
+            "Over SSH: run there `ssh -N -L 4321:127.0.0.1:4321 root@web-01`".to_owned(),
+            "Attached to the Kelpy running: closing this terminal UI leaves it running.".to_owned(),
+        ];
+        let lines: Vec<String> = fact_lines(&facts(&notes, Style::new()), 40, Style::new())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Code      K7QM-4ZP2 (to sign in from",
+                "          another browser)",
+                "Home      /root/Kelpy",
+                "Over SSH  run there ssh -N -L",
+                "          4321:127.0.0.1:4321",
+                "          root@web-01",
+                "Attached to the Kelpy running: closing",
+                "this terminal UI leaves it running.",
+            ]
+        );
     }
 
     #[test]

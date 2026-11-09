@@ -7,6 +7,11 @@ the install scripts and the signed checksums. Versions follow [Semantic Versioni
 
 - **Updates**: when GitHub answers the check for the latest release with an error, such as 504, `kelpy update` names
   it.
+- **Terminal UI**: on the start screen, the Web UI, the access code, the home, the account and the vault are listed
+  with their names in a column, each value going on under itself; what the AI provider still needs is shown whole.
+- **Web UI**: every button, menu item and tab shows the pointing hand.
+- **Install on Windows**: the command is now `powershell -c "irm https://kelpy.io/install.ps1 | iex"`, which runs from
+  the Command Prompt as well as PowerShell.
 
 ## 0.4.0 (2026-11-09)
 

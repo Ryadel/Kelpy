@@ -16,8 +16,8 @@ use crate::app::App;
 use crate::mark::{Kelpie, Mark, Wordmark};
 use crate::model::{ActionState, Message, Role, Status};
 use crate::theme::Theme;
-use crate::transcript::{action_lines, note, stamp, text_lines, wrap};
-use crate::ui::kelpy_name;
+use crate::transcript::{action_lines, fact_lines, note, stamp, text_lines, wrap};
+use crate::ui::{kelpy_name, start_facts};
 
 /// What of the open conversation was written into the terminal's history.
 #[derive(Default)]
@@ -233,13 +233,8 @@ fn banner(app: &App, width: u16, theme: Theme) -> Buffer {
             .into_iter()
             .map(|line| Line::styled(line, text)),
     );
-    lines.push(Line::from(vec![
-        Span::styled("Web UI  ", dim),
-        Span::styled(
-            banner.web_ui.clone(),
-            Style::new().fg(theme.accent()).underlined(),
-        ),
-    ]));
+    let facts = start_facts(app, theme);
+    lines.extend(fact_lines(&facts[..1], text_width, dim));
     if !app.sessions.is_empty() {
         let mut recent: Vec<String> = app
             .sessions
@@ -256,13 +251,7 @@ fn banner(app: &App, width: u16, theme: Theme) -> Buffer {
                 .map(|line| Line::styled(line, dim)),
         );
     }
-    for note in &banner.notes {
-        lines.extend(
-            wrap(note, text_width)
-                .into_iter()
-                .map(|line| Line::styled(line, dim)),
-        );
-    }
+    lines.extend(fact_lines(&facts[1..], text_width, dim));
     let top = if wordmark { Wordmark::SIZE.1 + 2 } else { 0 };
     let (mark_width, mark_height) = mark.map_or((0, 0), |mark| mark.size());
     let height = mark_height.max(top + lines.len() as u16 + 1);

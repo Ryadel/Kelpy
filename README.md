@@ -51,10 +51,10 @@ On Linux and macOS:
 curl -fsSL https://kelpy.io/install.sh | sh
 ```
 
-On Windows, in PowerShell:
+On Windows, in the Command Prompt or PowerShell:
 
-```powershell
-irm https://kelpy.io/install.ps1 | iex
+```bat
+powershell -c "irm https://kelpy.io/install.ps1 | iex"
 ```
 
 The command downloads the executable from the latest [release](https://github.com/Ryadel/Kelpy/releases), checks

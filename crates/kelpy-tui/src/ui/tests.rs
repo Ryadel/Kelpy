@@ -192,6 +192,30 @@ fn the_start_screen_tells_what_runs_where_and_the_conversations_to_continue() {
 }
 
 #[test]
+fn the_start_screen_shows_what_the_provider_needs_whole_and_without_backticks() {
+    let mut app = started();
+    app.provider.problem = Some("choose one in the Web UI or run `kelpy provider`".into());
+    for size in [(140, 40), (80, 24)] {
+        let screen = text(&drawn(&app, size, DARK));
+        assert!(
+            !screen.contains('`'),
+            "{size:?}
+{screen}"
+        );
+        let words: Vec<&str> = screen.split_whitespace().collect();
+        let wanted = [
+            "choose", "one", "in", "the", "Web", "UI", "or", "run", "kelpy", "provider",
+        ];
+        assert!(
+            words.windows(wanted.len()).any(|run| run == wanted)
+                || screen.contains("run kelpy provider"),
+            "{size:?}
+{screen}"
+        );
+    }
+}
+
+#[test]
 fn a_wide_terminal_has_the_side_panel_beside_the_conversation() {
     let screen = drawn(&working(), (140, 40), DARK);
     assert!(has_kelpie(&screen));

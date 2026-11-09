@@ -16,7 +16,7 @@ use crate::app::{App, Focus, Modes};
 use crate::mark::{Kelpie, Mark, Wordmark};
 use crate::model::{Action, ContextUse};
 use crate::theme::Theme;
-use crate::transcript::{Transcript, tail, wrap};
+use crate::transcript::{Fact, Transcript, fact_lines, facts, tail, unquoted, wrap};
 
 /// From this many columns the side panel shows beside the conversation; below, Ctrl+B opens it over it. As in
 /// OpenCode, whose users know it.
@@ -346,12 +346,13 @@ fn start_text(app: &App, theme: Theme, width: usize, name: bool) -> Vec<Line<'st
             about.push(Span::styled(part.clone(), text));
         }
     }
+    let warn = Style::new().fg(theme.warn());
     if !app.provider.label.is_empty() {
-        let mut provider = vec![Span::styled(app.provider.label.clone(), text)];
-        provider.push(match &app.provider.problem {
+        let dot = match &app.provider.problem {
             None => Span::styled(" ●", Style::new().fg(theme.good())),
-            Some(problem) => Span::styled(format!(" ● {problem}"), Style::new().fg(theme.warn())),
-        });
+            Some(_) => Span::styled(" ●", warn),
+        };
+        let provider = vec![Span::styled(app.provider.label.clone(), text), dot];
         // On the same line where it fits, else on its own.
         let used = Line::from(about.clone()).width() + 5 + Line::from(provider.clone()).width();
         if used <= width {
@@ -363,21 +364,16 @@ fn start_text(app: &App, theme: Theme, width: usize, name: bool) -> Vec<Line<'st
         }
     }
     lines.push(Line::from(about));
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled("Web UI  ", dim),
-        Span::styled(
-            banner.web_ui.clone(),
-            Style::new().fg(theme.accent()).underlined(),
-        ),
-    ]));
-    for note in &banner.notes {
+    // What the provider still needs, on lines of its own.
+    if let Some(problem) = &app.provider.problem {
         lines.extend(
-            wrap(note, width)
+            wrap(&unquoted(problem), width)
                 .into_iter()
-                .map(|line| Line::styled(line, dim)),
+                .map(|line| Line::styled(line, warn)),
         );
     }
+    lines.push(Line::raw(""));
+    lines.extend(fact_lines(&start_facts(app, theme), width, dim));
     if !app.sessions.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
@@ -405,6 +401,17 @@ fn start_text(app: &App, theme: Theme, width: usize, name: bool) -> Vec<Line<'st
         ]));
     }
     lines
+}
+
+/// The Web UI's link, then the banner's notes: `Code`, `Home`, `Account`, what Kelpy is reachable by.
+pub(crate) fn start_facts(app: &App, theme: Theme) -> Vec<Fact> {
+    let mut list = vec![Fact {
+        label: Some("Web UI".into()),
+        value: app.banner.web_ui.clone(),
+        style: Style::new().fg(theme.accent()).underlined(),
+    }];
+    list.extend(facts(&app.banner.notes, Style::new().fg(theme.text())));
+    list
 }
 
 /// How long ago, in `seconds`, as a person would say it.
@@ -598,7 +605,7 @@ fn side_panel(frame: &mut Frame, app: &App, theme: Theme, area: Rect, over: bool
     lines.push(row("Model", Span::styled(app.provider.label.clone(), text)));
     if let Some(problem) = &app.provider.problem {
         lines.extend(
-            wrap(problem, width)
+            wrap(&unquoted(problem), width)
                 .into_iter()
                 .map(|line| Line::styled(line, Style::new().fg(theme.warn()))),
         );

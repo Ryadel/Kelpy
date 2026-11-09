@@ -1,7 +1,9 @@
 # Downloads Kelpy from the latest GitHub release, checks it against the release's SHA256SUMS and runs it.
 # Kelpy's first run then asks where to install itself. Nothing is installed by this script.
 #
-#   irm https://kelpy.io/install.ps1 | iex
+#   powershell -c "irm https://kelpy.io/install.ps1 | iex"
+#
+# from the Command Prompt or PowerShell; in PowerShell, `irm https://kelpy.io/install.ps1 | iex` does the same.
 #
 # $env:KELPY_VERSION = 'v0.1.0' picks a release. Works on Windows PowerShell 5.1 (Windows Server 2016 and later).
 
