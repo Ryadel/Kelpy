@@ -188,11 +188,17 @@ async fn latest_version(releases: &str, timeout: Duration) -> Result<String> {
         .send()
         .await
         .with_context(|| format!("cannot reach {url}"))?;
+    // GitHub's download service may answer an error, such as 504, for a while after a release.
     let location = response
         .headers()
         .get(reqwest::header::LOCATION)
         .and_then(|value| value.to_str().ok())
-        .with_context(|| format!("{url} did not name a release"))?;
+        .with_context(|| {
+            format!(
+                "{url} answered {} without naming a release",
+                response.status()
+            )
+        })?;
     tag_version(location).with_context(|| format!("{url} did not name a release: {location}"))
 }
 
@@ -477,6 +483,32 @@ mod tests {
         let (release, _) = release(b"new");
         let url = serve(release).await;
         assert_eq!(latest_version(&url, CHECK_TIMEOUT).await.unwrap(), "9.9.9");
+    }
+
+    #[tokio::test]
+    async fn an_answer_without_a_redirect_is_reported_with_its_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/releases", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0; 4096]).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 504 Gateway Timeout
+content-length: 0
+connection: close
+
+",
+                )
+                .await;
+        });
+        let error = latest_version(&url, CHECK_TIMEOUT).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .ends_with("answered 504 Gateway Timeout without naming a release"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

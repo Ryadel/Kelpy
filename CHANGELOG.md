@@ -3,6 +3,11 @@
 Each release is on the [releases page](https://github.com/Ryadel/Kelpy/releases), with one executable per platform,
 the install scripts and the signed checksums. Versions follow [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+- **Updates**: when GitHub answers the check for the latest release with an error, such as 504, `kelpy update` names
+  it.
+
 ## 0.4.0 (2026-11-09)
 
 Kelpy now has a terminal UI, remote access over its own SSH server, and files and secrets.
