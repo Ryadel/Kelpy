@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use kelpy_common::{unix_now, utc};
+use kelpy_common::{host_name, unix_now, utc};
 use kelpy_storage::{Action, ActionState, Change, Difference};
 use kelpy_tools::{Output, Secrets, Tools};
 use serde_json::{Value, json};
@@ -74,7 +74,7 @@ impl Server {
             "format": "kelpy-operations",
             "version": 1,
             "exported_at": utc(unix_now()),
-            "server": { "host": host(), "os": std::env::consts::OS },
+            "server": { "host": host_name(), "os": std::env::consts::OS },
             "conversation": { "id": session.id, "title": session.title },
             "note": "The operations that succeeded, in order, with their arguments as given: secrets appear as \
                      their placeholders. Not repeatable until replayed on another server.",
@@ -103,21 +103,13 @@ fn is_operation(tool: &str) -> bool {
             | "install_packages"
             | "remove_packages"
             | "create_database"
+            | "install_windows_features"
+            | "create_iis_site"
             | "generate_secret"
             | "run_command"
             | "restore_file"
             | "put_back_file"
     )
-}
-/// This computer's name.
-fn host() -> String {
-    std::env::var("COMPUTERNAME")
-        .ok()
-        .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok())
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
-        .map(|name| name.trim().to_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "this server".to_owned())
 }
 
 /// The report of the conversation `title`, from its `actions`, the open `differences` and the listening `ports`.
@@ -130,7 +122,7 @@ fn report(
 ) -> String {
     let mut report = format!(
         "# Kelpy report: {title}\n\n{}, {}. Conversation started {}; report written {}.\n",
-        host(),
+        host_name(),
         std::env::consts::OS,
         utc(created_at),
         utc(unix_now())

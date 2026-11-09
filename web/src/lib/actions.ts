@@ -93,10 +93,19 @@ export function diffLine(line: string): string {
 export const diffLines = (diff: string) =>
   diff.split('\n').filter((line) => line !== '' && !line.startsWith('--- ') && !line.startsWith('+++ '));
 
-/** A duration in milliseconds, as `340 ms`, `2.4 s`, `3 min 5 s` or `1 h 2 min`. */
+/** A note's parts, with the code between backticks marked; an unpaired backtick leaves the note as it is. */
+export function codeSpans(note: string): { text: string; code: boolean }[] {
+  const parts = note.split('`');
+  if (parts.length % 2 === 0) {
+    return [{ text: note, code: false }];
+  }
+  return parts.map((text, index) => ({ text, code: index % 2 === 1 })).filter((part) => part.text !== '');
+}
+
+/** A duration in milliseconds, as `< 0.1 s`, `2.4 s`, `3 min 5 s` or `1 h 2 min`: a few milliseconds tell nothing. */
 export function duration(milliseconds: number): string {
-  if (milliseconds < 1000) {
-    return `${milliseconds} ms`;
+  if (milliseconds < 100) {
+    return '< 0.1 s';
   }
   if (milliseconds < 60_000) {
     return `${(milliseconds / 1000).toFixed(1)} s`;

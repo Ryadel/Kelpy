@@ -25,6 +25,7 @@ mod script;
 pub mod secret;
 pub mod service;
 mod tree;
+pub mod windows;
 
 use std::io;
 use std::path::PathBuf;
@@ -41,6 +42,7 @@ pub use package::PackageChange;
 pub use script::MAX_SCRIPT;
 pub use secret::{Registry, Secrets};
 pub use service::{ServiceAction, ServiceChange};
+pub use windows::{FeatureChange, SiteChange};
 
 /// Why an action could not be prepared or run. Its text is the call's result for the model, and is shown in the
 /// Command log.
@@ -229,6 +231,10 @@ pub enum Work {
     Service(Box<ServiceChange>),
     Packages(Box<PackageChange>),
     Database(Box<DatabaseChange>),
+    /// Windows features to install, such as IIS.
+    Features(Box<FeatureChange>),
+    /// An IIS site to create.
+    Site(Box<SiteChange>),
     /// A secret to generate, by its name: nothing changes on the system.
     Secret(String),
     /// A page of Kelpy's memory to read.
@@ -270,7 +276,12 @@ impl Prepared {
     pub fn changes(&self) -> bool {
         matches!(
             self.work,
-            Work::ChangeFile(_) | Work::Service(_) | Work::Packages(_) | Work::Database(_)
+            Work::ChangeFile(_)
+                | Work::Service(_)
+                | Work::Packages(_)
+                | Work::Database(_)
+                | Work::Features(_)
+                | Work::Site(_)
         )
     }
 
@@ -344,6 +355,26 @@ impl Prepared {
                     path: None,
                 })
             }
+            Work::Features(change) => Some(Card {
+                diff: change.planned.as_ref()?.preview.clone(),
+                notes: vec![
+                    "Kelpy installs the features marked + with their management tools and checks each; a restart \
+                     Windows asks for is reported, never made."
+                        .to_owned(),
+                ],
+                floor: None,
+                path: None,
+            }),
+            Work::Site(change) => Some(Card {
+                diff: change.planned.as_ref()?.preview.clone(),
+                notes: vec![
+                    "Kelpy then checks that the site is started and that IIS answers on its binding; if a step \
+                     fails, it removes what it created."
+                        .to_owned(),
+                ],
+                floor: None,
+                path: None,
+            }),
             _ => None,
         }
     }
@@ -372,6 +403,14 @@ impl Prepared {
                 }
             }),
             Work::Database(change) => Some(change.statements(change.planned.as_ref())),
+            Work::Features(change) => change
+                .planned
+                .as_ref()
+                .map(|planned| planned.command.display.clone()),
+            Work::Site(change) => change
+                .planned
+                .as_ref()
+                .map(|planned| planned.command.display.clone()),
             Work::ReadFile(_)
             | Work::ListDirectory(_)
             | Work::ChangeFile(_)
@@ -613,14 +652,63 @@ impl Tools {
             packages.parameters["required"] = json!(["reason", "packages"]);
             tools.push(packages);
         }
+        if self.os == Os::Windows {
+            let mut features = Tool {
+                kind: ToolKind::Changes,
+                ..tool(
+                    "install_windows_features",
+                    "Installs Windows features on Windows Server with Install-WindowsFeature, with their management \
+                     tools, such as Web-Server for IIS. Kelpy shows which are missing, installs them and checks each; a \
+                     restart Windows asks for is reported, never made. Features already installed are left alone."
+                        .into(),
+                    &[],
+                    &[],
+                )
+            };
+            features.parameters["properties"]["features"] = json!({
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 1,
+                "maxItems": 20,
+                "description": "The features' names, as Get-WindowsFeature lists them, such as Web-Server.",
+            });
+            features.parameters["required"] = json!(["reason", "features"]);
+            tools.push(features);
+            let mut site = Tool {
+                kind: ToolKind::Changes,
+                ..tool(
+                    "create_iis_site",
+                    "Creates an IIS site: its folder if missing, an application pool of its name (no .NET CLR, \
+                     integrated pipeline), the site with an HTTP binding, started. Kelpy checks first that IIS is \
+                     installed and that no site, pool or binding takes the name, port and host name, and afterwards \
+                     that IIS answers on the binding; if a step fails, it removes what it created. A site already \
+                     there as asked is left alone. For HTTPS, certificates or other settings, write commands."
+                        .into(),
+                    &[
+                        ("name", "The site's name, such as Contoso: also the application pool's."),
+                        ("path", "The site's folder, absolute, such as C:\\inetpub\\contoso."),
+                    ],
+                    &[("host", "The host name it answers to, such as www.contoso.com; none for every name.")],
+                )
+            };
+            site.parameters["properties"]["port"] = json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535,
+                "description": "The HTTP port; 80 if not given.",
+            });
+            tools.push(site);
+        }
         tools.push(Tool {
             kind: ToolKind::Changes,
             ..tool(
                 "generate_secret",
                 "Generates a secret, such as a password or a key, that only Kelpy knows: 32 letters and digits. \
                  Write {{secret:name}} where it goes, in write_file, edit_file or create_database, and Kelpy puts the \
-                 value in; it is hidden from what you read. Secrets last until Kelpy stops: write them where they are \
-                 needed in the same conversation. Nothing changes on the system, so it never asks."
+                 value in; it is hidden from what you read. Secrets last until Kelpy stops, unless the administrator keeps \
+                 them in the vault: write them where they are needed in the same conversation. The administrator's \
+                 own secrets, listed in your instructions, are used the same way and need no generating. Nothing \
+                 changes on the system, so it never asks."
                     .into(),
                 &[(
                     "name",
@@ -921,6 +1009,46 @@ impl Tools {
                 };
                 (change.summary(), Work::Database(Box::new(change)))
             }
+            "install_windows_features" => {
+                let features = match arguments.get("features") {
+                    Some(Value::Array(features)) if (1..=20).contains(&features.len()) => features
+                        .iter()
+                        .map(|feature| {
+                            windows::feature(feature.as_str().ok_or_else(|| {
+                                invalid("`features` must hold the features' names, as strings")
+                            })?)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    _ => return Err(invalid("`features` must list from 1 to 20 features")),
+                };
+                let change = FeatureChange {
+                    features,
+                    planned: None,
+                };
+                (change.summary(), Work::Features(Box::new(change)))
+            }
+            "create_iis_site" => {
+                let port = match arguments.get("port") {
+                    None => 80,
+                    Some(port) => port
+                        .as_u64()
+                        .and_then(|port| u16::try_from(port).ok())
+                        .filter(|&port| port != 0)
+                        .ok_or_else(|| invalid("`port` must be a port number, from 1 to 65535"))?,
+                };
+                let host = match arguments.get("host").and_then(Value::as_str) {
+                    Some(host) => windows::host_name(host)?,
+                    None => String::new(),
+                };
+                let change = SiteChange {
+                    name: windows::site_name(&required("name")?)?,
+                    path: absolute(&required("path")?)?,
+                    port,
+                    host,
+                    planned: None,
+                };
+                (change.summary(), Work::Site(Box::new(change)))
+            }
             "propose_plan" => {
                 let goal = required("goal")?;
                 let steps = match arguments.get("steps") {
@@ -1079,7 +1207,8 @@ mod tests {
     fn every_tool_asks_for_a_reason_and_describes_its_arguments() {
         for os in [Os::Linux, Os::Windows, Os::MacOs] {
             let tools = Tools::new(os).list();
-            assert_eq!(tools.len(), 21);
+            // Windows has two more: its features and IIS sites.
+            assert_eq!(tools.len(), if os == Os::Windows { 23 } else { 21 });
             for tool in tools {
                 assert_eq!(tool.parameters["required"][0], "reason", "{}", tool.name);
                 assert_eq!(tool.parameters["additionalProperties"], false);

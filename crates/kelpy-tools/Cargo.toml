@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+aho-corasick = "1.1.5"
 getrandom = "0.4.3"
 kelpy-common = { path = "../kelpy-common" }
 serde_json = "1.0.154"

@@ -21,11 +21,12 @@ use kelpy_core::home::{self, Home};
 use kelpy_core::private_file;
 use kelpy_core::providers::chatgpt::Endpoints;
 use kelpy_core::storage::Store;
+use kelpy_core::vault::VaultState;
 use kelpy_gateway::{Activity, Auth, RuntimeStatus, StopRequest};
 use serde::{Deserialize, Serialize};
 
-use crate::client::Client;
 use crate::{duration, platform, prompt, wizard};
+use kelpy_client::Client;
 
 const LOCK_FILE: &str = "runtime.lock";
 const INFO_FILE: &str = "runtime.json";
@@ -34,6 +35,8 @@ const DATABASE_FILE: &str = "kelpy.db";
 const LAST_PORT_FILE: &str = "last-port";
 /// After a stop is triggered, how long open connections and answers being written may take to finish.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+/// How long the SSH sessions get to close once told to, last before Kelpy says it stopped.
+const SSH_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RuntimeInfo {
@@ -131,9 +134,43 @@ pub struct Limits {
     pub idle: Option<Duration>,
 }
 
-/// Runs the runtime and the Web server in the foreground until Ctrl+C, the end of the terminal session, or one
-/// of the `limits`. In every case new work is refused at once, and work in progress gets `SHUTDOWN_GRACE` to finish.
-pub async fn run_foreground(home: &Home, open_browser: bool, limits: Limits) -> Result<ExitCode> {
+/// How the runtime shows itself in the terminal that starts it, and whether it can be reached from outside.
+#[derive(Debug, Clone, Default)]
+pub struct Launch {
+    /// Opens the Web UI in the browser once started.
+    pub open_browser: bool,
+    /// Shows the terminal UI in place of the banner; quitting it stops Kelpy.
+    pub terminal_ui: bool,
+    /// How the terminal UI draws.
+    pub terminal: TerminalUi,
+    /// Starts Kelpy's own SSH server.
+    pub ssh: Option<Ssh>,
+}
+
+/// How the terminal UI draws, as asked on the command line.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TerminalUi {
+    pub screen: kelpy_tui::Screen,
+    pub background: kelpy_tui::Background,
+}
+
+/// Kelpy's SSH server, as asked with `--ssh`.
+#[derive(Debug, Clone, Default)]
+pub struct Ssh {
+    /// The port; 0 lets the system choose.
+    pub port: u16,
+    /// The fingerprints of keys that connect without asking (`--allow-key`).
+    pub allowed_keys: Vec<String>,
+}
+
+/// While Kelpy can be reached from outside, it stops by itself: after this long without activity, unless another
+/// limit was given.
+pub const EXPOSED_IDLE: Duration = Duration::from_secs(60 * 60);
+
+/// Runs the runtime and the Web server in the foreground until Ctrl+C, the end of the terminal session, the terminal
+/// UI closed, or one of the `limits`. In every case new work is refused at once, and work in progress gets
+/// `SHUTDOWN_GRACE` to finish.
+pub async fn run_foreground(home: &Home, launch: Launch, limits: Limits) -> Result<ExitCode> {
     platform::remove_leftovers(&home.root().join(home::executable_name()), &home.data_dir());
     let config = Config::load(&home.config_path())?;
 
@@ -141,7 +178,7 @@ pub async fn run_foreground(home: &Home, open_browser: bool, limits: Limits) -> 
         match read_info(home) {
             Ok(Some(info)) => {
                 println!("Kelpy is already running: {}", info.url);
-                if open_browser {
+                if launch.open_browser {
                     open_url(&info.sign_in_url());
                 }
             }
@@ -203,50 +240,128 @@ pub async fn run_foreground(home: &Home, open_browser: bool, limits: Limits) -> 
     };
     lock.announce(&info)?;
 
-    println!("Kelpy v{VERSION}");
-    println!();
-    println!("Agent runtime started.");
-    println!("Web UI:   {}", info.sign_in_url());
-    println!(
-        "Code:     {}  (to sign in from another browser)",
-        info.access_code
-    );
-    println!("Home:     {}", home.root().display());
-    println!("Provider: {}", describe_provider(&agent));
-    println!("Account:  {}", agent.account().label());
-    if let Some(limits) = agent.account().limits() {
-        println!("          {limits}");
-    }
-    if let Some(last) = last_port.filter(|&last| last != address.port()) {
-        println!(
-            "Port {last} of the last start was not available: open the new link, and set up an SSH tunnel again."
-        );
-    }
-    println!();
-    if let Some(command) = platform::ssh_connection()
-        .and_then(|connection| ssh_tunnel_command(&connection, login_name().as_deref(), address))
-    {
-        println!(
-            "You are connected over SSH. To use the Web UI from your own computer, run there:"
-        );
-        println!("  {command}");
-        println!("then open the Web UI link above.");
+    // Kelpy's own SSH server, until Kelpy stops.
+    let remote = match &launch.ssh {
+        None => None,
+        Some(ssh) => {
+            agent.connections().allow_keys(ssh.allowed_keys.clone());
+            let options = kelpy_remote::RemoteOptions {
+                port: ssh.port,
+                host_key: home.data_dir().join("ssh_host_ed25519_key"),
+                files: Arc::clone(agent.files()),
+                web_port: address.port(),
+                api_url: info.url.clone(),
+                token: info.token.clone(),
+                banner: banner(
+                    VERSION,
+                    info.sign_in_url(),
+                    vec![format!(
+                        "Connected through Kelpy's SSH: to open the Web UI on your computer, forward port {0} with \
+                         -L {0}:127.0.0.1:{0}. Closing this terminal UI leaves Kelpy running.",
+                        address.port()
+                    )],
+                ),
+                connections: Arc::clone(agent.connections()),
+            };
+            Some(
+                kelpy_remote::start(options)
+                    .await
+                    .context("cannot start Kelpy's SSH server")?,
+            )
+        }
+    };
+    let reachable = remote.as_ref().map(|remote| {
+        format!(
+            "port {}, host key {}: `ssh -p {} {}@<this server>`; each connection waits for your approval here or in the \
+             Web UI",
+            remote.port,
+            remote.fingerprint,
+            remote.port,
+            login_name().as_deref().unwrap_or("you")
+        )
+    });
+    let vault = describe_vault(&agent).await;
+    let moved = last_port.filter(|&last| last != address.port()).map(|last| {
+        format!("Port {last} of the last start was not available: open the new link, and set up an SSH tunnel again.")
+    });
+    let tunnel = platform::ssh_connection()
+        .and_then(|connection| ssh_tunnel_command(&connection, login_name().as_deref(), address));
+    let stops = [
+        limits
+            .after
+            .map(|limit| format!("Stops automatically in {}.", duration::format(limit))),
+        limits.idle.map(|limit| {
+            format!(
+                "Stops automatically after {} without activity.",
+                duration::format(limit)
+            )
+        }),
+    ];
+    let banner = if launch.terminal_ui {
+        // The banner's content, on the terminal UI's start screen.
+        let mut header = vec![format!(
+            "Code: {} (to sign in from another browser) · Home: {}",
+            info.access_code,
+            home.root().display()
+        )];
+        let mut account = format!("Account: {}", agent.account().label());
+        if let Some(vault) = &vault {
+            account.push_str(&format!(" · Vault: {vault}"));
+        }
+        header.push(account);
+        header.extend(agent.account().limits().map(str::to_owned));
+        header.extend(reachable.iter().map(|line| format!("SSH: {line}")));
+        header.extend(moved);
+        if let Some(command) = &tunnel {
+            header.push(format!(
+                "Over SSH: to use the Web UI from your own computer, run there `{command}`"
+            ));
+        }
+        header.extend(stops.into_iter().flatten());
+        Some(banner(VERSION, info.sign_in_url(), header))
+    } else {
+        println!("Kelpy v{VERSION}");
         println!();
-    }
-    if let Some(limit) = limits.after {
-        println!("Stops automatically in {}.", duration::format(limit));
-    }
-    if let Some(limit) = limits.idle {
+        println!("Agent runtime started.");
+        println!("Web UI:   {}", info.sign_in_url());
         println!(
-            "Stops automatically after {} without activity.",
-            duration::format(limit)
+            "Code:     {}  (to sign in from another browser)",
+            info.access_code
         );
-    }
-    println!("Press Ctrl+C to stop.");
-    if open_browser {
+        println!("Home:     {}", home.root().display());
+        println!("Provider: {}", describe_provider(&agent));
+        println!("Account:  {}", agent.account().label());
+        if let Some(limits) = agent.account().limits() {
+            println!("          {limits}");
+        }
+        if let Some(vault) = &vault {
+            println!("Vault:    {vault}");
+        }
+        if let Some(reachable) = &reachable {
+            println!("SSH:      {reachable}");
+        }
+        if let Some(moved) = &moved {
+            println!("{moved}");
+        }
+        println!();
+        if let Some(command) = &tunnel {
+            println!(
+                "You are connected over SSH. To use the Web UI from your own computer, run there:"
+            );
+            println!("  {command}");
+            println!("then open the Web UI link above.");
+            println!();
+        }
+        for stop in stops.iter().flatten() {
+            println!("{stop}");
+        }
+        println!("Press Ctrl+C to stop.");
+        None
+    };
+    if launch.open_browser {
         open_url(&info.sign_in_url());
     }
-    if config.provider.is_none() && prompt::interactive() {
+    if config.provider.is_none() && banner.is_none() && prompt::interactive() {
         let client = Client::new(info.url.clone(), info.token.clone())?;
         // A thread of its own, not a task: the questions block on the terminal, and an unanswered one must not keep
         // Kelpy from exiting.
@@ -281,43 +396,80 @@ pub async fn run_foreground(home: &Home, open_browser: bool, limits: Limits) -> 
         let _ = stopped.await;
     });
     tokio::pin!(server);
-    tokio::select! {
-        result = &mut server => result.context("the local server failed")?,
-        () = shutdown_signal(limits, activity, stop_request) => {
-            // Access ends at once: no new answers, then no new connections or requests. Answers being written
-            // are stopped and saved as interrupted; open connections, such as answer streams, get a bounded time
-            // to close.
-            let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
-            let answers_saved = agent.stop_all(SHUTDOWN_GRACE);
-            // Fails only if the server already ended on its own, which is just as stopped.
-            let _ = stop.send(());
-            if !answers_saved.await {
-                println!("Some answers could not be saved in time.");
-            }
-            // Access ends with the session: the ChatGPT tokens are revoked within the same grace, unless the user
-            // chose to save the sign-in on this computer.
-            if !agent.chatgpt().close(deadline).await {
-                println!(
-                    "OpenAI did not confirm that the ChatGPT session was revoked; it ends on its own within 30 days."
-                );
-            }
-            match tokio::time::timeout_at(deadline, &mut server).await {
-                Ok(result) => result.context("the local server failed")?,
-                Err(_) => println!(
-                    "Some connections did not close within {}; closing them.",
-                    duration::format(SHUTDOWN_GRACE)
-                ),
-            }
-            // Last, the work in the background and the database, which the steps above may still have used.
-            if !agent.close(deadline).await {
-                println!(
-                    "Some work in the background did not end within {}; stopping it.",
-                    duration::format(SHUTDOWN_GRACE)
-                );
-            }
+    // The terminal UI, when shown: quitting it stops Kelpy. Dropped when Kelpy stops otherwise, it gives the
+    // terminal back first, so that what follows prints on it.
+    let terminal_ui = async {
+        let Some(banner) = banner else {
+            return std::future::pending().await;
+        };
+        let api = kelpy_tui::Api::new(info.url.clone(), info.token.clone())?;
+        let options = kelpy_tui::Options {
+            banner,
+            stops_runtime: true,
+            screen: launch.terminal.screen,
+            background: launch.terminal.background,
+        };
+        kelpy_tui::run_local(api, options)
+            .await
+            .context("the terminal UI failed")
+    };
+    let reason = tokio::select! {
+        result = &mut server => {
+            result.context("the local server failed")?;
+            None
+        }
+        reason = shutdown_signal(limits, activity, stop_request) => Some(reason),
+        exit = terminal_ui => Some(match exit {
+            Ok(kelpy_tui::Exit::Quit) => "the terminal UI was closed".to_owned(),
+            Ok(kelpy_tui::Exit::Stopped) => "requested from another interface".to_owned(),
+            Err(error) => format!("{error:#}"),
+        }),
+    };
+    if let Some(reason) = reason {
+        println!();
+        println!("Stopping Kelpy: {reason}.");
+        // Access ends at once: no new answers, then no new connections or requests. Answers being written
+        // are stopped and saved as interrupted; open connections, such as answer streams, get a bounded time
+        // to close.
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        let answers_saved = agent.stop_all(SHUTDOWN_GRACE);
+        // Fails only if the server already ended on its own, which is just as stopped.
+        let _ = stop.send(());
+        if !answers_saved.await {
+            println!("Some answers could not be saved in time.");
+        }
+        // Access ends with the session: the ChatGPT tokens are revoked within the same grace, unless the user
+        // chose to save the sign-in on this computer.
+        if !agent.chatgpt().close(deadline).await {
+            println!(
+                "OpenAI did not confirm that the ChatGPT session was revoked; it ends on its own within 30 days."
+            );
+        }
+        match tokio::time::timeout_at(deadline, &mut server).await {
+            Ok(result) => result.context("the local server failed")?,
+            Err(_) => println!(
+                "Some connections did not close within {}; closing them.",
+                duration::format(SHUTDOWN_GRACE)
+            ),
+        }
+        // Last, the work in the background and the database, which the steps above may still have used.
+        if !agent.close(deadline).await {
+            println!(
+                "Some work in the background did not end within {}; stopping it.",
+                duration::format(SHUTDOWN_GRACE)
+            );
         }
     }
 
+    // The SSH sessions end before the lock goes: nothing reaches Kelpy once it says it stopped.
+    if let Some(remote) = remote
+        && !remote.stop(SSH_GRACE).await
+    {
+        println!(
+            "Some SSH sessions did not close within {}; closing them.",
+            duration::format(SSH_GRACE)
+        );
+    }
     drop(lock);
     println!("Kelpy stopped.");
     Ok(ExitCode::SUCCESS)
@@ -349,6 +501,57 @@ pub fn status(home: &Home) -> Result<ExitCode> {
         }
         Ok(None) => println!("Kelpy is starting."),
         Err(error) => println!("Kelpy is running. {}", unreadable(&error)),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `kelpy tui`: the terminal UI of the Kelpy running for this home, which goes on when it is closed; with none
+/// running, Kelpy started with its terminal UI, as `kelpy` does.
+pub async fn terminal_ui(
+    home: &Home,
+    open_browser: bool,
+    terminal: TerminalUi,
+) -> Result<ExitCode> {
+    if !prompt::interactive() {
+        anyhow::bail!("the terminal UI needs an interactive terminal");
+    }
+    if !is_running(home)? {
+        let launch = Launch {
+            open_browser,
+            terminal_ui: true,
+            terminal,
+            ssh: None,
+        };
+        return run_foreground(home, launch, Limits::default()).await;
+    }
+    let info = match read_info(home) {
+        Ok(Some(info)) => info,
+        Ok(None) => {
+            println!("Kelpy is starting or being updated. Try again in a moment.");
+            return Ok(ExitCode::from(1));
+        }
+        Err(error) => {
+            println!("{}", unreadable(&error));
+            return Ok(ExitCode::from(1));
+        }
+    };
+    let notes = vec![
+        format!(
+            "Code: {} (to sign in from another browser) · Home: {}",
+            info.access_code,
+            home.root().display()
+        ),
+        "Attached to the Kelpy running: closing this terminal UI leaves it running.".to_owned(),
+    ];
+    let api = kelpy_tui::Api::new(info.url.clone(), info.token.clone())?;
+    let options = kelpy_tui::Options {
+        banner: banner(&info.version, info.sign_in_url(), notes),
+        stops_runtime: false,
+        screen: terminal.screen,
+        background: terminal.background,
+    };
+    if kelpy_tui::run_local(api, options).await? == kelpy_tui::Exit::Stopped {
+        println!("Kelpy has stopped.");
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -449,6 +652,34 @@ async fn request_stop(info: &RuntimeInfo) -> Result<()> {
         .to_owned();
     anyhow::ensure!(status == "202", "unexpected answer {status:?}");
     Ok(())
+}
+
+/// How long Kelpy waits at start for the SSH agent to unlock the vault: an agent may ask its user to confirm.
+const VAULT_UNLOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// The vault's line for the banner, if there is a vault. A locked vault is unlocked first when the SSH agent of the
+/// session holds one of its keys.
+async fn describe_vault(agent: &Agent) -> Option<String> {
+    let state = agent.vault().view();
+    if let Some(problem) = state.problem {
+        return Some(format!(
+            "cannot be read ({problem}): delete it in Secrets in the Web UI"
+        ));
+    }
+    match state.state {
+        VaultState::None => None,
+        VaultState::Unlocked => Some("unlocked".into()),
+        VaultState::Locked => {
+            let unlocked = tokio::time::timeout(VAULT_UNLOCK_WAIT, agent.unlock_vault_with_agent())
+                .await
+                .unwrap_or(false);
+            Some(if unlocked {
+                "unlocked with the SSH key of this session".into()
+            } else {
+                "locked (unlock it in Secrets in the Web UI)".into()
+            })
+        }
+    }
 }
 
 /// One line for the banner: service, model in brackets, and whether answers can use them right away, in green, or
@@ -577,6 +808,17 @@ fn ssh_tunnel_command(connection: &str, user: Option<&str>, address: SocketAddr)
     ))
 }
 
+/// What the terminal UI's start screen tells of the Kelpy running: `version`, the Web UI's `address`, `notes`.
+fn banner(version: &str, address: String, notes: Vec<String>) -> kelpy_tui::Banner {
+    kelpy_tui::Banner {
+        version: version.to_owned(),
+        web_ui: address,
+        server: kelpy_common::host_name(),
+        system: kelpy_common::system_name(),
+        notes,
+    }
+}
+
 fn login_name() -> Option<String> {
     std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" })
         .ok()
@@ -590,7 +832,11 @@ fn open_url(url: &str) {
 }
 
 /// Completes when the runtime must stop, after saying why.
-async fn shutdown_signal(limits: Limits, activity: Arc<Activity>, stop_request: Arc<StopRequest>) {
+async fn shutdown_signal(
+    limits: Limits,
+    activity: Arc<Activity>,
+    stop_request: Arc<StopRequest>,
+) -> String {
     let time_limit = async {
         match limits.after {
             Some(limit) => tokio::time::sleep(limit).await,
@@ -603,14 +849,12 @@ async fn shutdown_signal(limits: Limits, activity: Arc<Activity>, stop_request: 
             None => std::future::pending().await,
         }
     };
-    let reason = tokio::select! {
+    tokio::select! {
         reason = stop_requested() => reason.to_owned(),
         from = stop_request.requested() => format!("requested from {from}"),
         () = time_limit => "time limit reached".to_owned(),
         () = idle_limit => "no activity".to_owned(),
-    };
-    println!();
-    println!("Stopping Kelpy: {reason}.");
+    }
 }
 
 async fn wait_until_idle(activity: &Activity, limit: Duration) {

@@ -582,6 +582,7 @@
                       {:else}
                         <ActionCard
                           {action}
+                          {approval}
                           canDecide={usable() && message.status === 'streaming'}
                           onDecide={(decision, switchTo) => decide(action, decision, switchTo)}
                           onStop={() => stopOne(action)}

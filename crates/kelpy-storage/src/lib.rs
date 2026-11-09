@@ -209,8 +209,8 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// A conversation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// A conversation. With the other types the runtime's API sends, it is the contract its clients read too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: i64,
     pub title: String,
@@ -225,6 +225,13 @@ pub struct Session {
     /// Raised by every change of the conversation, in the database's own order: of two copies, the one with the
     /// higher revision is the newer, however late it arrives.
     pub revision: i64,
+}
+
+impl Session {
+    /// Whether this copy may replace `known`, a copy of the same conversation: it is not older.
+    pub fn supersedes(&self, known: &Self) -> bool {
+        self.revision >= known.revision
+    }
 }
 
 /// How a conversation's answers are written and what they may do: chosen before the first message, changed at any
@@ -263,7 +270,7 @@ pub enum Approval {
 }
 
 /// Where an action is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionState {
     /// Waiting for the administrator's approval.
@@ -281,7 +288,7 @@ pub enum ActionState {
 
 /// What Kelpy did on the system, or was asked to, as the Command log shows it: a call of a tool by the model in an
 /// answer, or an operation the administrator asked for, such as putting a file back as it was.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Action {
     pub id: i64,
     pub session_id: i64,
@@ -368,7 +375,7 @@ pub struct PlanStep {
 }
 
 /// A step of a plan: the plan's action, and the step's index in it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanStepRef {
     pub plan_id: i64,
     pub step: u32,
@@ -450,14 +457,14 @@ pub enum Settled {
     Replaced,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
     Assistant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Complete,
@@ -471,7 +478,7 @@ pub enum Status {
     Refused,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub id: i64,
     pub session_id: i64,

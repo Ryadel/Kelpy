@@ -335,6 +335,12 @@ export type RuntimeEvent =
   | { type: 'action_changed'; session_id: number; action: Action }
   /** Changes made outside Kelpy were found or settled: read them again. */
   | { type: 'differences_changed' }
+  /** The secrets or the vault changed: read them again. */
+  | { type: 'secrets_changed' }
+  /** The files uploaded changed: read them again. */
+  | { type: 'files_changed' }
+  /** A remote connection asks to be allowed, was decided, or ended: read them again. */
+  | { type: 'connections_changed' }
   /** The provider, or what it needs to answer, changed: read it again. */
   | { type: 'provider_changed' }
   /** Some events were missed: read again everything shown. */
@@ -387,7 +393,7 @@ export type SignInResult =
 async function request(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   headers.set('Accept', 'application/json');
-  if (init.body !== undefined) {
+  if (init.body !== undefined && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
   const session = loadSession();
@@ -838,3 +844,109 @@ export function gigabytes(bytes: number): string {
 export function describe(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason);
 }
+
+export type VaultState = 'none' | 'locked' | 'unlocked';
+
+/** A way to unlock the vault. */
+export type UnlockView = { kind: 'passphrase' } | { kind: 'ssh_key'; label: string; fingerprint: string };
+
+/** Every secret by name, never a value, with the vault and the SSH agent's keys. */
+export interface SecretsView {
+  vault: { state: VaultState; problem: string | null; unlocks: UnlockView[] };
+  /** The administrator's secrets, which every conversation can use. */
+  shared: { name: string; kept: boolean }[];
+  /** The secrets the conversations generated, which last until Kelpy stops. */
+  generated: { session_id: number; name: string }[];
+  agent_keys: AgentKey[];
+  /** Why the SSH agent's keys could not be listed. */
+  agent_problem: string | null;
+}
+
+export interface AgentKey {
+  label: string;
+  fingerprint: string;
+  /** Whether it can unlock a vault: Ed25519 and RSA keys can. */
+  usable: boolean;
+}
+
+/** How to open the vault; `fingerprint: null` tries every key of the agent. */
+export type UnlockRequest = { method: 'passphrase'; passphrase: string } | { method: 'ssh_key'; fingerprint: string | null };
+
+export const fetchSecrets = () => json<SecretsView>('/api/secrets');
+
+const post = (path: string, body: unknown = {}) =>
+  request(path, { method: 'POST', body: JSON.stringify(body) }).then(() => undefined);
+
+export const addSecret = (name: string, value: string, keep: boolean) => post('/api/secrets', { name, value, keep });
+
+export const removeSecret = (name: string) =>
+  request(`/api/secrets/${encodeURIComponent(name)}`, { method: 'DELETE' }).then(() => undefined);
+
+/** The value of one of the administrator's secrets, or of one a conversation generated. */
+export const secretValue = async (name: string, sessionId: number | null) =>
+  (
+    await json<{ value: string }>(`/api/secrets/${encodeURIComponent(name)}/value`, {
+      method: 'POST',
+      body: JSON.stringify({ session_id: sessionId }),
+    })
+  ).value;
+
+export const keepSecret = (name: string, sessionId: number | null) =>
+  post(`/api/secrets/${encodeURIComponent(name)}/keep`, { session_id: sessionId });
+
+export const createVault = (unlock: UnlockRequest) => post('/api/vault', unlock);
+export const unlockVault = (unlock: UnlockRequest) => post('/api/vault/unlock', unlock);
+export const lockVault = () => post('/api/vault/lock');
+export const deleteVault = () => request('/api/vault', { method: 'DELETE' }).then(() => undefined);
+export const addUnlock = (unlock: UnlockRequest) => post('/api/vault/unlocks', unlock);
+export const removeUnlock = (index: number) =>
+  request(`/api/vault/unlocks/${index}`, { method: 'DELETE' }).then(() => undefined);
+
+/** A file uploaded to Kelpy. */
+export interface UploadedFile {
+  name: string;
+  /** Where it is on the server, as the model reads it. */
+  path: string;
+  size: number;
+  /** Unix time, in seconds. */
+  modified: number;
+  /** Whether it reads as text, so that the model can read it. */
+  text: boolean;
+}
+
+export const fetchFiles = () => json<UploadedFile[]>('/api/files');
+
+/** Uploads `file`; a name already taken gets a number. */
+export const uploadFile = (file: File) =>
+  json<UploadedFile>(`/api/files/${encodeURIComponent(file.name)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: file,
+  });
+
+export const deleteFile = (name: string) =>
+  request(`/api/files/${encodeURIComponent(name)}`, { method: 'DELETE' }).then(() => undefined);
+
+/** The content of the uploaded file `name`. */
+export const fetchFile = async (name: string) => (await request(`/api/files/${encodeURIComponent(name)}`)).blob();
+
+/** A remote connection, such as an SSH session to Kelpy's own server. */
+export interface RemoteConnection {
+  id: number;
+  /** Where it comes from, such as `203.0.113.5:51234`. */
+  address: string;
+  user: string;
+  /** Its key, as `ssh-ed25519 SHA256:… (comment)`. */
+  key: string;
+  fingerprint: string;
+  /** Unix time, in seconds. */
+  since: number;
+  allowed_by: string | null;
+}
+
+export const fetchConnections = () =>
+  json<{ waiting: RemoteConnection[]; open: RemoteConnection[] }>('/api/connections');
+
+/** Allows or refuses a connection waiting for a decision. */
+export const decideConnection = (id: number, allow: boolean) =>
+  post(`/api/connections/${id}/${allow ? 'allow' : 'deny'}`, { interface: 'web' });

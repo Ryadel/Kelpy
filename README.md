@@ -76,9 +76,10 @@ Kelpy/
   logs/
 ```
 
-Later runs start straight away and print the Web UI address with a one-click sign-in link, the access code for
+Later runs start straight away and show the Web UI address with a one-click sign-in link, the access code for
 signing in from another browser (new at every start), the AI provider with whether answers can start, and the
-account Kelpy runs as:
+account Kelpy runs as. In an interactive terminal they head the terminal UI, which shows the conversations next to
+the Web UI; without a terminal Kelpy prints them:
 
 ```text
 Kelpy v0.3.0
@@ -101,17 +102,32 @@ unchanged. Nothing new is exposed on the server.
 
 | Command | Purpose |
 |---|---|
-| `kelpy` | Start the runtime and the Web UI in the foreground |
+| `kelpy` | Start the runtime and the Web UI in the foreground; in a terminal, with the terminal UI |
+| `kelpy tui` | Open the terminal UI of the running Kelpy, or start Kelpy with it |
 | `kelpy status` | Show whether Kelpy is running, with its PID, port, URL and access code |
 | `kelpy open` | Open the Web UI in the browser, already signed in |
 | `kelpy stop` | Stop the running Kelpy, for example from another terminal |
 | `kelpy provider` | Choose how Kelpy connects to AI; with `--service`, without questions |
 | `kelpy cleanup` | Remove Kelpy from this computer: its files in the home (conversations and memory included), the PATH entry and the record of the home; other files in the folder are kept. Asks first; `--yes` confirms in scripts |
+| `kelpy update` | Install the latest version of Kelpy, after checking its signature |
 | `kelpy --version` | Show the installed version |
 
 Kelpy can also be stopped from the Web UI (*Stop Kelpy*). Either way it stops in order: answers being written are
 kept as incomplete. Kelpy never runs in the background: it lives in the terminal that started it.
-`kelpy tui`, `kelpy config` and `kelpy chat` are planned.
+
+### Terminal UI
+
+<p><img src="screenshots/tui-conversation-dark.png" alt="Kelpy's terminal UI: a conversation with a plan waiting for approval, and the side panel with the context used, the model and the modes" width="880"></p>
+
+<details><summary>On a light terminal</summary>
+<p><img src="screenshots/tui-conversation-light.png" alt="Kelpy's terminal UI on a light terminal" width="880"></p>
+</details>
+
+The terminal UI shows the same conversations as the Web UI: each action as one line, what waits for a decision
+whole, and from 120 columns a side panel with the conversation's state. Enter sends, Ctrl+Y and Ctrl+N approve or
+deny an action, Shift+Tab, F2 and F4 change the conversation's modes, and Ctrl+C quits, stopping Kelpy if that
+terminal UI started it. Over SSH it draws inline: the conversation goes into the terminal's own history and only a
+footer is redrawn. See [Terminal UI](https://github.com/Ryadel/Kelpy/wiki/Terminal-UI).
 
 ### AI provider
 
@@ -162,8 +178,8 @@ asks: *System access* None, Read-only (the default) or Full, and *Approval mode*
 With Read-only, Kelpy looks before it answers: services, installed software, listening ports, disks, processes,
 logs, files. Each look is an action shown in the answer with its exact command and its reason, and with Ask it
 waits for *Approve* or *Deny*. These commands are fixed by Kelpy and only read; files that may hold secrets are
-never read. With Full, Kelpy changes files, services, packages (apt) and MariaDB or MySQL databases through
-operations it understands: the card shows the change first (a diff, what apt would install, the service's state),
+never read. With Full, Kelpy changes files, services, packages (apt), MariaDB or MySQL databases, Windows features and IIS sites
+through operations it understands: the card shows the change first (a diff, what apt would install, the service's state),
 files are backed up, and the result is checked, with what can be put back put back when the check fails. A change
 already made is not made again. Passwords are secrets Kelpy generates and the AI model never sees. With Plan, Kelpy
 proposes the changes as one plan, approved once. For anything else, Kelpy writes a command (PowerShell or bash),
@@ -172,6 +188,16 @@ conversation; there *Restore* puts a file back from its backup, and *Report* giv
 notices when something it changed was changed outside it, shows the difference and never reverts it by itself. What
 Kelpy reads is sent to the AI service. The [wiki](https://github.com/Ryadel/Kelpy/wiki/System-access) has the
 details.
+
+### Files and secrets
+
+*Files*, in the top bar, uploads files to the server for Kelpy to use, such as a configuration or a database dump;
+the paperclip in the message box uploads them and writes their paths in the message. *Secrets* lists every secret by
+name: those generated in conversations and those you add, such as an existing database's password, which every
+conversation can use by placeholder. The model never sees their values. A secret lasts until Kelpy stops unless it
+is kept in the vault, encrypted in `data/vault.json` with XChaCha20-Poly1305, which opens with a passphrase (Argon2id)
+or with an SSH key of the agent of Kelpy's session; with that key, the vault opens by itself when Kelpy starts. See
+the [wiki](https://github.com/Ryadel/Kelpy/wiki/Files-and-secrets).
 
 ## Building from source
 
@@ -241,6 +267,11 @@ The API answers only authenticated requests:
 
 The `data/` folder, which holds the conversations and the runtime's credentials, is restricted to the user who
 started Kelpy.
+
+With `--ssh`, Kelpy also runs its own SSH server: keys only, each connection waiting until it is allowed in the
+terminal UI or the Web UI, then limited to the terminal UI, SFTP to the uploaded files and forwarding to the Web UI;
+no command runs over it. Connections are logged in `logs/remote.log`, and Kelpy stops by itself while reachable
+([wiki](https://github.com/Ryadel/Kelpy/wiki/Remote-access)).
 
 Both the code and the token are random and change at every start.
 

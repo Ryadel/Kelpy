@@ -1,0 +1,20 @@
+name: IIS
+
+# Installs IIS on a disposable Windows Server and has Kelpy create a site on it, end to end. Run by hand: it changes
+# the machine, which only a runner thrown away afterwards allows.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  iis:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install IIS and create a site
+        run: cargo test -p kelpy-tools --lib windows -- --ignored --nocapture

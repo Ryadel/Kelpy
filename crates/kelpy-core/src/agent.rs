@@ -29,15 +29,22 @@ use tokio_util::task::TaskTracker;
 
 use crate::chatgpt::{ChatGpt, ChatGptError};
 use crate::config::{ConfigError, ProviderConfig};
+use crate::connections::Connections;
 use crate::events::{Event, Events, Subscription};
+use crate::files::Files;
 use crate::home::Home;
 use crate::ollama::Ollama;
+use crate::ssh_agent::SshAgent;
+use crate::vault::{Unlock, Vault, VaultError};
+pub use context::ContextUse;
 use providers::Providers;
 pub use providers::{
     KeySource, KindInfo, ModelChoice, ModelList, ModelQuery, Needed, ProviderInfo, ProviderUpdate,
 };
 use server::Server;
-pub use server::{DifferenceView, Operated};
+pub use server::{
+    AgentKeyView, DifferenceView, GeneratedSecret, Operated, SecretsView, SharedSecret,
+};
 use turns::Turns;
 pub use turns::{AnswerEvents, ChatEvent};
 
@@ -73,6 +80,8 @@ pub enum AgentError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     ChatGpt(#[from] ChatGptError),
+    #[error(transparent)]
+    Vault(#[from] VaultError),
 }
 
 pub struct Agent {
@@ -83,6 +92,10 @@ pub struct Agent {
     /// Where the work in the background runs, answers and downloads: [`Agent::close`] waits for it.
     tasks: TaskTracker,
     events: Events,
+    /// The files the administrator uploads.
+    files: Arc<Files>,
+    /// Remote connections and their approval.
+    connections: Arc<Connections>,
 }
 
 impl Agent {
@@ -115,13 +128,15 @@ impl Agent {
             events.clone(),
             backups,
             home.memory_dir(),
+            home.data_dir().join("vault.json"),
+            SshAgent::of_session(),
         ));
         let turns = Turns::new(
             store.clone(),
             client,
             tasks.clone(),
             events.clone(),
-            home.memory_dir().join("MEMORY.md"),
+            home,
             executor,
             Arc::clone(&server),
         );
@@ -131,6 +146,11 @@ impl Agent {
             turns: Arc::new(turns),
             server,
             tasks,
+            files: Arc::new(Files::new(home.uploads_dir(), events.clone())),
+            connections: Arc::new(Connections::new(
+                home.logs_dir().join("remote.log"),
+                events.clone(),
+            )),
             events,
         })
     }
@@ -223,6 +243,46 @@ impl Agent {
     /// The changes from now on, until Kelpy stops: conversations, answers, the provider.
     pub fn subscribe(&self) -> Subscription {
         self.events.subscribe()
+    }
+
+    /// The administrator's secrets, those of the conversations and the vault.
+    pub async fn secrets(&self) -> SecretsView {
+        self.server.secrets_view().await
+    }
+
+    /// The value of a secret, for the administrator: one of theirs, or one the conversation `session_id` generated.
+    pub fn secret_value(&self, session_id: Option<i64>, name: &str) -> Option<String> {
+        self.server.secret_value(session_id, name)
+    }
+
+    /// Keeps a secret the conversation `session_id` generated in the vault, for every conversation.
+    pub async fn keep_generated_secret(
+        &self,
+        session_id: i64,
+        name: &str,
+    ) -> Result<(), AgentError> {
+        Ok(self.server.keep_generated(session_id, name).await?)
+    }
+
+    /// Remote connections and their approval.
+    pub fn connections(&self) -> &Arc<Connections> {
+        &self.connections
+    }
+
+    /// The files the administrator uploads.
+    pub fn files(&self) -> &Arc<Files> {
+        &self.files
+    }
+
+    /// Where the administrator keeps secrets across restarts.
+    pub fn vault(&self) -> &Vault {
+        self.server.vault()
+    }
+
+    /// Unlocks the vault with an SSH key of the session's agent, if one of its keys opens it. Returns whether the
+    /// vault was unlocked.
+    pub async fn unlock_vault_with_agent(&self) -> bool {
+        self.vault().unlock(Unlock::SshKey(None)).await.is_ok()
     }
 
     pub fn chatgpt(&self) -> &ChatGpt {
@@ -410,6 +470,14 @@ impl Agent {
         Ok(summary.map(|summary| summary.through))
     }
 
+    /// What the latest answer of a conversation, of which `messages` are the messages, took of the context window
+    /// of the model set now; none if another model wrote it, or none is set.
+    pub async fn context_use(&self, messages: &[Message]) -> Option<ContextUse> {
+        let settings = self.providers.settings().ok()?;
+        let window = self.turns.window(&settings).await;
+        context::latest_use(messages, &settings.model, window)
+    }
+
     /// Whether an answer is being written in this conversation.
     pub fn is_running(&self, session_id: i64) -> bool {
         self.turns.is_running(session_id)
@@ -425,18 +493,20 @@ impl Agent {
     /// answers are saved, and tells whether all were.
     pub fn stop_all(&self, limit: Duration) -> impl Future<Output = bool> + use<> {
         self.providers.ollama().close();
+        self.vault().stop();
         self.events.close();
         self.turns.stop_all(limit)
     }
 
-    /// Kelpy is stopping, after [`Agent::stop_all`]: waits for the work in the background to end, then closes the
+    /// Kelpy is stopping, after [`Agent::stop_all`]: waits for the work in the background and the vault's changes to
+    /// end, then closes the
     /// database once the writes already sent are done, all until `deadline`. Returns whether everything ended in time;
     /// if not, the database is left to the process's exit, which its journal survives.
     pub async fn close(&self, deadline: tokio::time::Instant) -> bool {
         self.providers.ollama().close();
         self.tasks.close();
         let ended = async {
-            self.tasks.wait().await;
+            tokio::join!(self.tasks.wait(), self.vault().stopped());
             self.store.stop().await;
         };
         tokio::time::timeout_at(deadline, ended).await.is_ok()
@@ -581,6 +651,11 @@ mod tests {
                 message: done.clone(),
                 error: None,
                 summarised_through: None,
+                // Ollama's window, assumed: the test service does not tell it.
+                context: Some(ContextUse {
+                    used: done.context_estimate.unwrap(),
+                    window: 4096,
+                }),
             })
         );
         // Told that the answer ended, an interface can send the next message at once.
@@ -2387,6 +2462,72 @@ mod tests {
             "{report}"
         );
         assert!(!report.contains(value));
+    }
+
+    #[tokio::test]
+    async fn the_administrators_secret_is_named_to_the_model_and_written_where_it_goes() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let config = folder.path().join("mail.ini");
+        let server = model("Configured.").await;
+        server.respond_once(
+            CHAT,
+            "200 OK",
+            calling(
+                "write_file",
+                &json!({
+                    "reason": "Mail settings",
+                    "path": config,
+                    "content": "password = {{secret:smtp}}\n",
+                }),
+            ),
+        );
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        agent
+            .vault()
+            .add(
+                "smtp",
+                zeroize::Zeroizing::new("the-smtp-password".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        let session = agent
+            .create_session(None, full(Approval::Auto))
+            .await
+            .unwrap();
+        collect(agent.send(session.id, "Configure mail", ()).await.unwrap()).await;
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            "password = the-smtp-password\n"
+        );
+        let requests = chat_requests(&server);
+        assert!(
+            requests[0].contains("The administrator's secrets") && requests[0].contains(": smtp.")
+        );
+        for request in &requests {
+            assert!(!request.contains("the-smtp-password"));
+        }
+        assert_eq!(
+            agent.secret_value(None, "smtp").as_deref(),
+            Some("the-smtp-password")
+        );
+        // Keeping a secret needs a vault.
+        assert!(matches!(
+            agent.keep_generated_secret(session.id, "smtp").await,
+            Err(AgentError::Vault(crate::vault::VaultError::Missing))
+        ));
+        // Once Kelpy is stopping, the vault takes no change.
+        assert!(agent.stop_all(Duration::from_secs(1)).await);
+        let value = zeroize::Zeroizing::new("value".to_owned());
+        assert!(matches!(
+            agent.vault().add("late", value, false).await,
+            Err(crate::vault::VaultError::Stopping)
+        ));
+        assert!(
+            agent
+                .close(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await
+        );
     }
 
     #[tokio::test]

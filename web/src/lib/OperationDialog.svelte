@@ -6,6 +6,7 @@
   import { cn } from '$lib/utils';
   import { diffLine, diffLines } from './actions';
   import { describe, type Action, type Change, type Operated } from './api';
+  import NoteText from './NoteText.svelte';
 
   interface Props {
     open: boolean;
@@ -84,7 +85,7 @@
           >{/each}</pre>
       <ul class="text-muted-foreground space-y-0.5 text-xs">
         {#each preview.change.notes as note (note)}
-          <li>{note}</li>
+          <li><NoteText text={note} /></li>
         {/each}
         <li>Your own action: it does not depend on the conversation's System access or Approval mode.</li>
       </ul>

@@ -13,9 +13,12 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 dirs = "7.0.0"
 futures-util = "0.3.34"
+kelpy-client = { path = "../kelpy-client" }
 kelpy-common = { path = "../kelpy-common" }
 kelpy-core = { path = "../kelpy-core" }
 kelpy-gateway = { path = "../kelpy-gateway" }
+kelpy-remote = { path = "../kelpy-remote" }
+kelpy-tui = { path = "../kelpy-tui" }
 qrcode = { version = "0.14.1", default-features = false }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
 ring = "0.17.14"

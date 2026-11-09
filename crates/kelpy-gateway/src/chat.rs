@@ -30,8 +30,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream;
 use kelpy_core::agent::{
-    Access, Action, Agent, AgentError, AnswerEvents, Approval, ChatEvent, ModelQuery, Modes,
-    ProviderUpdate,
+    Access, Action, Agent, AgentError, AnswerEvents, Approval, ChatEvent, ContextUse, ModelQuery,
+    Modes, ProviderUpdate,
 };
 use kelpy_core::providers::ProviderError;
 use kelpy_core::storage::{Message, StoreError};
@@ -219,12 +219,16 @@ struct Conversation {
     running: bool,
     /// The last message the summary given to the model covers, if the older messages are summarised.
     summarised_through: Option<i64>,
+    /// What the latest answer took of the model's context window.
+    context: Option<ContextUse>,
 }
 
 async fn messages(State(state): State<ChatState>, Path(id): Path<i64>) -> Response {
     let conversation = async {
+        let messages = state.agent.messages(id).await?;
         Ok::<_, AgentError>(Conversation {
-            messages: state.agent.messages(id).await?,
+            context: state.agent.context_use(&messages).await,
+            messages,
             administrator_actions: state.agent.administrator_actions(id).await?,
             running: state.agent.is_running(id),
             summarised_through: state.agent.summarised_through(id).await?,
@@ -465,6 +469,7 @@ fn failure(failure: &AgentError) -> Response {
             | StoreError::DifferenceNotFound(_),
         ) => (StatusCode::NOT_FOUND, "not_found"),
         AgentError::ChatGpt(failure) => return chatgpt_failure(failure),
+        AgentError::Vault(_) => (StatusCode::CONFLICT, "vault_state"),
         AgentError::Provider(_)
         | AgentError::Store(_)
         | AgentError::Config(_)

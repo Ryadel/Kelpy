@@ -13,7 +13,7 @@ use crate::output::{Output, Stream};
 use crate::tree::Tree;
 use crate::{
     Account, Command, Os, Prepared, Recorded, RecordedKind, Secrets, ToolError, Work, change,
-    database, files, memory, package, service,
+    database, files, memory, package, service, windows,
 };
 
 /// How long one command of an inspection, or reading a file or a folder, may take. A command the model wrote has no
@@ -178,7 +178,15 @@ impl Executor {
                 let planned = within(database::plan(change, secrets, installed)).await?;
                 planned.map(|planned| change.planned = Some(planned)).err()
             }
-            Work::Secret(name) if secrets.names().contains(name) => Some(format!(
+            Work::Features(change) => {
+                let planned = within(windows::plan_features(change)).await?;
+                planned.map(|planned| change.planned = Some(planned)).err()
+            }
+            Work::Site(change) => {
+                let planned = within(windows::plan_site(change)).await?;
+                planned.map(|planned| change.planned = Some(planned)).err()
+            }
+            Work::Secret(name) if secrets.has(name) => Some(format!(
                 "The secret {name} exists already: write {} where it goes.",
                 crate::secret::placeholder(name)
             )),
@@ -292,6 +300,16 @@ impl Executor {
             Work::Database(change) => {
                 let planned = change.planned.as_ref().ok_or_else(not_planned)?;
                 database::apply(change, planned, secrets, output).await?;
+                None
+            }
+            Work::Features(change) => {
+                let planned = change.planned.as_ref().ok_or_else(not_planned)?;
+                windows::apply_features(planned, output).await?;
+                None
+            }
+            Work::Site(change) => {
+                let planned = change.planned.as_ref().ok_or_else(not_planned)?;
+                windows::apply_site(planned, output).await?;
                 None
             }
             Work::Secret(name) => {

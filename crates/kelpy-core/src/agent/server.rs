@@ -1,11 +1,12 @@
 //! The server Kelpy changes, beyond the conversations: the secrets of each conversation, shared by its answers and
-//! the administrator's operations; what Kelpy expects to find on the server and the differences found since
+//! the administrator's operations, and the administrator's own, with the vault ([`secrets`]); what Kelpy expects to find on the server and the differences found since
 //! ([`drift`]); the operations the administrator asks for ([`operations`]); the report and export of a conversation
 //! ([`report`]).
 
 mod drift;
 mod operations;
 mod report;
+mod secrets;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,9 +18,12 @@ use kelpy_storage::{Change, RecordKind, Storage};
 use kelpy_tools::{Card, Executor, Registry, Secrets};
 
 use crate::events::Events;
+use crate::ssh_agent::SshAgent;
+use crate::vault::Vault;
 
 pub use drift::DifferenceView;
 pub use operations::Operated;
+pub use secrets::{AgentKeyView, GeneratedSecret, SecretsView, SharedSecret};
 
 /// The secrets of each conversation, shared by its answers and the administrator's operations.
 pub(super) type SessionSecrets = Arc<Mutex<HashMap<i64, Secrets>>>;
@@ -29,8 +33,10 @@ pub(super) struct Server {
     executor: Executor,
     events: Events,
     secrets: SessionSecrets,
-    /// Every conversation's secrets, masked in all of them.
+    /// Every conversation's secrets, masked in all of them, and the administrator's, which all of them use.
     registry: Registry,
+    /// Where the administrator keeps secrets across restarts.
+    vault: Vault,
     /// Where the versions of files before a change are kept.
     backups: PathBuf,
     /// Kelpy's memory of the server, where it writes `server.md`.
@@ -50,13 +56,17 @@ impl Server {
         events: Events,
         backups: PathBuf,
         memory: PathBuf,
+        vault: PathBuf,
+        agent: Option<SshAgent>,
     ) -> Self {
+        let registry = Registry::default();
         Self {
             store,
             executor,
+            vault: Vault::open(vault, agent, registry.clone(), events.clone()),
             events,
             secrets: SessionSecrets::default(),
-            registry: Registry::default(),
+            registry,
             backups,
             memory,
             checked: Mutex::new(None),
@@ -71,6 +81,10 @@ impl Server {
             .entry(session_id)
             .or_insert_with(|| Secrets::sharing(&self.registry))
             .clone()
+    }
+
+    pub(super) fn vault(&self) -> &Vault {
+        &self.vault
     }
 
     /// Forgets the secrets of a conversation deleted: its placeholders no longer work, but the values stay masked

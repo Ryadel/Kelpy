@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  codeSpans,
   commandLog,
   diffLines,
   duration,
@@ -62,12 +63,27 @@ describe('an answer with actions', () => {
     expect(segments(answer('', []))).toEqual([]);
   });
 
-  test('durations read as milliseconds, seconds, minutes or hours', () => {
-    expect(duration(340)).toBe('340 ms');
+  test('durations read as seconds, minutes or hours, a few milliseconds as under a tenth of a second', () => {
+    expect([duration(0), duration(99)]).toEqual(['< 0.1 s', '< 0.1 s']);
+    expect(duration(340)).toBe('0.3 s');
     expect(duration(2400)).toBe('2.4 s');
     expect(duration(185_400)).toBe('3 min 5 s');
     expect(duration(3_725_000)).toBe('1 h 2 min');
     expect([elapsed(-1), elapsed(12), elapsed(60)]).toEqual(['0 s', '12 s', '1 min 0 s']);
+  });
+
+  test('a note shows the code between its backticks as code, and an unpaired backtick as text', () => {
+    expect(codeSpans('Checked with `nginx -t` before and after.')).toEqual([
+      { text: 'Checked with ', code: false },
+      { text: 'nginx -t', code: true },
+      { text: ' before and after.', code: false },
+    ]);
+    expect(codeSpans('`a` and `b`')).toEqual([
+      { text: 'a', code: true },
+      { text: ' and ', code: false },
+      { text: 'b', code: true },
+    ]);
+    expect(codeSpans('A single ` stays.')).toEqual([{ text: 'A single ` stays.', code: false }]);
   });
 });
 

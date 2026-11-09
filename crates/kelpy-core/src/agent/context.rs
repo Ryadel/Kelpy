@@ -7,6 +7,7 @@
 
 use kelpy_providers::Kind;
 use kelpy_storage::{Action, ActionState, Message, Role};
+use serde::Serialize;
 
 /// The most kept for the answer.
 const RESERVE: u64 = 20_000;
@@ -18,6 +19,14 @@ const SUMMARY: u64 = 4_000;
 const PER_MESSAGE: u64 = 4;
 /// The most the provider's count may exceed the estimate by: past it, the count is taken for a mistake.
 const MAX_CORRECTION: f64 = 4.0;
+
+/// How much of the model's context window the latest request of a conversation took, in tokens: as the provider
+/// counted it, else as estimated and corrected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ContextUse {
+    pub used: u64,
+    pub window: u64,
+}
 
 /// How much of a conversation fits one request to a model. Its sizes are estimated tokens, scaled by the
 /// correction: they compare directly with [`estimate`].
@@ -54,6 +63,11 @@ impl Budget {
         Self::new(self.window * 2 / 3, self.correction)
     }
 
+    /// What an `estimate` comes to as the provider counts.
+    pub(super) fn counted(self, estimate: u64) -> u64 {
+        (estimate as f64 * self.correction) as u64
+    }
+
     fn scaled(self, tokens: u64) -> u64 {
         (tokens as f64 / self.correction) as u64
     }
@@ -71,6 +85,20 @@ pub(super) fn correction(history: &[Message], model: &str) -> f64 {
         .map_or(1.0, |(estimated, counted)| {
             (counted as f64 / estimated as f64).clamp(1.0, MAX_CORRECTION)
         })
+}
+
+/// What the latest answer of `model` in `history` took of a `window`, if Kelpy kept its estimate.
+pub(super) fn latest_use(history: &[Message], model: &str, window: u64) -> Option<ContextUse> {
+    let answer = history
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant && message.context_estimate.is_some())
+        .filter(|answer| answer.model.as_deref() == Some(model))?;
+    let estimate = answer.context_estimate?;
+    let used = answer
+        .input_tokens
+        .unwrap_or_else(|| Budget::new(window, correction(history, model)).counted(estimate));
+    Some(ContextUse { used, window })
 }
 
 /// The context window assumed when the service does not tell: a known one for the model, else a cautious one for
@@ -358,6 +386,32 @@ mod tests {
         // A provider that counts twice the estimate halves what fits.
         assert_eq!(Budget::new(200_000, 2.0).limit(), 90_000);
         assert_eq!(large.shrunk().window, 133_333);
+    }
+
+    #[test]
+    fn the_use_shown_is_the_latest_answers_count_or_its_estimate_corrected() {
+        let answer = |estimated, counted| Message {
+            context_estimate: Some(estimated),
+            input_tokens: counted,
+            ..message(0, Role::Assistant, "")
+        };
+        let history = [answer(1_000, Some(1_500)), message(0, Role::User, "")];
+        assert_eq!(
+            latest_use(&history, "m", 8_000),
+            Some(ContextUse {
+                used: 1_500,
+                window: 8_000
+            })
+        );
+        // Not counted: the estimate, corrected by the earlier count.
+        let history = [answer(1_000, Some(1_500)), answer(2_000, None)];
+        assert_eq!(latest_use(&history, "m", 8_000).unwrap().used, 3_000);
+        // Written by another model, or before Kelpy kept estimates: nothing to show.
+        assert_eq!(latest_use(&history, "other", 8_000), None);
+        assert_eq!(
+            latest_use(&[message(0, Role::Assistant, "")], "m", 8_000),
+            None
+        );
     }
 
     #[test]

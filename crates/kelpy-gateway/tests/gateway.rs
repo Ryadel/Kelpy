@@ -642,6 +642,16 @@ async fn a_conversation_streams_its_answer_and_keeps_it() {
     assert!(conversation["summarised_through"].is_null());
     assert!(events.contains("\"summarised_through\":null"));
     assert!(conversation["messages"][1].get("input_tokens").is_none());
+    // Only what the latest request took of the model's window, for the interfaces to show.
+    let (used, window) = (
+        &conversation["context"]["used"],
+        &conversation["context"]["window"],
+    );
+    assert!(
+        used.as_u64().unwrap() > 0 && window.as_u64().unwrap() > used.as_u64().unwrap(),
+        "{conversation}"
+    );
+    assert!(events.contains("\"context\":{\"used\":"), "{events}");
 
     let response = call(
         &app,
@@ -865,4 +875,145 @@ async fn an_agent_registration_file_can_be_used_but_not_made_before_registering(
     )
     .await;
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn secrets_are_added_kept_in_the_vault_and_shown_only_on_request() {
+    let auth = auth();
+    let app = router(status(), PORT, Arc::new(Activity::new()), Arc::clone(&auth));
+    let send = |method: Method, path: &str, body: serde_json::Value| {
+        let request = json_request(method, path, &auth);
+        call(&app, request, Body::from(body.to_string()))
+    };
+    let view = json_body(send(Method::GET, "/api/secrets", serde_json::json!({})).await).await;
+    assert_eq!(view["vault"]["state"], "none");
+
+    let added = send(
+        Method::POST,
+        "/api/secrets",
+        serde_json::json!({ "name": "smtp", "value": "smtp-password", "keep": false }),
+    )
+    .await;
+    assert_eq!(added.status(), StatusCode::NO_CONTENT);
+    // Keeping needs a vault.
+    let keep = send(
+        Method::POST,
+        "/api/secrets/smtp/keep",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(keep.status(), StatusCode::CONFLICT);
+    let created = send(
+        Method::POST,
+        "/api/vault",
+        serde_json::json!({ "method": "passphrase", "passphrase": "correct horse battery" }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::NO_CONTENT);
+    let keep = send(
+        Method::POST,
+        "/api/secrets/smtp/keep",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(keep.status(), StatusCode::NO_CONTENT);
+
+    let view = send(Method::GET, "/api/secrets", serde_json::json!({})).await;
+    let text = String::from_utf8(
+        axum::body::to_bytes(view.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!text.contains("smtp-password"), "{text}");
+    let view: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(view["vault"]["state"], "unlocked");
+    assert_eq!(
+        view["shared"],
+        serde_json::json!([{ "name": "smtp", "kept": true }])
+    );
+
+    let value = send(
+        Method::POST,
+        "/api/secrets/smtp/value",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(value.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(json_body(value).await["value"], "smtp-password");
+
+    send(Method::POST, "/api/vault/lock", serde_json::json!({})).await;
+    let value = send(
+        Method::POST,
+        "/api/secrets/smtp/value",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(value.status(), StatusCode::NOT_FOUND);
+    let wrong = send(
+        Method::POST,
+        "/api/vault/unlock",
+        serde_json::json!({ "method": "passphrase", "passphrase": "wrong horse battery" }),
+    )
+    .await;
+    // Not 401, which would end the Web UI's session.
+    assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(wrong).await["code"], "wrong_passphrase");
+}
+
+#[tokio::test]
+async fn files_are_uploaded_listed_downloaded_and_deleted() {
+    let auth = auth();
+    let app = router(status(), PORT, Arc::new(Activity::new()), Arc::clone(&auth));
+    let upload = call(
+        &app,
+        authorized(Request::put("/api/files/site%20one.conf"), &auth),
+        Body::from("server {}\n"),
+    )
+    .await;
+    assert_eq!(upload.status(), StatusCode::CREATED);
+    let file = json_body(upload).await;
+    assert_eq!(file["name"], "site one.conf");
+    assert_eq!(file["text"], true);
+
+    let list = call(
+        &app,
+        authorized(Request::get("/api/files"), &auth),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(json_body(list).await.as_array().unwrap().len(), 1);
+    let download = call(
+        &app,
+        authorized(Request::get("/api/files/site%20one.conf"), &auth),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(download.status(), StatusCode::OK);
+    assert!(
+        download.headers()[header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;")
+    );
+    let content = axum::body::to_bytes(download.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&content[..], b"server {}\n");
+
+    let deleted = call(
+        &app,
+        authorized(Request::delete("/api/files/site%20one.conf"), &auth),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    let missing = call(
+        &app,
+        authorized(Request::get("/api/files/..%2Fconfig.toml"), &auth),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
 }

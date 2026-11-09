@@ -8,8 +8,11 @@ mod assets;
 mod auth;
 mod chat;
 mod chatgpt;
+mod connections;
 mod events;
+mod files;
 mod ollama;
+mod secrets;
 mod security;
 mod stop;
 
@@ -134,6 +137,9 @@ pub fn router(
         .with_state(Arc::new(status))
         .merge(auth::routes().with_state(Arc::clone(&auth)))
         .merge(chat::routes().with_state(chat))
+        .merge(secrets::routes().with_state(Arc::clone(&agent)))
+        .merge(files::routes().with_state(Arc::clone(&agent)))
+        .merge(connections::routes().with_state(Arc::clone(&agent)))
         .merge(events::routes().with_state(agent))
         .merge(chatgpt::routes().with_state(chatgpt))
         .merge(ollama::routes().with_state(ollama))

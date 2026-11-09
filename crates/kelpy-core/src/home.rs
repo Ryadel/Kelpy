@@ -127,6 +127,11 @@ impl Home {
         self.root.join(OWN_DIRS[2])
     }
 
+    /// Where the files the administrator uploads go: inside the workspace, which is Kelpy's own.
+    pub fn uploads_dir(&self) -> PathBuf {
+        self.workspace_dir().join("files")
+    }
+
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join(OWN_DIRS[3])
     }

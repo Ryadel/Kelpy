@@ -10,18 +10,21 @@
   import { Button } from '$lib/components/ui/button';
   import { cn } from '$lib/utils';
   import Elapsed from './Elapsed.svelte';
+  import NoteText from './NoteText.svelte';
   import { diffLine, diffLines as linesOf, duration, stateLabels } from './actions';
   import type { Action, Approval } from './api';
 
   interface Props {
     action: Action;
+    /** The conversation's Approval mode: the card offers only the modes that would change it. */
+    approval: Approval;
     /** Whether this page can take the decision, or stop the action, now. */
     canDecide: boolean;
     onDecide: (decision: 'approve' | 'deny', switchTo?: Approval) => Promise<void>;
     onStop: () => Promise<void>;
   }
 
-  let { action, canDecide, onDecide, onStop }: Props = $props();
+  let { action, approval, canDecide, onDecide, onStop }: Props = $props();
 
   let deciding = $state(false);
   let live = $state<HTMLPreElement>();
@@ -31,6 +34,9 @@
   const waiting = $derived(action.state === 'waiting');
   /** A command the model wrote: it always asks, whatever the Approval mode. */
   const written = $derived(action.tool === 'run_command');
+  /** Plan helps from Ask only; Auto from Ask or Plan. A command written or a change on the floor asks in every mode. */
+  const toPlan = $derived(!written && !action.change?.floor && approval === 'ask');
+  const toAuto = $derived(!written && !action.change?.floor && approval !== 'auto');
   /** The diff's lines, without its two header lines: the path is in the heading. */
   const diffLines = $derived(linesOf(action.change?.diff ?? ''));
   /** A command that ran and reported a failure. */
@@ -127,7 +133,7 @@
   {#if action.change && waiting}
     <ul class="text-muted-foreground mt-2 space-y-0.5 text-xs">
       {#each action.change.notes as note (note)}
-        <li>{note}</li>
+        <li><NoteText text={note} /></li>
       {/each}
     </ul>
   {/if}
@@ -163,25 +169,29 @@
     <div class="mt-3 flex flex-wrap items-center gap-2">
       <Button size="sm" disabled={!canDecide || deciding} onclick={() => decide('approve')}>Approve</Button>
       <Button size="sm" variant="outline" disabled={!canDecide || deciding} onclick={() => decide('deny')}>Deny</Button>
-      {#if !written && !action.change?.floor}
+      {#if toPlan || toAuto}
         <span class="text-muted-foreground ml-auto flex items-center gap-1 text-xs">
-          <Button
-            variant="link"
-            size="sm"
-            class="h-auto p-0 text-xs"
-            disabled={!canDecide || deciding}
-            title="Approves this and runs what only looks without asking, in this conversation."
-            onclick={() => decide('approve', 'plan')}>Switch to Plan</Button
-          >
-          ·
-          <Button
-            variant="link"
-            size="sm"
-            class="h-auto p-0 text-xs"
-            disabled={!canDecide || deciding}
-            title="Approves this and, in this conversation, runs without asking what only looks and the file changes Kelpy backs up."
-            onclick={() => decide('approve', 'auto')}>Switch to Auto</Button
-          >
+          {#if toPlan}
+            <Button
+              variant="link"
+              size="sm"
+              class="h-auto p-0 text-xs"
+              disabled={!canDecide || deciding}
+              title="Approves this and, in this conversation, runs what only looks without asking; changes come as one plan to approve."
+              onclick={() => decide('approve', 'plan')}>Switch to Plan</Button
+            >
+          {/if}
+          {#if toPlan && toAuto}·{/if}
+          {#if toAuto}
+            <Button
+              variant="link"
+              size="sm"
+              class="h-auto p-0 text-xs"
+              disabled={!canDecide || deciding}
+              title="Approves this and, in this conversation, runs without asking what only looks and the changes Kelpy checks and can put back."
+              onclick={() => decide('approve', 'auto')}>Switch to Auto</Button
+            >
+          {/if}
         </span>
       {/if}
     </div>

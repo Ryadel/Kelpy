@@ -43,9 +43,62 @@ pub fn utc(seconds: i64) -> String {
     )
 }
 
+/// This computer's name.
+pub fn host_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "this server".to_owned())
+}
+
+/// This computer's operating system, as `Ubuntu 24.04` where `/etc/os-release` names it, else as `Windows`.
+pub fn system_name() -> String {
+    std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|release| os_release_name(&release))
+        .unwrap_or_else(|| {
+            match std::env::consts::OS {
+                "windows" => "Windows",
+                "macos" => "macOS",
+                "linux" => "Linux",
+                other => other,
+            }
+            .to_owned()
+        })
+}
+
+/// The name and version in an `os-release` file, such as `Ubuntu 24.04`.
+fn os_release_name(release: &str) -> Option<String> {
+    let field = |key: &str| {
+        release.lines().find_map(|line| {
+            let value = line.strip_prefix(key)?.strip_prefix('=')?;
+            Some(value.trim().trim_matches('"').to_owned()).filter(|value| !value.is_empty())
+        })
+    };
+    let name = field("NAME")?;
+    Some(match field("VERSION_ID") {
+        Some(version) => format!("{name} {version}"),
+        None => name,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_system_is_named_with_its_version_from_os_release() {
+        let ubuntu = "PRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\n";
+        assert_eq!(os_release_name(ubuntu).as_deref(), Some("Ubuntu 24.04"));
+        assert_eq!(
+            os_release_name("NAME=Arch Linux\n").as_deref(),
+            Some("Arch Linux")
+        );
+        assert_eq!(os_release_name("ID=x\n"), None);
+    }
 
     #[test]
     fn a_poisoned_mutex_is_still_usable() {

@@ -5,8 +5,35 @@ the install scripts and the signed checksums. Versions follow [Semantic Versioni
 
 ## Unreleased
 
+- **Remote access**: `kelpy --ssh [PORT]` also starts Kelpy's own SSH server: keys only, and each connection waits
+  until you allow it in the terminal UI or the Web UI (`--allow-key` for unattended use). A connection gets the
+  terminal UI, SFTP to the uploaded files and forwarding to the Web UI only, never a command or a shell. Every
+  connection is logged in `logs/remote.log`; without another limit Kelpy stops after 1 hour without activity.
+- **Windows Server**: with System access Full, Kelpy installs Windows features, such as IIS, with
+  `Install-WindowsFeature`, and creates IIS sites: folder, application pool and HTTP binding, checked by a request to
+  the site and removed again if a step fails.
+- **Terminal UI**: in an interactive terminal, `kelpy` shows the terminal UI in place of the start-up lines: a start
+  screen with Kelpy's mark and the recent conversations, the answers as they are written with each action on one line,
+  the actions with Ctrl+Y and Ctrl+N to approve or deny, the conversation's modes (Shift+Tab, F2 to F4), and from 120
+  columns a side panel with the conversation's state and how much of the model's context it takes (Ctrl+B). Over SSH
+  it draws inline: the conversation goes into the terminal's own history and only a footer is redrawn (`--inline`,
+  `--fullscreen`). Its colours follow the terminal's background (`--theme dark|light` where the terminal does not
+  tell). It stays in step with the Web UI. Closing it stops Kelpy, asking first while an
+  answer is being written. `kelpy tui` opens it for a Kelpy already running, which goes on when it is closed.
+  `--no-browser` keeps the browser closed. The first run no longer asks which interface to use.
+- **Files**: *Files*, in the top bar, uploads files to the server for Kelpy to use (up to 2 GiB each), lists them,
+  and downloads and deletes them; the paperclip in the message box, or a file dropped on it, uploads it and writes
+  its path in the message. Uploads go to `workspace/files/`, readable by Kelpy's account only.
+- **Secrets**: *Secrets*, in the top bar, lists every secret by name and copies its value on request. Secrets you add
+  serve every conversation by placeholder, as `{{secret:name}}`; the model is told their names, never their values.
+- **Vault**: secrets can be kept across restarts in `data/vault.json`, encrypted with XChaCha20-Poly1305. The vault
+  opens with a passphrase (Argon2id) or with an Ed25519 or RSA key of the SSH agent of Kelpy's session, which unlocks
+  it when Kelpy starts; it has as many ways to unlock it as you add. The banner shows a `Vault:` line.
 - **Unexpected changes** is the new name of what was *Changed outside Kelpy*: the bar above the conversation, and
   its section in the handover report and in the memory page `server.md`.
+- **Web UI**: the Approval menu describes Plan and Auto as each works; an action card offers *Switch to Plan* and
+  *Switch to Auto* only when they would change the conversation's mode; the notes of a change show its commands as
+  code; actions shorter than a tenth of a second read `< 0.1 s`.
 
 ## 0.3.0 (2026-11-06)
 
@@ -14,8 +41,8 @@ Kelpy now runs on macOS and on Linux ARM64.
 
 - **Platforms**: new executables for Linux ARM64 (`kelpy-linux-aarch64`, static like the x86-64 one), macOS on
   Apple silicon (`kelpy-macos-aarch64`) and macOS on Intel (`kelpy-macos-x86_64`). The install command
-  `curl -fsSL https://kelpy.io/install.sh | sh` works on macOS too. The macOS executables are not signed by Apple
-  yet: download them with `curl`, as a file downloaded with a browser is blocked by Gatekeeper.
+  `curl -fsSL https://kelpy.io/install.sh | sh` works on macOS too. The macOS executables are not signed by Apple:
+  download them with `curl`, as a file downloaded with a browser is blocked by Gatekeeper.
 - **macOS changes that always ask**: changes to the SSH configuration, the sudo rules and the other files of the
   floor now always ask on macOS too, where `/etc` is a link to `/private/etc`. The packet filter (`/etc/pf.conf`,
   `/etc/pf.anchors`), the application firewall and the network settings in `/Library/Preferences` are added; a

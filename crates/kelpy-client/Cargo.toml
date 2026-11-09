@@ -1,0 +1,20 @@
+[package]
+name = "kelpy-client"
+description = "A client of the running Kelpy's local API, for the terminal commands and the terminal UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+futures-util = "0.3.34"
+kelpy-providers = { path = "../kelpy-providers" }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
+serde = "1.0.229"
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["macros", "net", "io-util", "rt-multi-thread"] }

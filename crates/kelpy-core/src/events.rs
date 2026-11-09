@@ -7,6 +7,8 @@
 //! [`Event::Resync`] in place of the events it missed, and reads again what it shows.
 
 use kelpy_storage::{Action, Message, Session};
+
+use crate::agent::ContextUse;
 use serde::Serialize;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_util::sync::CancellationToken;
@@ -41,6 +43,8 @@ pub enum Event {
         error: Option<String>,
         /// The last message the conversation's summary covers, if its older part is summarised for the model.
         summarised_through: Option<i64>,
+        /// What the answer's last request took of the model's context window, if it got as far as a request.
+        context: Option<ContextUse>,
     },
     /// An operation the administrator asked for started or ended: it is not part of an answer.
     ActionChanged {
@@ -50,6 +54,13 @@ pub enum Event {
     /// Differences between what Kelpy left on the server and what is there were found or settled: the interfaces
     /// read them again.
     DifferencesChanged,
+    /// The administrator's secrets, the secrets of a conversation or the vault changed: the interfaces read them
+    /// again.
+    SecretsChanged,
+    /// The files uploaded to Kelpy changed: the interfaces read them again.
+    FilesChanged,
+    /// A remote connection asks to be allowed, was decided, or ended: the interfaces read them again.
+    ConnectionsChanged,
     /// The provider, or what it needs to answer (a sign-in, a key), changed: the interfaces read it again.
     ProviderChanged,
     /// Some events were missed by a subscriber that fell behind: it reads again everything it shows.
@@ -69,6 +80,9 @@ impl Event {
             Self::AnswerEnded { .. } => "answer_ended",
             Self::ActionChanged { .. } => "action_changed",
             Self::DifferencesChanged => "differences_changed",
+            Self::SecretsChanged => "secrets_changed",
+            Self::FilesChanged => "files_changed",
+            Self::ConnectionsChanged => "connections_changed",
             Self::ProviderChanged => "provider_changed",
             Self::Resync => "resync",
             Self::Stopping => "stopping",

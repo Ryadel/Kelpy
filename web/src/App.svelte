@@ -3,6 +3,8 @@
   import CheckIcon from '@lucide/svelte/icons/check';
   import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
   import CpuIcon from '@lucide/svelte/icons/cpu';
+  import FolderIcon from '@lucide/svelte/icons/folder';
+  import KeyRoundIcon from '@lucide/svelte/icons/key-round';
   import LogOutIcon from '@lucide/svelte/icons/log-out';
   import PanelLeftIcon from '@lucide/svelte/icons/panel-left';
   import PowerIcon from '@lucide/svelte/icons/power';
@@ -34,8 +36,11 @@
     type Session,
   } from './lib/api';
   import Chat from './lib/Chat.svelte';
+  import ConnectionDialog from './lib/ConnectionDialog.svelte';
+  import FilesDialog from './lib/FilesDialog.svelte';
   import NewConversation from './lib/NewConversation.svelte';
   import ProviderDialog from './lib/ProviderDialog.svelte';
+  import SecretsDialog from './lib/SecretsDialog.svelte';
   import Sessions from './lib/Sessions.svelte';
   import SignIn from './lib/SignIn.svelte';
   import StopDialog from './lib/StopDialog.svelte';
@@ -64,6 +69,12 @@
   /** The outcome of a return from OpenAI's sign-in page, shown by the provider dialog. */
   let afterChatGpt = $state<{ error: string | null } | null>(null);
   let stopOpen = $state(false);
+  let secretsOpen = $state(false);
+  let filesOpen = $state(false);
+  /** Count the changes Kelpy announced, for the open dialog to read them again. */
+  let secretsChanges = $state(0);
+  let filesChanges = $state(0);
+  let connectionsChanges = $state(0);
   /** On wide screens the conversations are a sidebar, which can be hidden. */
   let sidebarOpen = $state(true);
   /** On small screens the conversations open in a panel instead. */
@@ -213,6 +224,15 @@
         break;
       case 'provider_changed':
         void refreshProvider();
+        break;
+      case 'secrets_changed':
+        secretsChanges += 1;
+        break;
+      case 'files_changed':
+        filesChanges += 1;
+        break;
+      case 'connections_changed':
+        connectionsChanges += 1;
         break;
       case 'resync':
         void catchUp();
@@ -411,6 +431,26 @@
         {/if}
 
         <div class="ml-auto flex shrink-0 items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon-lg"
+            class="text-muted-foreground"
+            onclick={() => (filesOpen = true)}
+            aria-label="Files"
+            title="Files: what you uploaded for Kelpy to use"
+          >
+            <FolderIcon class="size-[18px]" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-lg"
+            class="text-muted-foreground"
+            onclick={() => (secretsOpen = true)}
+            aria-label="Secrets"
+            title="Secrets: passwords and keys Kelpy uses by name, and the vault"
+          >
+            <KeyRoundIcon class="size-[18px]" />
+          </Button>
           {#if current}
             <Button
               variant="ghost"
@@ -499,6 +539,9 @@
     <ProviderDialog bind:open={providerOpen} info={provider} {afterChatGpt} onSaved={(info) => (provider = info)} />
   {/if}
   <StopDialog bind:open={stopOpen} onStopped={() => (view = { kind: 'stopped' })} />
+  <SecretsDialog bind:open={secretsOpen} {sessions} changes={secretsChanges} />
+  <FilesDialog bind:open={filesOpen} changes={filesChanges} />
+  <ConnectionDialog changes={connectionsChanges} />
   <Dialog.Root bind:open={sessionsOpen}>
     <Dialog.Content class="bg-sidebar flex h-[80dvh] flex-col gap-0 p-0">
       <Dialog.Title class="sr-only">Conversations</Dialog.Title>

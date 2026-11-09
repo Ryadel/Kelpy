@@ -122,7 +122,8 @@ fn first_run(executable: &Path, executable_dir: &Path, options: &Options<'_>) ->
             keep_installer(executable, &home);
         }
     }
-    let open_browser = interactive && ask_interface()?;
+    // Both interfaces are always there: the browser opens on a desktop, the terminal UI shows in the terminal.
+    let open_browser = interactive && platform::ssh_connection().is_none();
     Ok(Resolved::Ready { home, open_browser })
 }
 
@@ -290,23 +291,6 @@ fn keep_installer(installer: &Path, home: &Home) {
 
 /// Returns whether the Web UI should be opened in the browser. Over SSH there is no browser to open on this side:
 /// the banner shows how to reach the Web UI from the admin's computer instead.
-fn ask_interface() -> Result<bool> {
-    println!();
-    if platform::ssh_connection().is_some() {
-        return Ok(false);
-    }
-    println!("How do you want to use Kelpy?");
-    println!("  1) Web UI         (opens your browser)");
-    println!("  2) Terminal UI");
-    if prompt::choose(2, 1)? == 2 {
-        println!(
-            "The terminal UI is not available yet in this version: starting the Web UI instead."
-        );
-    }
-    println!();
-    Ok(true)
-}
-
 /// The user pointer names a home that is gone: find it again, or start over.
 fn relocate(
     recorded: &Path,

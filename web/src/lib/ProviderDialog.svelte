@@ -85,6 +85,15 @@
   );
 
   /** The service of the configuration; Kelpy names it also for configurations saved without one. */
+  /** What the service's list adds, `count` models besides the recommended ones if there are `besides`. */
+  function listedNote(count: number, besides: boolean): string {
+    if (count === 0) {
+      return besides ? 'The service lists no other models.' : 'The service lists no models: type a model name.';
+    }
+    const models = besides ? 'more' : count === 1 ? 'model' : 'models';
+    return `${count} ${models} listed by the service: type to search.`;
+  }
+
   function configuredService(): Service | undefined {
     return info.services.find((candidate) => candidate.id === info.configured?.service);
   }
@@ -299,8 +308,7 @@
                 {:else if listed?.error}
                   The service's list is unavailable: {listed.error}. Any model name can be typed.
                 {:else if listed}
-                  {listed.models.length - recommended.length}
-                  {recommended.length > 0 ? 'more' : 'models'} listed by the service: type to search.
+                  {listedNote(listed.models.length - recommended.length, recommended.length > 0)}
                 {/if}
               </p>
             </div>

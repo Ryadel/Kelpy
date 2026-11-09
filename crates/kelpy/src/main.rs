@@ -1,7 +1,6 @@
 //! The `kelpy` executable: command line, first run and the local runtime.
 
 mod cleanup;
-mod client;
 mod duration;
 mod platform;
 mod prompt;
@@ -32,6 +31,33 @@ struct Cli {
     #[arg(long, short = 'y', global = true)]
     yes: bool,
 
+    /// Do not open the Web UI in the browser: in a terminal, the terminal UI only.
+    #[arg(long, global = true)]
+    no_browser: bool,
+
+    /// Draw the terminal UI inline: the conversation in the terminal's own history, only a footer redrawn. The
+    /// default over SSH.
+    #[arg(long, global = true, conflicts_with = "fullscreen")]
+    inline: bool,
+
+    /// Draw the terminal UI on the whole screen, also over SSH.
+    #[arg(long, global = true)]
+    fullscreen: bool,
+
+    /// The terminal's background, for the terminal UI's colours, where the terminal does not tell it.
+    #[arg(long, global = true, value_enum, value_name = "BACKGROUND")]
+    theme: Option<Theme>,
+
+    /// Also start Kelpy's own SSH server, on this port or one the system chooses: its terminal UI, SFTP to the
+    /// uploaded files and forwarding to the Web UI, each connection allowed by you first. Without another limit, Kelpy
+    /// stops after 1h without activity.
+    #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "0")]
+    ssh: Option<u16>,
+
+    /// With --ssh, let the key with this fingerprint (SHA256:...) connect without asking, for unattended use.
+    #[arg(long, value_name = "FINGERPRINT", requires = "ssh")]
+    allow_key: Vec<String>,
+
     /// Stop after this time, e.g. 30m, 2h or 1h30m. Work in progress is allowed to finish.
     #[arg(long, value_name = "DURATION", value_parser = duration::parse)]
     shutdown_after: Option<Duration>,
@@ -42,6 +68,13 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// A terminal's background, as `--theme` gives it.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum Theme {
+    Dark,
+    Light,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -56,10 +89,6 @@ enum Command {
     Open,
     /// Choose how Kelpy connects to AI: a ChatGPT plan, a free service, an API key or a local model.
     Provider(ProviderArgs),
-    /// Manage the configuration.
-    Config,
-    /// Send messages from the command line.
-    Chat,
     /// Remove Kelpy from this computer: its home with conversations and memory, the PATH entry, the user record.
     Cleanup,
     /// Install the latest version of Kelpy, after checking its signature.
@@ -119,26 +148,52 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         setup::Resolved::Delegated(code) => return Ok(code),
     };
 
+    let screen = if cli.inline {
+        kelpy_tui::Screen::Inline
+    } else if cli.fullscreen {
+        kelpy_tui::Screen::Full
+    } else {
+        kelpy_tui::Screen::Auto
+    };
+    let background = match cli.theme {
+        None => kelpy_tui::Background::Ask,
+        Some(Theme::Dark) => kelpy_tui::Background::Dark,
+        Some(Theme::Light) => kelpy_tui::Background::Light,
+    };
+    let terminal = runtime::TerminalUi { screen, background };
     match cli.command {
         None => {
             if let Some(code) = update::at_start(&home, cli.yes).await {
                 return Ok(code);
             }
-            let limits = runtime::Limits {
+            let mut limits = runtime::Limits {
                 after: cli.shutdown_after,
                 idle: cli.shutdown_idle,
             };
-            runtime::run_foreground(&home, open_browser, limits).await
+            // Reachable from outside, Kelpy never stays up unattended without an end.
+            if cli.ssh.is_some() && limits.after.is_none() && limits.idle.is_none() {
+                limits.idle = Some(runtime::EXPOSED_IDLE);
+            }
+            let launch = runtime::Launch {
+                open_browser: open_browser && !cli.no_browser,
+                terminal_ui: prompt::interactive(),
+                terminal,
+                ssh: cli.ssh.map(|port| runtime::Ssh {
+                    port,
+                    allowed_keys: cli.allow_key.clone(),
+                }),
+            };
+            runtime::run_foreground(&home, launch, limits).await
         }
         Some(Command::Status) => runtime::status(&home),
         Some(Command::Open) => runtime::open(&home),
-        Some(Command::Tui) => not_available("The terminal UI"),
+        Some(Command::Tui) => {
+            runtime::terminal_ui(&home, open_browser && !cli.no_browser, terminal).await
+        }
         Some(Command::Stop) => runtime::stop(&home).await,
         Some(Command::Cleanup) => cleanup::run(&home, cli.yes),
         Some(Command::Update) => update::command(&home, cli.yes).await,
         Some(Command::Provider(args)) => provider(&home, args).await,
-        Some(Command::Config) => not_available("Configuration from the command line"),
-        Some(Command::Chat) => not_available("Chat from the command line"),
     }
 }
 
@@ -165,9 +220,4 @@ async fn provider(home: &kelpy_core::home::Home, args: ProviderArgs) -> anyhow::
         _ => wizard::show(&client).await?,
     }
     Ok(ExitCode::SUCCESS)
-}
-
-fn not_available(feature: &str) -> anyhow::Result<ExitCode> {
-    println!("{feature} is not available yet in this version of Kelpy.");
-    Ok(ExitCode::from(2))
 }

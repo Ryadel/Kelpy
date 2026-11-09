@@ -21,6 +21,16 @@ export const ACCESS_OPTIONS: { value: Access; name: string; description: string;
 
 export const APPROVAL_OPTIONS: { value: Approval; name: string; description: string }[] = [
   { value: 'ask', name: 'Ask', description: 'Every action waits for your approval.' },
-  { value: 'plan', name: 'Plan', description: 'Looking needs no approval. Each command Kelpy writes still waits for it.' },
-  { value: 'auto', name: 'Auto', description: 'Looking needs no approval. Each command Kelpy writes still waits for it.' },
+  {
+    value: 'plan',
+    name: 'Plan',
+    description:
+      'Looking needs no approval. Kelpy proposes its changes as one plan, which you approve once; a change outside it waits for approval.',
+  },
+  {
+    value: 'auto',
+    name: 'Auto',
+    description:
+      'Looking, and the changes Kelpy checks and can put back, need no approval. Commands Kelpy writes, and changes that could lock you out or lose data, still wait for it.',
+  },
 ];

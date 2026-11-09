@@ -2,11 +2,12 @@
   import { onMount } from 'svelte';
   import ArrowUpIcon from '@lucide/svelte/icons/arrow-up';
   import LightbulbIcon from '@lucide/svelte/icons/lightbulb';
+  import PaperclipIcon from '@lucide/svelte/icons/paperclip';
   import ServerIcon from '@lucide/svelte/icons/server';
   import ShieldCheckIcon from '@lucide/svelte/icons/shield-check';
   import SquareIcon from '@lucide/svelte/icons/square';
   import ModeMenu from './ModeMenu.svelte';
-  import type { Access, Approval } from './api';
+  import { describe, uploadFile, type Access, type Approval } from './api';
   import { usable } from './connection.svelte';
   import { runtime } from './runtime.svelte';
   import { ACCESS_OPTIONS, APPROVAL_OPTIONS } from './modes';
@@ -40,6 +41,29 @@
   }: Props = $props();
 
   let field = $state<HTMLTextAreaElement | null>(null);
+  let picker = $state<HTMLInputElement | null>(null);
+  let uploading = $state(0);
+  let dragging = $state(false);
+  let uploadError = $state<string | null>(null);
+
+  /** Uploads `files` and writes their paths in the message, for the model to read them there. */
+  async function attach(files: FileList | null) {
+    uploadError = null;
+    for (const file of files ?? []) {
+      uploading += 1;
+      try {
+        const uploaded = await uploadFile(file);
+        const separator = value === '' || value.endsWith('\n') ? '' : '\n';
+        // In backticks: a path may hold spaces.
+        value = `${value}${separator}\`${uploaded.path}\`\n`;
+      } catch (reason: unknown) {
+        uploadError = `${file.name}: ${describe(reason)}`;
+      } finally {
+        uploading -= 1;
+      }
+    }
+    focus();
+  }
 
   /** Moves the cursor to the message box, such as after a suggestion filled it. */
   export function focus() {
@@ -68,7 +92,27 @@
   });
 </script>
 
-<div class="bg-composer focus-within:border-primary/45 rounded-[28px] border px-4 pt-3 pb-2.5 shadow-sm">
+<!-- Files dropped on the message box are uploaded, and their paths written in the message. -->
+<div
+  role="group"
+  class="bg-composer focus-within:border-primary/45 rounded-[28px] border px-4 pt-3 pb-2.5 shadow-sm {dragging
+    ? 'border-primary'
+    : ''}"
+  ondragover={(event) => {
+    if (event.dataTransfer?.types.includes('Files')) {
+      event.preventDefault();
+      dragging = true;
+    }
+  }}
+  ondragleave={() => (dragging = false)}
+  ondrop={(event) => {
+    if (event.dataTransfer?.files.length) {
+      event.preventDefault();
+      dragging = false;
+      void attach(event.dataTransfer.files);
+    }
+  }}
+>
   <textarea
     bind:this={field}
     bind:value
@@ -78,7 +122,30 @@
     aria-label="Message"
     class="placeholder:text-muted-foreground block field-sizing-content max-h-48 min-h-7 w-full resize-none bg-transparent py-0.5 leading-relaxed outline-none"
   ></textarea>
+  {#if uploadError}
+    <p class="text-destructive mt-1 text-xs" role="alert">{uploadError}</p>
+  {/if}
   <div class="mt-2 flex flex-wrap items-center gap-2">
+    <button
+      type="button"
+      onclick={() => picker?.click()}
+      disabled={uploading > 0 || !usable()}
+      aria-label="Attach files"
+      title={uploading > 0 ? 'Uploading…' : 'Upload files to Kelpy and write their paths in the message. Files in the top bar lists them.'}
+      class="text-muted-foreground hover:bg-muted hover:text-foreground inline-flex size-8 items-center justify-center rounded-full disabled:opacity-40"
+    >
+      <PaperclipIcon class="size-4 {uploading > 0 ? 'animate-pulse' : ''}" />
+    </button>
+    <input
+      bind:this={picker}
+      type="file"
+      multiple
+      class="hidden"
+      onchange={(event) => {
+        void attach(event.currentTarget.files);
+        event.currentTarget.value = '';
+      }}
+    />
     <button
       type="button"
       aria-pressed={explanations}

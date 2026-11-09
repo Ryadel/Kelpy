@@ -12,8 +12,6 @@ struct Choice<T> {
     value: T,
     name: &'static str,
     means: &'static str,
-    /// Offered in the Web UI; one that is not is shown disabled.
-    available: bool,
 }
 
 const ACCESS: [Choice<Access>; 3] = [
@@ -21,20 +19,17 @@ const ACCESS: [Choice<Access>; 3] = [
         value: Access::None,
         name: "None",
         means: "you only answer, and read nothing on this system",
-        available: true,
     },
     Choice {
         value: Access::ReadOnly,
         name: "Read-only",
         means: "you may look at this system with your tools, changing nothing",
-        available: true,
     },
     Choice {
         value: Access::Full,
         name: "Full",
         means: "you may also change the system: files, services, packages and databases with the typed tools, \
                 anything else with commands you write",
-        available: true,
     },
 ];
 
@@ -43,7 +38,6 @@ const APPROVAL: [Choice<Approval>; 3] = [
         value: Approval::Ask,
         name: "Ask",
         means: "each of your actions waits for the administrator's approval",
-        available: true,
     },
     Choice {
         value: Approval::Plan,
@@ -51,7 +45,6 @@ const APPROVAL: [Choice<Approval>; 3] = [
         means: "looking needs no approval; you propose the changes with propose_plan and the administrator approves \
                 the plan once, its steps marked where they would always ask otherwise; a change outside the plan \
                 waits for approval",
-        available: true,
     },
     Choice {
         value: Approval::Auto,
@@ -59,7 +52,6 @@ const APPROVAL: [Choice<Approval>; 3] = [
         means: "looking, and the changes Kelpy checks and puts back (files, services, package installations, \
                 databases), need no approval; removing packages, stopping SSH, remote management or the network, and \
                 changes to the SSH, sudo, login, firewall, network or boot configuration still wait for it",
-        available: true,
     },
 ];
 
@@ -89,9 +81,10 @@ closes; off, you stay concise and write none.
 - System access, now {access}. {access_choices}
 - Approval mode, now {approval}.{approval_note} {approval_choices} The commands you write with `run_command` \
 always wait for approval, in every mode.
-Each action you take shows in your answer as a card with Approve and Deny; on a card that is not a command, Switch \
-to Plan and Switch to Auto approve it and change the Approval mode. While an action runs, its card shows the time \
-it has taken and Stop, which ends that action only: you are told, and your answer goes on. A plan shows as one card \
+Each action you take shows in your answer as a card with Approve and Deny; on a card that is neither a command nor \
+a change that always asks, Switch to Plan (from Ask) and Switch to Auto (from Ask or Plan) approve it and change \
+the Approval mode. While an action runs, its card shows the time it has taken and Stop, which ends that action \
+only: you are told, and your answer goes on. A plan shows as one card \
 with its steps, each marked as it is carried out. The terminal button in the top bar opens the Command log: what \
 you ran in this conversation. There, Restore puts a file back as it was before one of your changes, from its \
 backup: that is the administrator's own action, told to you with their next message. Report gives the handover \
@@ -99,7 +92,10 @@ report of the conversation (what changed, what did not complete, where secrets w
 and Export the operations that succeeded, with their arguments. When Kelpy finds that something it changed was \
 changed outside it, a bar above the conversation says so, and the administrator settles each difference with Accept \
 or Put back. Stop, beside the message box, ends your answer. The AI provider menu in the top bar changes the service \
-and the model (Change provider).
+and the model (Change provider). Files, in the top bar, uploads files to the server and lists them; the paperclip in the \
+message box, or a file dropped on it, uploads it and writes its path in the message. Secrets, in the top bar, is where \
+the administrator adds secrets for every conversation, sees and copies the values of every secret, and keeps them in \
+the vault, an encrypted store that opens with a passphrase or an SSH key; the vault is locked again when Kelpy stops.
 
 When a request needs a setting other than the current one, say which control to change, where it is and to which \
 value. When no setting allows it, say so plainly. Name the controls and their values as written here, in English, whatever language \
@@ -113,7 +109,7 @@ the conversation. Files that may hold secrets (private keys, `.env` files, passw
 never shown to you. Your actions run as the account that started Kelpy, {account}. {rights} An action \
 not approved within 30 minutes counts as denied. One answer may use the tools up to 20 times. If Kelpy stops while \
 a change is under way, its outcome is uncertain: it is never run again by itself. Secrets you generate last until \
-Kelpy stops.",
+Kelpy stops, unless the administrator keeps them in the vault.",
         access = name(&ACCESS, modes.access),
         access_choices = choices(&ACCESS),
         approval = name(&APPROVAL, modes.approval),
@@ -134,13 +130,7 @@ fn name<T: PartialEq>(choices: &[Choice<T>], value: T) -> &'static str {
 fn choices<T>(choices: &[Choice<T>]) -> String {
     let described: Vec<String> = choices
         .iter()
-        .map(|choice| {
-            if choice.available {
-                format!("{}: {}", choice.name, choice.means)
-            } else {
-                format!("{}: {}; not available yet", choice.name, choice.means)
-            }
-        })
+        .map(|choice| format!("{}: {}", choice.name, choice.means))
         .collect();
     format!("{}.", described.join("; "))
 }
@@ -162,21 +152,17 @@ mod tests {
     #[test]
     fn the_controls_named_are_the_web_uis() {
         let modes = web("lib/modes.ts");
-        for (name, available) in ACCESS
+        for name in ACCESS
             .iter()
-            .map(|choice| (choice.name, choice.available))
-            .chain(
-                APPROVAL
-                    .iter()
-                    .map(|choice| (choice.name, choice.available)),
-            )
+            .map(|choice| choice.name)
+            .chain(APPROVAL.iter().map(|choice| choice.name))
         {
             let at = modes
                 .find(&format!("name: '{name}'"))
                 .unwrap_or_else(|| panic!("{name} is not in modes.ts"));
             // The option's own entry, up to the next one.
             let entry = modes[at..].split("},").next().unwrap();
-            assert_eq!(!entry.contains("disabled: true"), available, "{name}");
+            assert!(!entry.contains("disabled: true"), "{name}");
         }
         let composer = web("lib/Composer.svelte");
         for label in [
@@ -184,6 +170,7 @@ mod tests {
             "label=\"System access\"",
             "label=\"Approval mode\"",
             "title=\"Stop\"",
+            "aria-label=\"Attach files\"",
         ] {
             assert!(composer.contains(label), "{label}");
         }
@@ -208,6 +195,8 @@ mod tests {
         let app = web("App.svelte");
         for label in [
             "aria-label=\"Command log\"",
+            "aria-label=\"Files\"",
+            "aria-label=\"Secrets\"",
             "title=\"AI provider\"",
             "'Change provider'",
         ] {

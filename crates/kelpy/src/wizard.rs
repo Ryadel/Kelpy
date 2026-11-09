@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::runtime::Runtime;
 
-use crate::client::Client;
 use crate::prompt;
+use kelpy_client::Client;
 
 /// How long a sign-in with ChatGPT may take in the browser, as the runtime allows.
 const SIGN_IN_TIME: Duration = Duration::from_secs(10 * 60);
@@ -306,7 +306,7 @@ struct Setup {
 
 impl Setup {
     fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.runtime.block_on(self.client.get(path))
+        Ok(self.runtime.block_on(self.client.get(path))?)
     }
 
     fn post<T: serde::de::DeserializeOwned>(
@@ -314,8 +314,9 @@ impl Setup {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<T> {
-        self.runtime
-            .block_on(self.client.send(Method::POST, path, body))
+        Ok(self
+            .runtime
+            .block_on(self.client.send(Method::POST, path, body))?)
     }
 
     /// Forgets the agent registration: the next sign-in as an agent registers again, with any account.
@@ -576,7 +577,7 @@ impl Setup {
         self.runtime
             .block_on(
                 self.client
-                    .events("/api/chatgpt/code", &json!({ "keep": keep }), |event| match event {
+                    .each_event("/api/chatgpt/code", &json!({ "keep": keep }), |event| match event {
                         CodeEvent::Code {
                             verification_url,
                             user_code,
@@ -816,7 +817,7 @@ impl Setup {
         }
         let mut shown = 0;
         let mut failed = None;
-        self.runtime.block_on(self.client.events(
+        self.runtime.block_on(self.client.each_event(
             "/api/ollama/install",
             &json!({}),
             |installation: Installation| {
@@ -844,7 +845,7 @@ impl Setup {
 
     fn download(&self, base_url: &str, model: &str) -> Result<()> {
         let mut failed = None;
-        self.runtime.block_on(self.client.events(
+        self.runtime.block_on(self.client.each_event(
             "/api/ollama/download",
             &json!({ "base_url": base_url, "model": model }),
             |download: Download| {

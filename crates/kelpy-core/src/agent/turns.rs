@@ -32,9 +32,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::AgentError;
-use super::context::{self, Budget};
+use super::context::{self, Budget, ContextUse};
 use super::server::Server;
 use crate::events::{Event, Events};
+use crate::home::Home;
 use actions::{Question, chat_messages};
 use fitting::{WindowKey, window_key};
 
@@ -74,7 +75,8 @@ not ask for it again unless they say so: go on with what you know. If something 
 pub(super) const CHANGING: &str = "You can look at this system and change it with the tools provided. Prefer the \
 built-in tools to look, as they only read. Make changes with the typed tools: `edit_file` and `write_file` for files, \
 `manage_service` for services, `install_packages` and `remove_packages` for packages, `create_database` for MariaDB \
-or MySQL. Kelpy shows each change before it is approved, backs files up, checks the result and puts back what it can \
+or MySQL; on Windows Server, `install_windows_features` for features such as IIS and `create_iis_site` for IIS \
+sites. Kelpy shows each change before it is approved, backs files up, checks the result and puts back what it can \
 when the check fails, and does nothing when the system is already as asked: do not back files up yourself, nor \
 repeat the checks it reports. Where a password or a key goes, create it with `generate_secret` and write \
 {{secret:name}} there: you never see its value, so never ask for it nor write one yourself. `run_command` runs the \
@@ -152,6 +154,8 @@ pub enum ChatEvent {
         error: Option<String>,
         /// The last message the conversation's summary covers, if its older part is summarised for the model.
         summarised_through: Option<i64>,
+        /// What the answer's last request took of the model's context window, if it got as far as a request.
+        context: Option<ContextUse>,
     },
 }
 
@@ -163,6 +167,8 @@ struct AnswerState {
     error: Option<String>,
     /// The last message the conversation's summary covers.
     summarised_through: Option<i64>,
+    /// What the answer's last request took of the model's context window, once known.
+    context: Option<ContextUse>,
 }
 
 /// The events of one answer for one interface, from where the answer is when following starts to its end.
@@ -238,6 +244,7 @@ impl AnswerEvents {
                         message: state.message.clone(),
                         error: state.error.clone(),
                         summarised_through: state.summarised_through,
+                        context: state.context,
                     });
                 }
             }
@@ -251,6 +258,7 @@ impl AnswerEvents {
                     message,
                     error: Some("the answer stopped unexpectedly".to_owned()),
                     summarised_through: state.summarised_through,
+                    context: state.context,
                 });
             }
         }
@@ -266,6 +274,8 @@ pub(super) struct Turns {
     /// Where answers starting and ending are published.
     events: Events,
     pub(super) memory_index: PathBuf,
+    /// Where the files the administrator uploads are.
+    uploads: PathBuf,
     /// The tools the model may call, and where they run.
     tools: Tools,
     executor: Executor,
@@ -361,14 +371,14 @@ impl Turns {
     }
 
     /// Turns stored in `store`, answered through `client`, run in `tasks` and published to `events`, with the memory
-    /// index at `memory_index`. The model looks at the system through `executor`; what its changes leave is recorded
-    /// by `server`.
+    /// and the uploads of `home`. The model looks at the system through `executor`; what its changes leave is
+    /// recorded by `server`.
     pub(super) fn new(
         store: Storage,
         client: Provider,
         tasks: TaskTracker,
         events: Events,
-        memory_index: PathBuf,
+        home: &Home,
         executor: Executor,
         server: Arc<Server>,
     ) -> Self {
@@ -377,7 +387,8 @@ impl Turns {
             client,
             tasks,
             events,
-            memory_index,
+            memory_index: home.memory_dir().join("MEMORY.md"),
+            uploads: home.uploads_dir(),
             tools: Tools::new(executor.os()),
             executor,
             server,
@@ -521,6 +532,7 @@ impl Turns {
                 message: turn.answer,
                 error: None,
                 summarised_through: turn.summary.as_ref().map(|summary| summary.through),
+                context: None,
             });
             if let Some(running) = lock(&turns.answers).running.get_mut(&session_id) {
                 running.answer = Some(follower.clone());
@@ -554,6 +566,7 @@ impl Turns {
                 message: ended.message,
                 error: ended.error,
                 summarised_through: ended.summarised_through,
+                context: ended.context,
             });
         });
         start.await.unwrap_or(Err(AgentError::NotStarted))
@@ -626,6 +639,7 @@ impl Turns {
         } else {
             self.server.notes().await
         };
+        let secrets = self.server.secrets_note().await;
         // The tools that look with System access Read-only; with Full also those that change, and propose_plan in
         // the Approval mode Plan.
         let specs = |kind: ToolKind| -> Vec<ToolSpec> {
@@ -689,6 +703,14 @@ impl Turns {
             };
             let mut instructions =
                 instructions(modes, looking, self.executor.account(), memory.as_deref());
+            instructions.push_str("\n\n");
+            instructions.push_str(&secrets);
+            instructions.push_str(&format!(
+                "\n\n## Files\n\nThe files the administrator uploads are in {}, readable by Kelpy's account only: \
+                 their paths appear in the administrator's messages, and Files in the top bar lists them. Read them \
+                 where they are; copy one where a service needs it.",
+                self.uploads.display()
+            ));
             if let Some(differences) = differences.as_deref() {
                 instructions.push_str("\n\n");
                 instructions.push_str(differences);
@@ -838,6 +860,10 @@ impl Turns {
             if let Some((estimate, input_tokens)) = usage {
                 state.message.context_estimate = Some(estimate);
                 state.message.input_tokens = input_tokens;
+                state.context = Some(ContextUse {
+                    used: input_tokens.unwrap_or_else(|| budget.counted(estimate)),
+                    window: budget.window,
+                });
             }
             state.error = error;
         });
