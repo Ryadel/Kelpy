@@ -9,6 +9,7 @@ use kelpy_core::agent::{Access, Approval};
 use serde_json::json;
 
 use crate::Banner;
+use crate::history::{self, Recall};
 use crate::model::{
     Action, ActionState, ChatEvent, Connection, ContextUse, Conversation, Message, ProviderState,
     Role, RuntimeEvent, Session, Status,
@@ -48,6 +49,8 @@ pub enum Effect {
         approve: bool,
     },
     Cancel(i64),
+    /// Opens a link in this computer's browser.
+    OpenLink(String),
     Change {
         session: i64,
         change: serde_json::Value,
@@ -83,6 +86,12 @@ pub enum Update {
     },
     /// A conversation this interface created for its first message.
     Created(Session),
+    /// Kelpy refused a message, `problem` saying why: no answer is being written for it.
+    NotSent {
+        session: i64,
+        content: String,
+        problem: String,
+    },
     Session(Session),
     Chat {
         session: i64,
@@ -111,13 +120,20 @@ pub struct App {
     /// The highlighted line of the list of conversations: 0 is *New conversation*, then the conversations.
     pub cursor: usize,
     pub messages: Vec<Message>,
+    /// Whether the open conversation's messages are being read: until then, none shows.
+    pub loading: bool,
     /// What the open conversation's latest answer took of the model's context window, once known.
     pub context: Option<ContextUse>,
     /// Conversations with an answer being written.
     pub answering: HashSet<i64>,
+    /// Conversations this interface created for a message, among `answering` only on its word until Kelpy says
+    /// whether an answer began: a refusal of that message takes back this mark, and no other.
+    presumed: HashSet<i64>,
     /// The modes of a new conversation, until its first message.
     pub draft: Modes,
     pub input: String,
+    /// Where Up and Down are in the open conversation's messages sent.
+    recall: Recall,
     pub focus: Focus,
     pub notice: Option<String>,
     /// How many lines the conversation is scrolled up from its end.
@@ -134,6 +150,8 @@ pub struct App {
     pub overlay: bool,
     /// Drawn inline, in the terminal's own history, with only a footer: no side panel.
     pub inline: bool,
+    /// Whether Ctrl+O opens the Web UI in this computer's browser: not over SSH, where it would open on the server.
+    pub opens_links: bool,
     /// Whether the conversations were read once: the start banner lists them.
     pub loaded: bool,
     /// Raised by each conversation added or deleted: a list read before is out of date, and read again.
@@ -176,10 +194,13 @@ impl App {
             selected: None,
             cursor: 0,
             messages: Vec::new(),
+            loading: false,
             context: None,
             answering: HashSet::new(),
+            presumed: HashSet::new(),
             draft: Modes::default(),
             input: String::new(),
+            recall: Recall::default(),
             focus: Focus::Message,
             notice: None,
             scroll: 0,
@@ -189,6 +210,7 @@ impl App {
             panel_hidden: false,
             overlay: false,
             inline: false,
+            opens_links: false,
             loaded: false,
             listing: 0,
             changes: 0,
@@ -210,6 +232,7 @@ impl App {
     /// Reads conversation `id` from now on.
     fn read(&mut self, id: i64) -> Effect {
         self.reads += 1;
+        self.loading = true;
         Effect::Open {
             id,
             read: self.reads,
@@ -221,9 +244,21 @@ impl App {
     fn open(&mut self, id: Option<i64>) {
         self.selected = id;
         self.messages.clear();
+        self.loading = false;
+        self.recall.reset();
         self.context = None;
         self.touched.clear();
         self.running_set = 0;
+    }
+
+    /// Records what Kelpy says: whether an answer is being written in conversation `id`.
+    fn set_answering(&mut self, id: i64, answering: bool) {
+        self.presumed.remove(&id);
+        if answering {
+            self.answering.insert(id);
+        } else {
+            self.answering.remove(&id);
+        }
     }
 
     /// Counts a change to the open conversation, and returns it.
@@ -297,6 +332,9 @@ impl App {
             }
             KeyCode::Char('y') if control => self.decide(true),
             KeyCode::Char('n') if control => self.decide(false),
+            KeyCode::Char('o') if control && self.opens_links => {
+                vec![Effect::OpenLink(self.banner.web_ui.clone())]
+            }
             KeyCode::Char('r') if control => {
                 self.focus = Focus::Conversations;
                 self.overlay = false;
@@ -377,7 +415,23 @@ impl App {
 
     fn message_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            self.recall.reset();
+        }
         match key.code {
+            // The messages sent in this conversation, as a shell's history.
+            KeyCode::Up => {
+                let sent = history::sent(&self.messages);
+                if let Some(text) = self.recall.back(&sent, &self.input) {
+                    self.input = text;
+                }
+            }
+            KeyCode::Down => {
+                let sent = history::sent(&self.messages);
+                if let Some(text) = self.recall.forward(&sent) {
+                    self.input = text;
+                }
+            }
             KeyCode::Char('u') if control => self.input.clear(),
             // On the start screen, a number opens that recent conversation.
             KeyCode::Char(digit @ '1'..='3')
@@ -404,6 +458,10 @@ impl App {
                 self.notice = Some(
                     "An answer is being written: wait for it, or press Esc to stop it.".into(),
                 );
+            }
+            // Kelpy would refuse it: say why now, the message kept, rather than open a conversation for nothing.
+            KeyCode::Enter if !self.input.trim().is_empty() && self.provider.problem.is_some() => {
+                self.notice = self.provider.refusal();
             }
             KeyCode::Enter if !self.input.trim().is_empty() => {
                 let content = std::mem::take(&mut self.input);
@@ -510,10 +568,31 @@ impl App {
             Update::Created(session) => {
                 self.listing += 1;
                 self.open(Some(session.id));
-                self.answering.insert(session.id);
+                // Until Kelpy says whether an answer began, or refuses the message.
+                if self.answering.insert(session.id) {
+                    self.presumed.insert(session.id);
+                }
                 self.running_set = self.change();
                 self.upsert(session);
                 self.cursor = 1;
+            }
+            Update::NotSent {
+                session,
+                content,
+                problem,
+            } => {
+                self.notice = Some(format!("Not sent: {problem}."));
+                // Only this interface's mark is taken back: an answer another one began since stays.
+                if self.presumed.remove(&session) {
+                    self.answering.remove(&session);
+                }
+                if self.selected == Some(session) {
+                    if self.input.is_empty() {
+                        self.input = content;
+                    }
+                    // And the conversation read again, for what Kelpy says of it.
+                    return vec![self.read(session)];
+                }
             }
             Update::Session(session) => self.upsert(session),
             Update::Chat { session, event } => self.chat(session, event),
@@ -529,14 +608,11 @@ impl App {
         if self.selected != Some(id) {
             return Vec::new();
         }
+        self.loading = false;
         if self.running_set <= since {
             // An answer that ended meanwhile brought a newer one.
             self.context = conversation.context.or(self.context);
-            if conversation.running {
-                self.answering.insert(id);
-            } else {
-                self.answering.remove(&id);
-            }
+            self.set_answering(id, conversation.running);
         }
         let newer = |message: &Message| self.touched.get(&message.id).is_some_and(|&at| at > since);
         let mut local: HashMap<i64, Message> = std::mem::take(&mut self.messages)
@@ -567,7 +643,7 @@ impl App {
             self.running_set = self.change();
         }
         if matches!(event, ChatEvent::Started { .. }) {
-            self.answering.insert(session);
+            self.set_answering(session, true);
         }
         if let ChatEvent::Done {
             error: Some(error), ..
@@ -577,7 +653,7 @@ impl App {
             self.notice = Some(error.clone());
         }
         if let ChatEvent::Done { context, .. } = &event {
-            self.answering.remove(&session);
+            self.set_answering(session, false);
             if self.selected == Some(session) && context.is_some() {
                 self.context = *context;
             }
@@ -646,7 +722,7 @@ impl App {
                 }
             }
             RuntimeEvent::AnswerStarted { session_id } => {
-                self.answering.insert(session_id);
+                self.set_answering(session_id, true);
                 if self.selected == Some(session_id) {
                     self.running_set = self.change();
                     return vec![Effect::Follow(session_id)];
@@ -656,7 +732,7 @@ impl App {
                 session_id,
                 context,
             } => {
-                self.answering.remove(&session_id);
+                self.set_answering(session_id, false);
                 if self.selected == Some(session_id) {
                     self.running_set = self.change();
                     self.context = context.or(self.context);
@@ -790,6 +866,149 @@ pub(crate) mod tests {
         app.apply(Update::Created(session(7, 1)));
         assert_eq!(app.selected, Some(7));
         assert!(app.running());
+    }
+
+    #[test]
+    fn up_and_down_bring_back_the_messages_sent_in_the_open_conversation() {
+        let mut app = App::new(Banner::default(), true);
+        app.selected = Some(1);
+        app.messages = vec![
+            message(1, Role::User, "uptime?"),
+            message(2, Role::Assistant, "Up 3 days."),
+            message(3, Role::User, "df -h?"),
+        ];
+        for char in "draft".chars() {
+            app.key(key(KeyCode::Char(char)));
+        }
+        app.key(key(KeyCode::Up));
+        assert_eq!(app.input, "df -h?");
+        app.key(key(KeyCode::Up));
+        assert_eq!(app.input, "uptime?");
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::Down));
+        assert_eq!(app.input, "draft");
+        // Another conversation has its own.
+        app.key(key(KeyCode::Up));
+        app.apply(Update::Created(session(7, 1)));
+        assert!(app.key(key(KeyCode::Down)).is_empty());
+        assert_eq!(app.input, "df -h?");
+    }
+
+    #[test]
+    fn a_message_kelpy_would_refuse_is_kept_and_why_is_said() {
+        let mut app = App::new(Banner::default(), true);
+        app.apply(Update::Provider(ProviderState {
+            label: "No AI provider".into(),
+            problem: Some("choose one in the Web UI or run `kelpy provider`".into()),
+            configured: false,
+        }));
+        for char in "uptime?".chars() {
+            app.key(key(KeyCode::Char(char)));
+        }
+        assert!(app.key(key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.input, "uptime?");
+        assert_eq!(app.selected, None);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(
+                "No AI provider configured yet: choose one in the Web UI or run 'kelpy provider'."
+            )
+        );
+    }
+
+    #[test]
+    fn a_message_refused_leaves_no_answer_to_wait_for() {
+        let mut app = App::new(Banner::default(), true);
+        for char in "uptime?".chars() {
+            app.key(key(KeyCode::Char(char)));
+        }
+        app.key(key(KeyCode::Enter));
+        app.apply(Update::Created(session(7, 1)));
+        assert!(app.running());
+        let effects = app.apply(Update::NotSent {
+            session: 7,
+            content: "uptime?".into(),
+            problem: "no AI provider is configured yet".into(),
+        });
+        assert!(!app.running());
+        // Read again, for what Kelpy says of it.
+        assert!(matches!(effects[..], [Effect::Open { id: 7, .. }]));
+        assert_eq!(app.input, "uptime?");
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Not sent: no AI provider is configured yet.")
+        );
+        // Sent again, not held back by an answer that never began.
+        assert!(matches!(
+            app.key(key(KeyCode::Enter))[..],
+            [Effect::Send {
+                session: Some(7),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn a_message_refused_leaves_the_answer_another_interface_began() {
+        let mut app = App::new(Banner::default(), true);
+        app.apply(Update::Sessions {
+            listing: 0,
+            sessions: vec![session(3, 5)],
+        });
+        app.key(control('r'));
+        app.key(key(KeyCode::Down));
+        let [Effect::Open { read, since, .. }] = app.key(key(KeyCode::Enter))[..] else {
+            panic!("not opened");
+        };
+        let idle = Conversation {
+            messages: Vec::new(),
+            running: false,
+            context: None,
+        };
+        app.apply(Update::Conversation {
+            id: 3,
+            read,
+            since,
+            conversation: idle,
+        });
+        for char in "uptime?".chars() {
+            app.key(key(KeyCode::Char(char)));
+        }
+        assert!(matches!(
+            app.key(key(KeyCode::Enter))[..],
+            [Effect::Send {
+                session: Some(3),
+                ..
+            }]
+        ));
+
+        // Another interface began an answer meanwhile, and this message is refused for it.
+        app.apply(Update::Runtime(RuntimeEvent::AnswerStarted {
+            session_id: 3,
+        }));
+        let effects = app.apply(Update::NotSent {
+            session: 3,
+            content: "uptime?".into(),
+            problem: "an answer is being written".into(),
+        });
+        assert!(app.running());
+        assert_eq!(app.input, "uptime?");
+        // Read again: what Kelpy says of it is taken.
+        let [Effect::Open { id: 3, read, since }] = effects[..] else {
+            panic!("not read again: {effects:?}");
+        };
+        let effects = app.apply(Update::Conversation {
+            id: 3,
+            read,
+            since,
+            conversation: Conversation {
+                messages: Vec::new(),
+                running: true,
+                context: None,
+            },
+        });
+        assert!(app.running());
+        assert_eq!(effects, [Effect::Follow(3)]);
     }
 
     #[test]
@@ -1128,6 +1347,23 @@ pub(crate) mod tests {
             .is_empty()
         );
         assert_eq!(app.messages[1].content, "Look at /var.");
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_web_ui_only_where_this_computer_has_a_browser() {
+        let banner = Banner {
+            web_ui: "http://127.0.0.1:4321/#code=K7QM-4ZP2".into(),
+            ..Banner::default()
+        };
+        let mut app = App::new(banner, false);
+        // Over SSH it would open on the server: the key does nothing, and types nothing.
+        assert!(app.key(control('o')).is_empty());
+        assert_eq!(app.input, "");
+        app.opens_links = true;
+        assert!(matches!(
+            &app.key(control('o'))[..],
+            [Effect::OpenLink(url)] if url == "http://127.0.0.1:4321/#code=K7QM-4ZP2"
+        ));
     }
 
     #[test]

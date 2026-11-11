@@ -43,8 +43,8 @@ impl Account {
         match (self.os, self.elevated) {
             (_, true) => None,
             (Os::Windows, false) => Some(
-                "Changes that need administrator rights fail. To allow them, start Kelpy from a terminal opened as \
-                 administrator.",
+                "Changes that need administrator rights fail. To allow them, restart Kelpy as administrator from the \
+                 System access menu, or start it from a terminal opened as administrator.",
             ),
             (_, false) => Some(
                 "Changes that need root fail, unless sudo works without a password. To allow them, start Kelpy with \

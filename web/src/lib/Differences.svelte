@@ -62,7 +62,7 @@
 </script>
 
 {#if differences.length > 0}
-  <div class="mx-auto w-full max-w-3xl px-5 pt-3">
+  <div class="mx-auto w-full max-w-conversation px-5 pt-3">
     <div class="rounded-xl border border-amber-500/40 bg-amber-500/5 text-sm">
       <button
         type="button"

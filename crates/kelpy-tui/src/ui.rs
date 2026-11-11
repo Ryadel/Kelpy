@@ -4,7 +4,10 @@
 
 use kelpy_common::unix_now;
 use kelpy_core::agent::{Access, Approval};
+use std::num::NonZeroU16;
+
 use ratatui::Frame;
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -285,7 +288,7 @@ fn start(frame: &mut Frame, app: &App, terminal: Capabilities, area: Rect) {
     let gap = if mark.is_some() { GAP } else { 0 };
     let text_width = TEXT_WIDTH.min(area.width.saturating_sub(4 + mark_width + gap));
     let wordmark = above.height >= Wordmark::SIZE.1 + 4 && text_width >= Wordmark::SIZE.0;
-    let lines = start_text(app, theme, text_width.into(), !wordmark);
+    let lines = start_text(app, theme, terminal.links, text_width.into(), !wordmark);
     let text_height = lines.len() as u16 + if wordmark { Wordmark::SIZE.1 + 1 } else { 0 };
     let height = mark_height.max(text_height).min(above.height);
     let x = area.x + (area.width - (mark_width + gap + text_width)) / 2;
@@ -308,6 +311,36 @@ fn start(frame: &mut Frame, app: &App, terminal: Capabilities, area: Rect) {
         text.height = text.height.saturating_sub(Wordmark::SIZE.1 + 1);
     }
     frame.render_widget(Paragraph::new(lines), text);
+    if terminal.links {
+        hyperlink(frame.buffer_mut(), text, &app.banner.web_ui);
+    }
+}
+
+/// Makes `url`, where a row of `area` shows it whole, a link the terminal opens (OSC 8): its first cell writes it
+/// all between the link's sequences, and stands for the cells it covers. Not where it is cut on two rows.
+fn hyperlink(buffer: &mut Buffer, area: Rect, url: &str) {
+    // Nothing that could end the sequence early or be read as one.
+    if url.is_empty() || !url.is_ascii() || url.chars().any(|char| char.is_ascii_control()) {
+        return;
+    }
+    let Some(width) = u16::try_from(url.len()).ok().and_then(NonZeroU16::new) else {
+        return;
+    };
+    let area = area.intersection(buffer.area);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right().saturating_sub(width.get() - 1) {
+            let shown = url
+                .bytes()
+                .zip(x..)
+                .all(|(byte, column)| buffer[(column, y)].symbol().as_bytes() == [byte]);
+            if shown {
+                buffer[(x, y)]
+                    .set_symbol(&format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\"))
+                    .set_diff_option(CellDiffOption::ForcedWidth(width));
+                return;
+            }
+        }
+    }
 }
 
 /// The kelpie beside the wordmark: the largest that fits the terminal's rows with the text beside it. None on a
@@ -332,7 +365,13 @@ fn start_mark(theme: Theme, area: Rect) -> Option<Mark> {
 
 /// The start screen's text: what runs where, the Web UI, the notes, the conversations to continue. With
 /// `name`, Kelpy's name first, where the wordmark does not fit.
-fn start_text(app: &App, theme: Theme, width: usize, name: bool) -> Vec<Line<'static>> {
+fn start_text(
+    app: &App,
+    theme: Theme,
+    links: bool,
+    width: usize,
+    name: bool,
+) -> Vec<Line<'static>> {
     let (dim, text) = (Style::new().fg(theme.dim()), Style::new().fg(theme.text()));
     let banner = &app.banner;
     let mut lines = Vec::new();
@@ -373,7 +412,7 @@ fn start_text(app: &App, theme: Theme, width: usize, name: bool) -> Vec<Line<'st
         );
     }
     lines.push(Line::raw(""));
-    lines.extend(fact_lines(&start_facts(app, theme), width, dim));
+    lines.extend(fact_lines(&start_facts(app, theme, links), width, dim));
     if !app.sessions.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
@@ -403,15 +442,33 @@ fn start_text(app: &App, theme: Theme, width: usize, name: bool) -> Vec<Line<'st
     lines
 }
 
-/// The Web UI's link, then the banner's notes: `Code`, `Home`, `Account`, what Kelpy is reachable by.
-pub(crate) fn start_facts(app: &App, theme: Theme) -> Vec<Fact> {
+/// The Web UI's link, with how to open it where `links` are shown, then the banner's notes: `Code`, `Home`,
+/// `Account`, what Kelpy is reachable by.
+pub(crate) fn start_facts(app: &App, theme: Theme, links: bool) -> Vec<Fact> {
     let mut list = vec![Fact {
         label: Some("Web UI".into()),
         value: app.banner.web_ui.clone(),
         style: Style::new().fg(theme.accent()).underlined(),
+        note: link_hint(links, app.opens_links),
     }];
     list.extend(facts(&app.banner.notes, Style::new().fg(theme.text())));
     list
+}
+
+/// How the Web UI's link opens: with a click where the terminal shows `links`, with Ctrl+O where Kelpy `opens` this
+/// computer's browser. None over SSH, where neither would reach it.
+fn link_hint(links: bool, opens: bool) -> Option<String> {
+    let click = if cfg!(target_os = "macos") {
+        "Cmd+click"
+    } else {
+        "Ctrl+click"
+    };
+    match (links, opens) {
+        (true, true) => Some(format!("{click} opens it · Ctrl+O too")),
+        (true, false) => Some(format!("{click} opens it")),
+        (false, true) => Some("Ctrl+O opens it in the browser".into()),
+        (false, false) => None,
+    }
 }
 
 /// How long ago, in `seconds`, as a person would say it.
@@ -858,7 +915,10 @@ fn key_line(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
             Style::new().fg(theme.warn()).bold(),
         )
     } else if let Some(notice) = &app.notice {
-        Line::styled(format!(" {notice}"), Style::new().fg(theme.bad()))
+        Line::styled(
+            format!(" {}", unquoted(notice)),
+            Style::new().fg(theme.bad()).bold(),
+        )
     } else {
         // The keys that matter now first, then as many others as fit whole, and how to quit.
         let mut keys = Vec::new();
@@ -867,6 +927,9 @@ fn key_line(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
         }
         if app.waiting().is_some() {
             keys.push("Ctrl+Y approve · Ctrl+N deny");
+        }
+        if app.opens_links {
+            keys.push("Ctrl+O open the Web UI");
         }
         keys.push("Ctrl+R conversations");
         if !app.starting() {

@@ -95,8 +95,8 @@ pub struct SshAgent {
 impl SshAgent {
     /// The agent of Kelpy's session, if it has one: `SSH_AUTH_SOCK`, or else OpenSSH's agent on Windows.
     pub fn of_session() -> Option<Self> {
-        let address = match std::env::var_os("SSH_AUTH_SOCK") {
-            Some(path) if !path.is_empty() => PathBuf::from(path),
+        let address = match crate::environment::var("SSH_AUTH_SOCK") {
+            Some(path) => PathBuf::from(path),
             _ if cfg!(windows) => PathBuf::from(r"\\.\pipe\openssh-ssh-agent"),
             _ => return None,
         };

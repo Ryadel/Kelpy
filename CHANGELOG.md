@@ -3,6 +3,33 @@
 Each release is on the [releases page](https://github.com/Ryadel/Kelpy/releases), with one executable per platform,
 the install scripts and the signed checksums. Versions follow [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+- **Terminal UI**: a message sent without a usable AI provider is no longer lost in a conversation that showed
+  *Loading…* forever. Kelpy keeps it in the box and says what is missing, such as "No AI provider configured yet:
+  choose one in the Web UI or run 'kelpy provider'". A message Kelpy refuses for another reason comes back to the
+  box with the reason, and the conversation no longer waits for an answer that never began. An empty conversation
+  says so.
+- **Terminal UI**: the Web UI's link on the start screen is a real link in Windows Terminal and most terminals,
+  opened with Ctrl+click, and a line under it says how to open it. Ctrl+O opens the Web UI in the browser, signed
+  in, from any screen and in the classic Command Prompt too; it is not offered over SSH, where the browser would be
+  the server's.
+- **Terminal UI and Web UI**: Up and Down in the message box bring back the messages already sent in the open
+  conversation, as a shell brings back its commands; Down goes forward again to what was being written.
+- **Web UI**: the conversation is wider on large screens. While an answer is being thought out, the creature from
+  folklore shown meanwhile is easier to read, with its tradition and its source.
+- **Web UI**: the first start, without an AI provider, opens on a welcome with Kelpy's logo and what it does,
+  beside the choice of how Kelpy connects to AI.
+- **Web UI**: the System access and Approval mode menus close as soon as an option is chosen.
+- **Restart as administrator**: when an action fails for lack of administrator rights, the Web UI offers to
+  restart Kelpy as administrator, under the action and in the System access menu. Windows asks for consent in its
+  own prompt; Kelpy restarts at the same address, and the page reloads by itself, still signed in, with the keys,
+  sign-ins and secrets as before.
+- **Running `kelpy` again**: when Kelpy is already running, it says where (the Web UI's link), since when, its
+  process and version, and its home, then offers to open the terminal UI, open the Web UI, stop Kelpy, or leave it
+  running. Stopping asks first when an answer is being written. Without a terminal it prints the same facts and
+  `kelpy stop`. While Kelpy is starting or being updated, it waits up to half a minute.
+
 ## 0.4.1 (2026-11-09)
 
 Fixes to the terminal UI's start screen and the Web UI, and a Windows install command that also runs from the

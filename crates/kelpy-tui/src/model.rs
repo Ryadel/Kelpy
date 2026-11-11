@@ -118,6 +118,23 @@ pub struct ProviderState {
     /// `Groq (llama-3.3-70b)`; empty until read.
     pub label: String,
     pub problem: Option<String>,
+    /// Whether a provider is chosen at all.
+    pub configured: bool,
+}
+
+impl ProviderState {
+    /// What to say instead of sending a message, when Kelpy would refuse it.
+    pub fn refusal(&self) -> Option<String> {
+        let problem = self.problem.as_deref()?;
+        Some(if self.configured {
+            format!("{}: {problem}.", self.label)
+        } else {
+            format!(
+                "No AI provider configured yet: {}.",
+                problem.replace('`', "'")
+            )
+        })
+    }
 }
 
 impl ProviderInfo {
@@ -126,6 +143,7 @@ impl ProviderInfo {
             return ProviderState {
                 label: "No AI provider".into(),
                 problem: Some("choose one in the Web UI or run `kelpy provider`".into()),
+                configured: false,
             };
         };
         let name = |id: &str| {
@@ -148,6 +166,7 @@ impl ProviderInfo {
         ProviderState {
             label: format!("{service} ({})", configured.model),
             problem: problem.map(str::to_owned),
+            configured: true,
         }
     }
 }
@@ -171,6 +190,24 @@ mod tests {
     }
 
     #[test]
+    fn a_message_kelpy_would_refuse_is_held_back_with_what_is_missing() {
+        let ready = ProviderState {
+            label: "Groq (llama)".into(),
+            problem: None,
+            configured: true,
+        };
+        assert_eq!(ready.refusal(), None);
+        let keyless = ProviderState {
+            problem: Some("no API key: enter it in the Web UI".into()),
+            ..ready
+        };
+        assert_eq!(
+            keyless.refusal().as_deref(),
+            Some("Groq (llama): no API key: enter it in the Web UI.")
+        );
+    }
+
+    #[test]
     fn the_provider_is_named_with_its_state() {
         let info: ProviderInfo = serde_json::from_str(
             r#"{"configured":{"kind":"openai_compatible","service":"groq","model":"llama"},"needs":"key",
@@ -182,6 +219,7 @@ mod tests {
             ProviderState {
                 label: "Groq (llama)".into(),
                 problem: Some("no API key: enter it in the Web UI".into()),
+                configured: true,
             }
         );
         let none: ProviderInfo =

@@ -343,6 +343,8 @@ export type RuntimeEvent =
   | { type: 'connections_changed' }
   /** The provider, or what it needs to answer, changed: read it again. */
   | { type: 'provider_changed' }
+  /** Restarting as administrator became possible, started, or failed: read it again. */
+  | { type: 'elevation_changed' }
   /** Some events were missed: read again everything shown. */
   | { type: 'resync' }
   /** Kelpy is stopping: the last event. */
@@ -441,6 +443,35 @@ async function json<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const fetchStatus = (signal?: AbortSignal) => json<RuntimeStatus>('/api/status', { signal });
+
+/** How Kelpy restarts with administrator rights: the system's prompt on this computer, `sudo` in Kelpy's terminal,
+ * or by hand. */
+export type ElevationHow = 'prompt' | 'terminal' | 'command';
+
+/** Whether Kelpy has administrator rights, how it can restart with them, and where a restart asked for is. */
+export type ElevationView = {
+  elevated: boolean;
+  how: ElevationHow | null;
+} & (
+  | { step: 'idle' }
+  /** The system's prompt is open, or `sudo` asks for the password. */
+  | { step: 'prompt' }
+  /** Handing over to the new Kelpy: this page reloads once it answers. */
+  | { step: 'restarting' }
+  | { step: 'failed'; reason: string }
+);
+
+export const fetchElevation = () => json<ElevationView>('/api/elevation');
+
+/** Asks Kelpy to restart as administrator, through the system's prompt. */
+export const askElevation = async () => {
+  await request('/api/elevation', { method: 'POST' });
+};
+
+/** Cancels the restart while the system's prompt is open. */
+export const cancelElevation = async () => {
+  await request('/api/elevation', { method: 'DELETE' });
+};
 
 export const fetchProvider = () => json<ProviderInfo>('/api/provider');
 

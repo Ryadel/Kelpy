@@ -70,6 +70,21 @@ impl Registry {
     pub fn names(&self) -> Vec<String> {
         lock(&self.0).common.keys().cloned().collect()
     }
+
+    /// Everything it holds, for the Kelpy restarted in this one's place: the values masked, and the administrator's
+    /// secrets by name.
+    pub fn handed_over(&self) -> (BTreeSet<String>, BTreeMap<String, String>) {
+        let shared = lock(&self.0);
+        (shared.values.clone(), shared.common.clone())
+    }
+
+    /// Takes over what [`Registry::handed_over`] gave, with what it holds already.
+    pub fn take_over(&self, masked: BTreeSet<String>, common: BTreeMap<String, String>) {
+        let mut shared = lock(&self.0);
+        shared.values.extend(masked);
+        shared.values.extend(common.values().cloned());
+        shared.common.extend(common);
+    }
 }
 
 /// The secrets of one conversation. Clones share them.
@@ -92,6 +107,21 @@ impl Secrets {
             own: Arc::default(),
             registry: registry.clone(),
         }
+    }
+
+    /// A conversation's secrets, sharing the administrator's in `registry`, with those it generated before Kelpy
+    /// restarted in another process: `own`, by name.
+    pub fn taking_over(registry: &Registry, own: BTreeMap<String, String>) -> Self {
+        lock(&registry.0).values.extend(own.values().cloned());
+        Self {
+            own: Arc::new(Mutex::new(own)),
+            registry: registry.clone(),
+        }
+    }
+
+    /// The secrets this conversation generated, by name, for the Kelpy restarted in this one's place.
+    pub fn handed_over(&self) -> BTreeMap<String, String> {
+        lock(&self.own).clone()
     }
 
     /// Generates the secret `name`, unless it exists, in this conversation or among the administrator's. Returns

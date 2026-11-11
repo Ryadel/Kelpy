@@ -180,8 +180,13 @@ pub fn tail(
         transcript.messages.clear();
         (transcript.selected, transcript.width, transcript.theme) = (app.selected, width, theme);
     }
-    if app.messages.is_empty() {
-        return vec![Line::from("  Loading…").fg(theme.dim())];
+    if app.messages.is_empty() && !app.running() {
+        let empty = if app.loading {
+            "  Loading…"
+        } else {
+            "  No messages yet."
+        };
+        return vec![Line::from(empty).fg(theme.dim())];
     }
     // In reverse, turned the right way at the end.
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -418,6 +423,8 @@ pub(crate) struct Fact {
     pub label: Option<String>,
     pub value: String,
     pub style: Style,
+    /// A line under the value, in the labels' style, such as how to open a link.
+    pub note: Option<String>,
 }
 
 /// The facts in a start banner's notes, such as `Code: K7QM-4ZP2 (…) · Home: /root/Kelpy`: each part with a short
@@ -434,11 +441,13 @@ pub(crate) fn facts(notes: &[String], style: Style) -> Vec<Fact> {
                     label: Some(label.to_owned()),
                     value: value.to_owned(),
                     style,
+                    note: None,
                 },
                 None => Fact {
                     label: None,
                     value: part.to_owned(),
                     style,
+                    note: None,
                 },
             });
         }
@@ -447,7 +456,7 @@ pub(crate) fn facts(notes: &[String], style: Style) -> Vec<Fact> {
 }
 
 /// The facts in `width` columns: the labels in a column as wide as the longest, in `label_style`; a value that
-/// does not fit goes on under itself, never under its label. A fact without a label takes the whole width.
+/// does not fit goes on under itself, never under its label, and so does its note. A fact without a label takes the whole width.
 pub(crate) fn fact_lines(facts: &[Fact], width: usize, label_style: Style) -> Vec<Line<'static>> {
     let longest = facts
         .iter()
@@ -475,6 +484,16 @@ pub(crate) fn fact_lines(facts: &[Fact], width: usize, label_style: Style) -> Ve
                 Span::raw(" ".repeat(column))
             };
             lines.push(Line::from(vec![head, Span::styled(line, fact.style)]));
+        }
+        for line in fact
+            .note
+            .iter()
+            .flat_map(|note| wrap(note, width.saturating_sub(column)))
+        {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(column)),
+                Span::styled(line, label_style),
+            ]));
         }
     }
     lines
@@ -585,6 +604,23 @@ mod tests {
                 "  It is fine."
             ]
         );
+    }
+
+    #[test]
+    fn an_empty_conversation_says_loading_only_while_it_is_read() {
+        let mut app = open(Vec::new());
+        let text = |app: &App| {
+            tail(app, &mut Transcript::default(), Theme::default(), 40, 10)
+                .iter()
+                .map(|line| line.to_string().trim().to_owned())
+                .collect::<Vec<_>>()
+        };
+        app.loading = true;
+        assert_eq!(text(&app), ["Loading…"]);
+        app.loading = false;
+        assert_eq!(text(&app), ["No messages yet."]);
+        app.answering.insert(1);
+        assert_eq!(text(&app), ["Kelpy is answering…"]);
     }
 
     /// A conversation open with `messages`.

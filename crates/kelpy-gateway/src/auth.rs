@@ -78,6 +78,26 @@ impl Auth {
         })
     }
 
+    /// What a Kelpy restarted in another process takes over, so that the browsers signed in and the local clients
+    /// go on without signing in again.
+    pub fn handed_over(&self) -> AuthState {
+        AuthState {
+            code: self.code.clone(),
+            token: self.token.clone(),
+            sessions: lock(&self.sessions).clone(),
+        }
+    }
+
+    /// The credentials of the Kelpy that handed `state` over. The failed sign-ins start counting again.
+    pub fn take_over(state: AuthState) -> Self {
+        Self {
+            code: state.code,
+            token: state.token,
+            sessions: Mutex::new(state.sessions),
+            limiter: Mutex::new(Limiter::new(Instant::now())),
+        }
+    }
+
     /// The access code for browsers, formatted for reading, such as `K7QM-4ZP2`.
     pub fn access_code(&self) -> String {
         let (first, second) = self.code.split_at(CODE_LENGTH / 2);
@@ -119,6 +139,15 @@ impl Auth {
             .any(|session| bool::from(credential.as_bytes().ct_eq(session.as_bytes())))
             .then_some(Client::Browser)
     }
+}
+
+/// The credentials a Kelpy hands over to the one restarted in its place.
+#[derive(Serialize, Deserialize)]
+pub struct AuthState {
+    code: String,
+    token: String,
+    /// Browser sessions, by their public id.
+    sessions: HashMap<String, String>,
 }
 
 /// HMAC-SHA256 of the challenge, keyed by the session, in hexadecimal.
@@ -325,6 +354,26 @@ mod tests {
         );
         assert_eq!(auth.token().len(), 64);
         assert_ne!(Auth::new().unwrap().token(), auth.token());
+    }
+
+    #[test]
+    fn a_kelpy_taking_over_knows_the_code_the_token_and_the_browsers_signed_in() {
+        let before = Auth::new().unwrap();
+        let signed_in = before
+            .sign_in(&before.access_code(), Instant::now())
+            .unwrap();
+        let state = serde_json::to_string(&before.handed_over()).unwrap();
+        let after = Auth::take_over(serde_json::from_str(&state).unwrap());
+        assert_eq!(after.access_code(), before.access_code());
+        assert_eq!(after.token(), before.token());
+        assert_eq!(
+            after.prove(&signed_in.id, "challenge"),
+            before.prove(&signed_in.id, "challenge")
+        );
+        let mut headers = HeaderMap::new();
+        let bearer = format!("Bearer {}", signed_in.session);
+        headers.insert(header::AUTHORIZATION, bearer.parse().unwrap());
+        assert_eq!(after.client(&headers), Some(Client::Browser));
     }
 
     #[test]

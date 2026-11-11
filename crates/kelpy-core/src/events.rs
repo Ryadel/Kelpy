@@ -63,6 +63,8 @@ pub enum Event {
     ConnectionsChanged,
     /// The provider, or what it needs to answer (a sign-in, a key), changed: the interfaces read it again.
     ProviderChanged,
+    /// Restarting Kelpy as administrator became possible, started, waits, or failed: the interfaces read it again.
+    ElevationChanged,
     /// Some events were missed by a subscriber that fell behind: it reads again everything it shows.
     Resync,
     /// Kelpy is stopping: the last event.
@@ -84,6 +86,7 @@ impl Event {
             Self::FilesChanged => "files_changed",
             Self::ConnectionsChanged => "connections_changed",
             Self::ProviderChanged => "provider_changed",
+            Self::ElevationChanged => "elevation_changed",
             Self::Resync => "resync",
             Self::Stopping => "stopping",
         }
@@ -125,6 +128,12 @@ impl Events {
     pub fn close(&self) {
         self.closed.cancel();
         self.publish(Event::Stopping);
+    }
+
+    /// Ends every subscription without saying Kelpy stops: it restarts in another process, and the interfaces
+    /// connect to it by themselves.
+    pub(crate) fn close_for_restart(&self) {
+        self.closed.cancel();
     }
 }
 

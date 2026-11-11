@@ -24,6 +24,7 @@ pub(crate) fn started() -> App {
     app.provider = ProviderState {
         label: "Ollama (qwen3)".into(),
         problem: None,
+        configured: true,
     };
     app.sessions = ["Harden SSH", "Disk space on /var", "Nginx 502 errors"]
         .into_iter()
@@ -85,12 +86,18 @@ pub(crate) fn working() -> App {
 }
 
 /// `app` drawn on a terminal `width` × `height` columns and rows.
-pub(crate) fn drawn(app: &App, (width, height): (u16, u16), theme: Theme) -> Buffer {
+pub(crate) fn drawn(app: &App, size: (u16, u16), theme: Theme) -> Buffer {
+    drawn_on(app, size, theme, false)
+}
+
+/// `app` drawn as [`drawn`], on a terminal that shows `links` or not.
+fn drawn_on(app: &App, (width, height): (u16, u16), theme: Theme, links: bool) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     let terminal_can = Capabilities {
         theme,
         shift_enter: true,
         inline: false,
+        links,
     };
     terminal
         .draw(|frame| draw(frame, app, &mut Transcript::default(), terminal_can))
@@ -105,6 +112,7 @@ fn drawn_inline(app: &App, width: u16, live: Vec<Line<'static>>) -> Buffer {
         theme: DARK,
         shift_enter: false,
         inline: true,
+        links: false,
     };
     terminal
         .draw(|frame| draw_inline(frame, app, terminal_can, live))
@@ -189,6 +197,42 @@ fn the_start_screen_tells_what_runs_where_and_the_conversations_to_continue() {
     let screen = drawn(&started(), (140, 40), BASIC);
     assert!(!has_kelpie(&screen));
     shows(&screen, &["██    ", "Continue"]);
+}
+
+#[test]
+fn the_web_ui_link_says_how_it_opens_and_is_a_link_where_the_terminal_shows_links() {
+    let click = if cfg!(target_os = "macos") {
+        "Cmd+click"
+    } else {
+        "Ctrl+click"
+    };
+    let mut app = started();
+    // Over SSH: neither a click nor Ctrl+O would reach it.
+    let screen = text(&drawn(&app, (140, 40), DARK));
+    assert!(
+        !screen.contains("opens it") && !screen.contains("Ctrl+O"),
+        "{screen}"
+    );
+    // The classic console: no links, but Ctrl+O, under the link and among the keys.
+    app.opens_links = true;
+    let screen = drawn(&app, (140, 40), DARK);
+    shows(
+        &screen,
+        &[
+            "Web UI  http://127.0.0.1:4321",
+            "        Ctrl+O opens it in the browser",
+            "Ctrl+O open the Web UI",
+        ],
+    );
+    assert!(!text(&screen).contains("\x1b"));
+    // Windows Terminal and most others: a link (OSC 8), followed with a click.
+    let screen = text(&drawn_on(&app, (140, 40), DARK, true));
+    let link = "\x1b]8;;http://127.0.0.1:4321\x1b\\http://127.0.0.1:4321\x1b]8;;\x1b\\";
+    assert!(screen.contains(&format!("Web UI  {link}")), "{screen}");
+    assert!(
+        screen.contains(&format!("        {click} opens it · Ctrl+O too")),
+        "{screen}"
+    );
 }
 
 #[test]
@@ -363,6 +407,7 @@ fn any_size_of_terminal_draws_without_panicking() {
                     theme: DARK,
                     shift_enter: false,
                     inline: true,
+                    links: false,
                 };
                 terminal
                     .draw(|frame| draw_inline(frame, app, terminal_can, vec![Line::raw("live")]))

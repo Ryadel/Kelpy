@@ -8,6 +8,7 @@
 
 mod api;
 mod app;
+mod history;
 mod inline;
 mod mark;
 mod model;
@@ -60,6 +61,8 @@ pub struct Options {
     pub stops_runtime: bool,
     pub screen: Screen,
     pub background: Background,
+    /// Opens a link in this computer's browser, for Ctrl+O; none where there is no browser to open, as over SSH.
+    pub open: Option<fn(&str) -> io::Result<()>>,
 }
 
 /// The terminal's background, as it says, or as the user does where it cannot.
@@ -154,12 +157,31 @@ pub async fn run_local(api: Api, options: Options) -> io::Result<Exit> {
         )?;
     }
     let input = EventStream::new().filter_map(|event| std::future::ready(event.ok()));
+    let ssh = over_ssh();
     let terminal_can = Capabilities {
         theme,
         shift_enter: local.shift_enter,
         inline,
+        // Over SSH the link is the server's own address, which the browser of the computer in front cannot reach.
+        links: !inline && !ssh && shows_links(|name| std::env::var(name).ok()),
+    };
+    let options = Options {
+        open: options.open.filter(|_| !ssh),
+        ..options
     };
     run_on(&mut terminal, input, api, options, terminal_can).await
+}
+
+/// Whether the terminal shows links written as such (OSC 8), told by what it sets in `env`: on Windows, Windows
+/// Terminal and the terminals that name themselves do, the classic console does not; elsewhere all but the Linux
+/// console do.
+fn shows_links(env: impl Fn(&str) -> Option<String>) -> bool {
+    let set = |name| env(name).is_some_and(|value| !value.is_empty());
+    if cfg!(windows) {
+        set("WT_SESSION") || set("TERM_PROGRAM")
+    } else {
+        !matches!(env("TERM").as_deref(), Some("linux" | "dumb") | None)
+    }
 }
 
 /// Whether this process runs in an SSH session: OpenSSH sets these, on Unix and on Windows.
@@ -199,6 +221,8 @@ struct Capabilities {
     shift_enter: bool,
     /// Drawn inline, rather than on the whole screen.
     inline: bool,
+    /// Whether it shows links written as such (OSC 8), followed with Ctrl+click.
+    links: bool,
 }
 
 impl Capabilities {
@@ -302,6 +326,11 @@ pub async fn run_remote<W: Write>(
         inline,
         ..Capabilities::default()
     };
+    // Kelpy's browser is on the server, not in front of the one connected.
+    let options = Options {
+        open: None,
+        ..options
+    };
     let exit = run_on(&mut terminal, events, api, options, terminal_can).await;
     // Best effort: the other end may be gone already.
     let leave = if inline {
@@ -343,10 +372,12 @@ where
 {
     let mut app = App::new(options.banner, options.stops_runtime);
     app.inline = terminal_can.inline;
+    app.opens_links = options.open.is_some();
     app.resize(terminal.size().map_err(io::Error::other)?.width);
     let (updates, mut received) = mpsc::channel(UPDATES);
     let mut runner = Runner {
         api,
+        open: options.open,
         updates,
         tasks: JoinSet::new(),
         following: Arc::default(),
@@ -441,6 +472,7 @@ fn failure(ended: Result<(), JoinError>) -> Option<Update> {
 /// Dropped, it stops them all.
 struct Runner {
     api: Api,
+    open: Option<fn(&str) -> io::Result<()>>,
     updates: mpsc::Sender<Update>,
     tasks: JoinSet<()>,
     /// The conversations whose answer is being followed, so that none is followed twice.
@@ -507,8 +539,20 @@ impl Runner {
                     };
                     // Followed by this stream: the notice of the answer's start must not open a second one.
                     let followed = Followed::start(&following, id);
-                    let answer = api.send(id, &content).await;
-                    forward(answer, id, &updates).await;
+                    match api.send(id, &content).await {
+                        Ok(answer) => forward(Ok(answer), id, &updates).await,
+                        // Refused before an answer began: none will end, so the conversation must not wait for one.
+                        Err(error) => {
+                            let problem = error.to_string();
+                            let _ = updates
+                                .send(Update::NotSent {
+                                    session: id,
+                                    content,
+                                    problem,
+                                })
+                                .await;
+                        }
+                    }
                     drop(followed);
                 });
             }
@@ -518,6 +562,22 @@ impl Runner {
                 approve,
             } => self.spawn_quiet(async move { api.decide(session, action, approve).await }),
             Effect::Cancel(id) => self.spawn_quiet(async move { api.cancel(id).await }),
+            Effect::OpenLink(url) => {
+                let Some(open) = self.open else {
+                    return;
+                };
+                self.tasks.spawn(async move {
+                    // A browser can take its time to start: it does not hold up the screen.
+                    let opened = tokio::task::spawn_blocking(move || open(&url)).await;
+                    let problem = match opened {
+                        Ok(Ok(())) => return,
+                        Ok(Err(error)) => error.to_string(),
+                        Err(error) => error.to_string(),
+                    };
+                    let notice = format!("Could not open the browser: {problem}");
+                    let _ = updates.send(Update::Failed(notice)).await;
+                });
+            }
             Effect::Change { session, change } => self.spawn(async move {
                 Ok(Update::Session(api.update_session(session, &change).await?))
             }),
@@ -645,6 +705,27 @@ mod tests {
         assert!(Background::Ask.theme(Colours::True, None).dark);
         assert!(Background::Dark.theme(Colours::True, Some(solarized)).dark);
         assert!(!Background::Light.theme(Colours::Indexed, None).dark);
+    }
+
+    #[test]
+    fn links_are_written_where_the_terminal_shows_them() {
+        let env = |set: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                set.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        if cfg!(windows) {
+            assert!(shows_links(env(&[("WT_SESSION", "8f2c")])));
+            assert!(shows_links(env(&[("TERM_PROGRAM", "vscode")])));
+            // The classic console sets neither.
+            assert!(!shows_links(env(&[])));
+        } else {
+            assert!(shows_links(env(&[("TERM", "xterm-256color")])));
+            assert!(!shows_links(env(&[("TERM", "linux")])));
+            assert!(!shows_links(env(&[])));
+        }
     }
 
     #[tokio::test]

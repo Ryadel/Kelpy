@@ -2,6 +2,8 @@
 
 mod cleanup;
 mod duration;
+mod elevate;
+mod handover;
 mod platform;
 mod prompt;
 mod runtime;
@@ -93,6 +95,9 @@ enum Command {
     Cleanup,
     /// Install the latest version of Kelpy, after checking its signature.
     Update,
+    /// Takes over from the Kelpy restarting as administrator, through its channel: started by it, not by hand.
+    #[command(hide = true)]
+    Handover { channel: String, from: u32 },
 }
 
 /// Without options, `kelpy provider` asks; with `--service`, it sets the provider without questions.
@@ -194,6 +199,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Some(Command::Cleanup) => cleanup::run(&home, cli.yes),
         Some(Command::Update) => update::command(&home, cli.yes).await,
         Some(Command::Provider(args)) => provider(&home, args).await,
+        Some(Command::Handover { channel, from }) => {
+            runtime::take_over(&home, &channel, from).await
+        }
     }
 }
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import ArrowUpIcon from '@lucide/svelte/icons/arrow-up';
   import LightbulbIcon from '@lucide/svelte/icons/lightbulb';
   import PaperclipIcon from '@lucide/svelte/icons/paperclip';
@@ -7,9 +7,11 @@
   import ShieldCheckIcon from '@lucide/svelte/icons/shield-check';
   import SquareIcon from '@lucide/svelte/icons/square';
   import ModeMenu from './ModeMenu.svelte';
+  import { onFirstLine, onLastLine, PromptHistory } from './history';
   import { describe, uploadFile, type Access, type Approval } from './api';
   import { usable } from './connection.svelte';
   import { runtime } from './runtime.svelte';
+  import { canRestart, restartAsAdministrator } from './elevation.svelte';
   import { ACCESS_OPTIONS, APPROVAL_OPTIONS } from './modes';
 
   interface Props {
@@ -25,6 +27,8 @@
     running?: boolean;
     onSend: () => void;
     onStop?: () => void;
+    /** The messages sent in this conversation, oldest first: Up and Down bring them back. */
+    history?: readonly string[];
   }
 
   let {
@@ -38,6 +42,7 @@
     running = false,
     onSend,
     onStop,
+    history = [],
   }: Props = $props();
 
   let field = $state<HTMLTextAreaElement | null>(null);
@@ -45,6 +50,17 @@
   let uploading = $state(0);
   let dragging = $state(false);
   let uploadError = $state<string | null>(null);
+  const recall = new PromptHistory(() => history);
+  // Another conversation, or a message sent: browsing starts again from the latest. Answers being written change
+  // the messages, not what was sent, so they leave it alone.
+  let sentKey = '';
+  $effect(() => {
+    const key = history.join('\u0000');
+    if (key !== sentKey) {
+      sentKey = key;
+      recall.reset();
+    }
+  });
 
   /** Uploads `files` and writes their paths in the message, for the model to read them there. */
   async function attach(files: FileList | null) {
@@ -83,7 +99,30 @@
       if (!running && usable()) {
         onSend();
       }
+    } else if ((event.key === 'ArrowUp' || event.key === 'ArrowDown') && field) {
+      browse(event, field);
     }
+  }
+
+  /** Up on the box's first line brings back the message sent before; Down on its last line, the next one. */
+  function browse(event: KeyboardEvent, box: HTMLTextAreaElement) {
+    const plain = !(event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing);
+    const at = box.selectionStart;
+    if (!plain || at !== box.selectionEnd) {
+      return;
+    }
+    const up = event.key === 'ArrowUp';
+    if (up ? !onFirstLine(value, at) : !onLastLine(value, at)) {
+      return;
+    }
+    const recalled = up ? recall.back(value) : recall.forward();
+    if (recalled === null) {
+      return;
+    }
+    event.preventDefault();
+    value = recalled;
+    // Then at its end, where typing goes on.
+    void tick().then(() => box.setSelectionRange(recalled.length, recalled.length));
   }
   /** Who Kelpy's actions run as, and what that rules out. */
   const account = $derived.by(() => {
@@ -117,6 +156,7 @@
     bind:this={field}
     bind:value
     onkeydown={onKeydown}
+    oninput={() => recall.reset()}
     rows="1"
     placeholder="Write a message"
     aria-label="Message"
@@ -163,6 +203,9 @@
         value={access}
         options={ACCESS_OPTIONS}
         note={account}
+        noteAction={canRestart()
+          ? { label: 'Restart as administrator', icon: ShieldCheckIcon, onclick: () => void restartAsAdministrator() }
+          : undefined}
         onChange={onAccess}
       />
       <ModeMenu

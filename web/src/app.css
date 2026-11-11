@@ -83,6 +83,9 @@
 @theme static {
   --font-sans: 'Inter', 'Segoe UI Variable Text', 'Segoe UI', system-ui, -apple-system, sans-serif;
   --font-mono: ui-monospace, 'Cascadia Code', 'JetBrains Mono', Menlo, Consolas, monospace;
+  /* The conversation's column, its message box and what shows above it (`max-w-conversation`): wide enough for
+     diffs and commands on one line. */
+  --container-conversation: 72rem;
 }
 
 @theme inline {
@@ -164,4 +167,11 @@
 }
 :root:not(.dark) .mark-glow {
   display: none;
+}
+
+/* The first run's welcome panel: lit in teal from behind the logo. */
+.welcome-panel {
+  background:
+    radial-gradient(120% 70% at 50% 18%, color-mix(in srgb, var(--primary) 16%, transparent), transparent 70%),
+    color-mix(in srgb, var(--background) 60%, var(--popover));
 }

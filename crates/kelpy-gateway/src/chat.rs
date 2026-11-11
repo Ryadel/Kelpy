@@ -4,7 +4,7 @@
 //! |---|---|
 //! | `GET /api/provider`, `PUT /api/provider` | provider settings; the API key is accepted but never returned |
 //! | `POST /api/provider/models` | the models a service offers, for the setup; takes the key being entered |
-//! | `GET /api/sessions`, `POST /api/sessions` | list, create |
+//! | `GET /api/sessions`, `POST /api/sessions` | list (each with whether an answer is being written), create |
 //! | `PATCH /api/sessions/{id}`, `DELETE /api/sessions/{id}` | change the title, explanations, access or approval mode; delete |
 //! | `GET /api/sessions/{id}/messages` | the messages with their actions, and whether an answer is being written |
 //! | `POST /api/sessions/{id}/messages` | send a message; the answer streams back as SSE |
@@ -34,7 +34,7 @@ use kelpy_core::agent::{
     Modes, ProviderUpdate,
 };
 use kelpy_core::providers::ProviderError;
-use kelpy_core::storage::{Message, StoreError};
+use kelpy_core::storage::{Message, Session, StoreError};
 use serde::{Deserialize, Serialize};
 
 use crate::Activity;
@@ -103,9 +103,26 @@ async fn provider_models(
     }
 }
 
+/// A conversation as listed: with whether an answer is being written in it.
+#[derive(Serialize)]
+struct Listed {
+    #[serde(flatten)]
+    session: Session,
+    running: bool,
+}
+
 async fn sessions(State(state): State<ChatState>) -> Response {
     match state.agent.sessions().await {
-        Ok(sessions) => Json(sessions).into_response(),
+        Ok(sessions) => {
+            let listed: Vec<Listed> = sessions
+                .into_iter()
+                .map(|session| Listed {
+                    running: state.agent.is_running(session.id),
+                    session,
+                })
+                .collect();
+            Json(listed).into_response()
+        }
         Err(error) => failure(&error),
     }
 }

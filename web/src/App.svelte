@@ -8,6 +8,8 @@
   import LogOutIcon from '@lucide/svelte/icons/log-out';
   import PanelLeftIcon from '@lucide/svelte/icons/panel-left';
   import PowerIcon from '@lucide/svelte/icons/power';
+  import ShieldCheckIcon from '@lucide/svelte/icons/shield-check';
+  import XIcon from '@lucide/svelte/icons/x';
   import SlidersHorizontalIcon from '@lucide/svelte/icons/sliders-horizontal';
   import SquarePenIcon from '@lucide/svelte/icons/square-pen';
   import SquareTerminalIcon from '@lucide/svelte/icons/square-terminal';
@@ -40,6 +42,7 @@
   import FilesDialog from './lib/FilesDialog.svelte';
   import NewConversation from './lib/NewConversation.svelte';
   import ProviderDialog from './lib/ProviderDialog.svelte';
+  import RestartDialog from './lib/RestartDialog.svelte';
   import SecretsDialog from './lib/SecretsDialog.svelte';
   import Sessions from './lib/Sessions.svelte';
   import SignIn from './lib/SignIn.svelte';
@@ -47,6 +50,7 @@
   import ThemeToggle from './lib/ThemeToggle.svelte';
   import { connection, usable, watchConnection } from './lib/connection.svelte';
   import { kept, merged } from './lib/conversations';
+  import { elevation, justRestarted, refreshElevation } from './lib/elevation.svelte';
   import { runtime } from './lib/runtime.svelte';
   import { watchEvents } from './lib/events';
 
@@ -69,6 +73,8 @@
   /** The outcome of a return from OpenAI's sign-in page, shown by the provider dialog. */
   let afterChatGpt = $state<{ error: string | null } | null>(null);
   let stopOpen = $state(false);
+  /** Shown once after the page reloaded onto the Kelpy restarted as administrator. */
+  let restartedNotice = $state(false);
   let secretsOpen = $state(false);
   let filesOpen = $state(false);
   /** Count the changes Kelpy announced, for the open dialog to read them again. */
@@ -144,6 +150,7 @@
       let fetched: Session[];
       [runtime.status, provider, fetched] = await Promise.all([fetchStatus(), fetchProvider(), fetchSessions()]);
       sessions = merged(sessions, fetched);
+      void refreshElevation();
       connection.resumed += 1;
     } catch (reason: unknown) {
       fail(reason);
@@ -161,6 +168,11 @@
       sessions = merged(sessions, fetched);
       selected ??= sessions[0]?.id ?? null;
       view = { kind: 'ready' };
+      await refreshElevation();
+      if (justRestarted() && elevation.view?.elevated) {
+        restartedNotice = true;
+        setTimeout(() => (restartedNotice = false), 10_000);
+      }
       const callback = takeChatGptReturn();
       if (callback) {
         await finishChatGpt(callback);
@@ -236,6 +248,9 @@
         break;
       case 'resync':
         void catchUp();
+        break;
+      case 'elevation_changed':
+        void refreshElevation();
         break;
       case 'stopping':
         view = { kind: 'stopped' };
@@ -505,7 +520,7 @@
       </header>
 
       {#if !usable()}
-        <div class="mx-auto w-full max-w-3xl px-4 pb-2">
+        <div class="mx-auto w-full max-w-conversation px-4 pb-2">
           <Alert.Root variant="destructive">
             <Alert.Description>
               {#if connection.reachable}
@@ -542,6 +557,29 @@
   <SecretsDialog bind:open={secretsOpen} {sessions} changes={secretsChanges} />
   <FilesDialog bind:open={filesOpen} changes={filesChanges} />
   <ConnectionDialog changes={connectionsChanges} />
+  <RestartDialog />
+  {#if restartedNotice}
+    <div
+      role="status"
+      class="bg-popover fixed right-4 bottom-4 z-50 flex max-w-sm gap-3 rounded-xl border p-4 shadow-lg"
+    >
+      <ShieldCheckIcon class="text-primary mt-0.5 size-5 shrink-0" />
+      <div>
+        <p class="font-medium">Kelpy runs as administrator</p>
+        <p class="text-muted-foreground mt-1 text-sm">
+          Restarted with your consent. Conversations, keys and secrets are as before.
+        </p>
+      </div>
+      <button
+        type="button"
+        aria-label="Close"
+        onclick={() => (restartedNotice = false)}
+        class="text-muted-foreground hover:bg-muted hover:text-foreground -mt-1 -mr-1 inline-flex size-7 shrink-0 items-center justify-center rounded-md"
+      >
+        <XIcon class="size-4" />
+      </button>
+    </div>
+  {/if}
   <Dialog.Root bind:open={sessionsOpen}>
     <Dialog.Content class="bg-sidebar flex h-[80dvh] flex-col gap-0 p-0">
       <Dialog.Title class="sr-only">Conversations</Dialog.Title>

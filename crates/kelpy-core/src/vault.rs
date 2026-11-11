@@ -159,6 +159,16 @@ struct Guarded {
     locks: u64,
 }
 
+/// What [`Vault::handed_over`] gives, as one consistent copy.
+pub(crate) struct HandedOver {
+    /// Every value masked.
+    pub masked: BTreeSet<String>,
+    /// The administrator's secrets by name, not kept in the vault.
+    pub shared: BTreeMap<String, String>,
+    /// The vault's key, while it is unlocked.
+    pub key: Option<Zeroizing<Vec<u8>>>,
+}
+
 /// Secrets by name, their values wiped when dropped.
 type Plain = BTreeMap<String, Zeroizing<String>>;
 
@@ -308,6 +318,36 @@ impl Vault {
     /// Locks the vault, cancelling an unlock under way: its secrets leave the administrator's, but stay masked.
     pub fn lock(&self) {
         self.inner.lock();
+    }
+
+    /// The administrator's secrets for the Kelpy restarted in this one's place, read at once under the vault's state,
+    /// which a lock changes together with the registry: the values masked; the secrets by name, but for those kept
+    /// in the vault, which come back only by opening it; and, while it is unlocked, the key that opens it.
+    pub(crate) fn handed_over(&self) -> HandedOver {
+        let guarded = self.inner.guarded();
+        let (masked, mut shared) = self.inner.registry.handed_over();
+        let key = match &guarded.state {
+            State::Open { key, kept, .. } => {
+                for name in kept {
+                    shared.remove(name);
+                }
+                Some(Zeroizing::new(key.to_vec()))
+            }
+            _ => None,
+        };
+        HandedOver {
+            masked,
+            shared,
+            key,
+        }
+    }
+
+    /// Unlocks the vault with the key the Kelpy before this one handed over: its secrets join the administrator's.
+    pub(crate) async fn take_over(&self, key: &[u8]) -> Result<(), VaultError> {
+        let key: [u8; KEY_LENGTH] = key
+            .try_into()
+            .map_err(|_| VaultError::Damaged("the key handed over is not a vault key"))?;
+        self.inner.take_over(Zeroizing::new(key)).await
     }
 
     /// Adds the administrator's secret `name`, kept in the vault if `keep`, or else until Kelpy stops.
@@ -490,6 +530,26 @@ impl Inner {
         if guarded.locks != locks {
             return Err(VaultError::Cancelled);
         }
+        let kept = secrets.keys().cloned().collect();
+        for (name, mut value) in secrets {
+            self.registry.set(&name, std::mem::take(&mut *value));
+        }
+        guarded.state = State::Open { sealed, key, kept };
+        drop(guarded);
+        self.events.publish(Event::SecretsChanged);
+        Ok(())
+    }
+
+    async fn take_over(&self, key: Zeroizing<[u8; KEY_LENGTH]>) -> Result<(), VaultError> {
+        let _change = self.changes.lock().await;
+        let mut guarded = self.guarded();
+        let sealed = match &guarded.state {
+            State::Locked(sealed) => sealed.clone(),
+            State::Open { .. } => return Ok(()),
+            State::None => return Err(VaultError::Missing),
+            State::Unreadable(problem) => return Err(VaultError::Unreadable(problem.clone())),
+        };
+        let secrets = decrypt_secrets(&sealed, &key)?;
         let kept = secrets.keys().cloned().collect();
         for (name, mut value) in secrets {
             self.registry.set(&name, std::mem::take(&mut *value));
@@ -1018,6 +1078,48 @@ mod tests {
             Events::new(),
         );
         (vault, registry)
+    }
+
+    #[tokio::test]
+    async fn what_is_handed_over_never_turns_a_kept_secret_into_one_not_kept() {
+        let folder = tempfile::tempdir().unwrap();
+        let (vault, _) = vault(&folder);
+        vault
+            .create(passphrase("correct horse battery"))
+            .await
+            .unwrap();
+        vault
+            .add("smtp", Zeroizing::new("smtp-password".into()), true)
+            .await
+            .unwrap();
+        vault
+            .add("api", Zeroizing::new("until-kelpy-stops".into()), false)
+            .await
+            .unwrap();
+        let key = vault.handed_over().key.unwrap();
+        for _ in 0..3000 {
+            vault.take_over(&key).await.unwrap();
+            // Copies taken while another thread locks the vault: each one is all before the lock, or all after.
+            std::thread::scope(|threads| {
+                let copying = threads.spawn(|| {
+                    loop {
+                        let copy = vault.handed_over();
+                        assert!(
+                            !copy.shared.contains_key("smtp"),
+                            "a kept secret handed over as not kept"
+                        );
+                        assert!(copy.shared.contains_key("api"));
+                        assert!(copy.masked.contains("smtp-password"));
+                        if copy.key.is_none() {
+                            break;
+                        }
+                    }
+                });
+                std::thread::yield_now();
+                vault.lock();
+                copying.join().unwrap();
+            });
+        }
     }
 
     #[tokio::test]

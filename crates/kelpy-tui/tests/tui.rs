@@ -57,6 +57,11 @@ async fn runtime(pieces: &'static [&'static str]) -> (Api, Arc<Agent>) {
         Arc::clone(&auth),
         Arc::clone(&agent),
         Arc::new(StopRequest::new()),
+        Arc::new(kelpy_gateway::Elevation::new(
+            false,
+            None,
+            Arc::clone(&agent),
+        )),
     );
     tokio::spawn(kelpy_gateway::serve(
         listener,
@@ -111,6 +116,7 @@ async fn inline_the_conversation_goes_into_the_terminals_history_and_the_footer_
         stops_runtime: false,
         screen: Screen::Inline,
         background: Background::Dark,
+        open: None,
     };
     let exit = kelpy_tui::run(
         &mut terminal,
@@ -158,6 +164,7 @@ async fn a_message_typed_in_the_terminal_ui_is_answered_there_and_saved() {
         stops_runtime: true,
         screen: Screen::Full,
         background: Background::Dark,
+        open: None,
     };
     let exit = kelpy_tui::run(
         &mut terminal,
@@ -193,6 +200,7 @@ async fn a_conversation_from_another_interface_shows_and_kelpy_stopping_ends_the
         stops_runtime: false,
         screen: Screen::Full,
         background: Background::Dark,
+        open: None,
     };
     let other = Arc::clone(&agent);
     tokio::spawn(async move {

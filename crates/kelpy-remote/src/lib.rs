@@ -641,6 +641,8 @@ async fn terminal_ui(
             // Inline: what is said stays in the history of the terminal that connects.
             screen: Screen::Auto,
             background: Background::Ask,
+            // The browser to open would be the server's.
+            open: None,
         };
         let frames = Frames {
             output: Arc::clone(&output),

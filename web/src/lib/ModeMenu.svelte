@@ -21,11 +21,13 @@
     options: Option[];
     /** Shown under the options, such as what the choice depends on. */
     note?: string;
+    /** A button under the note, such as restarting Kelpy as administrator. */
+    noteAction?: { label: string; icon: Component; onclick: () => void };
     disabled?: boolean;
     onChange: (value: T) => void;
   }
 
-  let { label, title, icon: Icon, value, options, note, disabled = false, onChange }: Props = $props();
+  let { label, title, icon: Icon, value, options, note, noteAction, disabled = false, onChange }: Props = $props();
 
   const current = $derived(options.find((option) => option.value === value));
 </script>
@@ -50,7 +52,7 @@
     <DropdownMenu.Label class="text-muted-foreground px-2.5 text-xs font-normal">{label}</DropdownMenu.Label>
     <DropdownMenu.RadioGroup {value} onValueChange={(chosen) => onChange(chosen as T)}>
       {#each options as option (option.value)}
-        <DropdownMenu.RadioItem value={option.value} disabled={option.disabled} class="items-start py-2">
+        <DropdownMenu.RadioItem value={option.value} disabled={option.disabled} closeOnSelect class="items-start py-2">
           <div class="grid gap-0.5">
             <span class="font-medium">{option.name}</span>
             <span class="text-muted-foreground text-xs leading-snug">{option.description}</span>
@@ -61,6 +63,16 @@
     {#if note}
       <DropdownMenu.Separator />
       <p class="text-muted-foreground px-2.5 py-1.5 text-xs leading-snug">{note}</p>
+      {#if noteAction}
+        {@const ActionIcon = noteAction.icon}
+        <DropdownMenu.Item
+          onSelect={noteAction.onclick}
+          class="bg-primary text-primary-foreground data-highlighted:bg-primary/90 data-highlighted:text-primary-foreground mx-1 mb-1 justify-center font-medium"
+        >
+          <ActionIcon class="size-4" />
+          {noteAction.label}
+        </DropdownMenu.Item>
+      {/if}
     {/if}
   </DropdownMenu.Content>
 </DropdownMenu.Root>

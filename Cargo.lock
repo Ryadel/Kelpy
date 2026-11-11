@@ -1793,6 +1793,7 @@ version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
+ "chrono",
  "clap",
  "dirs",
  "futures-util",

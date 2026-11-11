@@ -4,6 +4,7 @@ pub mod agent;
 pub mod chatgpt;
 pub mod config;
 pub mod connections;
+pub mod environment;
 pub mod events;
 pub mod files;
 pub mod home;

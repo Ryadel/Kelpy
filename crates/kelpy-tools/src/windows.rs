@@ -139,8 +139,8 @@ IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { 'NOT-ADMIN';
 fn not_admin(text: &str) -> Option<ToolError> {
     text.lines().any(|line| line.trim() == "NOT-ADMIN").then(|| {
         invalid(
-            "Windows lets only administrators change its features and IIS: say that Kelpy must be started from a \
-             terminal opened as administrator",
+            "Windows lets only administrators change its features and IIS: say that Kelpy must run as \
+             administrator, with Restart as administrator in the System access menu",
         )
     })
 }

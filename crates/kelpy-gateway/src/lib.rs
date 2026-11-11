@@ -9,6 +9,7 @@ mod auth;
 mod chat;
 mod chatgpt;
 mod connections;
+mod elevation;
 mod events;
 mod files;
 mod ollama;
@@ -17,9 +18,11 @@ mod security;
 mod stop;
 
 pub use activity::{Activity, Busy};
-pub use auth::Auth;
+pub use auth::{Auth, AuthState};
+pub use elevation::{Elevation, ElevationView, How, Step as ElevationStep};
 pub use kelpy_core::agent::Agent;
 pub use stop::StopRequest;
+pub use tokio_util::sync::CancellationToken;
 
 use std::future::Future;
 use std::io;
@@ -115,6 +118,7 @@ pub fn router(
     auth: Arc<Auth>,
     agent: Arc<Agent>,
     stop: Arc<StopRequest>,
+    elevation: Arc<Elevation>,
 ) -> Router {
     let allowed = Arc::new(security::AllowedHosts::for_port(port));
     let chatgpt = chatgpt::ChatGptState {
@@ -144,6 +148,7 @@ pub fn router(
         .merge(chatgpt::routes().with_state(chatgpt))
         .merge(ollama::routes().with_state(ollama))
         .merge(stop::routes().with_state(stop))
+        .merge(elevation::routes().with_state(elevation))
         // Layers run outermost-last: foreign and unauthenticated requests are rejected before they count as
         // activity.
         .layer(middleware::from_fn_with_state(activity, activity::track))

@@ -22,10 +22,11 @@ use kelpy_core::private_file;
 use kelpy_core::providers::chatgpt::Endpoints;
 use kelpy_core::storage::Store;
 use kelpy_core::vault::VaultState;
-use kelpy_gateway::{Activity, Auth, RuntimeStatus, StopRequest};
+use kelpy_gateway::{Activity, Auth, Elevation, ElevationStep, How, RuntimeStatus, StopRequest};
 use serde::{Deserialize, Serialize};
 
-use crate::{duration, platform, prompt, wizard};
+use crate::handover::{self, Channel, Handover, Message};
+use crate::{duration, elevate, platform, prompt, wizard};
 use kelpy_client::Client;
 
 const LOCK_FILE: &str = "runtime.lock";
@@ -155,7 +156,7 @@ pub struct TerminalUi {
 }
 
 /// Kelpy's SSH server, as asked with `--ssh`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Ssh {
     /// The port; 0 lets the system choose.
     pub port: u16,
@@ -167,27 +168,157 @@ pub struct Ssh {
 /// limit was given.
 pub const EXPOSED_IDLE: Duration = Duration::from_secs(60 * 60);
 
+/// How long the new Kelpy has to connect and say hello once the system's prompt was answered, and to say it is
+/// ready once handed over.
+const HANDOVER_WAIT: Duration = Duration::from_secs(30);
+/// How long the new Kelpy takes to start once handed over, at most: less than [`HANDOVER_WAIT`], so that the one
+/// before still listens when told, and both agree on whether the restart happened.
+const TAKING_OVER_WAIT: Duration = Duration::from_secs(25);
+/// How long the new Kelpy waits for the state once it said hello: the Kelpy before stops first, its answers and
+/// connections given `SHUTDOWN_GRACE`, its SSH sessions `SSH_GRACE`.
+const STOPPING_WAIT: Duration =
+    Duration::from_secs(SHUTDOWN_GRACE.as_secs() + SSH_GRACE.as_secs() + 15);
+/// How long a Kelpy taking over waits for the one before to let go of the lock and the port.
+const RELEASE_WAIT: Duration = Duration::from_secs(10);
+
 /// Runs the runtime and the Web server in the foreground until Ctrl+C, the end of the terminal session, the terminal
 /// UI closed, or one of the `limits`. In every case new work is refused at once, and work in progress gets
 /// `SHUTDOWN_GRACE` to finish.
+///
+/// Asked from an interface, Kelpy restarts as administrator: a new process takes over on the same port, and this
+/// one stops.
 pub async fn run_foreground(home: &Home, launch: Launch, limits: Limits) -> Result<ExitCode> {
     platform::remove_leftovers(&home.root().join(home::executable_name()), &home.data_dir());
-    let config = Config::load(&home.config_path())?;
-
     let Some(lock) = RuntimeLock::try_acquire(home)? else {
-        match read_info(home) {
-            Ok(Some(info)) => {
-                println!("Kelpy is already running: {}", info.url);
-                if launch.open_browser {
-                    open_url(&info.sign_in_url());
-                }
-            }
-            // The lock without runtime.json: a runtime still starting, or an update in progress.
-            Ok(None) => println!("Kelpy is already running or being updated."),
-            Err(error) => println!("Kelpy is already running. {}", unreadable(&error)),
-        }
-        return Ok(ExitCode::SUCCESS);
+        return already_running(home, &launch).await;
     };
+    let start = Start {
+        lock,
+        handover: None,
+        ready: None,
+    };
+    serve(home, &launch, limits, start).await
+}
+
+/// The Kelpy restarted as administrator, started by the one before with the name of its channel and its PID: takes
+/// over what it hands over, then runs in its place, without a window, until stopped. Each step has a deadline: past
+/// it, this Kelpy gives up and exits.
+pub async fn take_over(home: &Home, channel: &str, from: u32) -> Result<ExitCode> {
+    use tokio::time::Instant;
+    let mut channel = handover::connect(channel, from, Instant::now() + HANDOVER_WAIT)
+        .await
+        .context("cannot reach the Kelpy to take over from")?;
+    channel
+        .send(&Message::Hello {
+            version: VERSION.to_owned(),
+            pid: std::process::id(),
+        })
+        .await?;
+    channel.until(Instant::now() + STOPPING_WAIT);
+    let handover = match channel.receive().await? {
+        Message::State(handover) => handover,
+        // Cancelled meanwhile: the Kelpy before goes on.
+        Message::Refused(_) => return Ok(ExitCode::SUCCESS),
+        _ => anyhow::bail!("the Kelpy before sent something unexpected"),
+    };
+    let starting = Instant::now() + TAKING_OVER_WAIT;
+    // Told within the time the Kelpy before still listens.
+    channel.until(Instant::now() + HANDOVER_WAIT);
+    kelpy_core::environment::take_over(handover.environment.clone());
+    let lock = match wait_for_lock(home).await {
+        Ok(lock) => lock,
+        Err(error) => {
+            let _ = channel.send(&Message::Failed(format!("{error:#}"))).await;
+            return Err(error);
+        }
+    };
+    let launch = Launch {
+        ssh: handover.ssh.clone(),
+        ..Launch::default()
+    };
+    let (ready, told) = tokio::sync::oneshot::channel();
+    let start = Start {
+        lock,
+        handover: Some(handover),
+        ready: Some(ready),
+    };
+    let serving = serve(home, &launch, Limits::default(), start);
+    tokio::pin!(serving);
+    tokio::select! {
+        told = told => {
+            let message = match told {
+                Ok(Ok(())) => Message::Ready,
+                Ok(Err(reason)) => Message::Failed(reason),
+                Err(_) => Message::Failed("it stopped while starting".into()),
+            };
+            channel.send(&message).await?;
+        }
+        served = &mut serving => {
+            let reason = match &served {
+                Ok(_) => "it stopped while starting".to_owned(),
+                Err(error) => format!("{error:#}"),
+            };
+            let _ = channel.send(&Message::Failed(reason)).await;
+            served?;
+            return Ok(ExitCode::FAILURE);
+        }
+        () = tokio::time::sleep_until(starting) => {
+            let reason = format!("it did not start within {}", duration::format(TAKING_OVER_WAIT));
+            let _ = channel.send(&Message::Failed(reason)).await;
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+    serving.await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// How a runtime starts.
+struct Start {
+    lock: RuntimeLock,
+    /// What the Kelpy before handed over: this one goes on with it.
+    handover: Option<Box<Handover>>,
+    /// Told once the runtime serves, or why it could not start.
+    ready: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
+}
+
+/// Why the runtime's loop ended.
+enum Ending {
+    Stop(Option<String>),
+    HandOver(Prepared),
+}
+
+/// A Kelpy restarted as administrator, connected, waiting for the state.
+struct Prepared {
+    channel: Channel<handover::Stream>,
+    pid: u32,
+}
+
+/// What `result`'s error says, to `ready` too: the Kelpy before learns why this one could not start.
+fn told<T>(
+    ready: &mut Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
+    result: Result<T>,
+) -> Result<T> {
+    if let Err(error) = &result
+        && let Some(ready) = ready.take()
+    {
+        let _ = ready.send(Err(format!("{error:#}")));
+    }
+    result
+}
+
+/// Runs one runtime in this process: fresh, or going on with what the Kelpy before handed over.
+async fn serve(home: &Home, launch: &Launch, limits: Limits, start: Start) -> Result<ExitCode> {
+    let Start {
+        lock,
+        handover,
+        mut ready,
+    } = start;
+    let config = told(
+        &mut ready,
+        Config::load(&home.config_path()).map_err(Into::into),
+    )?;
+    let handover = handover.map(|handover| *handover);
+    let first = handover.is_none();
 
     // The data folder holds the conversations and the runtime's credentials.
     if let Err(error) = private_file::restrict_dir(&home.data_dir()) {
@@ -196,14 +327,47 @@ pub async fn run_foreground(home: &Home, launch: Launch, limits: Limits) -> Resu
             home.data_dir().display()
         );
     }
-    let store = Store::open(&home.data_dir().join(DATABASE_FILE))
-        .context("cannot open the conversation database")?;
-    let agent = Arc::new(Agent::new(
-        home,
-        store,
-        config.provider.clone(),
-        Endpoints::default(),
+    let store = told(
+        &mut ready,
+        Store::open(&home.data_dir().join(DATABASE_FILE))
+            .context("cannot open the conversation database"),
+    )?;
+    let agent = Arc::new(told(
+        &mut ready,
+        Agent::new(home, store, config.provider.clone(), Endpoints::default()).map_err(Into::into),
     )?);
+    let (auth, port, started_at, limits, ssh) = match handover {
+        Some(handover) => {
+            for problem in agent.take_over(handover.agent).await {
+                tracing::warn!("restarted as administrator: {problem}");
+            }
+            let now = unix_now();
+            let limits = Limits {
+                after: handover.stops_at.map(|at| {
+                    Duration::from_secs(u64::try_from(at.saturating_sub(now)).unwrap_or(0))
+                }),
+                idle: handover.idle_limit.map(Duration::from_secs),
+            };
+            (
+                Auth::take_over(handover.auth),
+                Some(handover.port),
+                handover.started_at,
+                limits,
+                handover.ssh,
+            )
+        }
+        None => (
+            told(
+                &mut ready,
+                Auth::new().context("cannot create the access code"),
+            )?,
+            None,
+            unix_now(),
+            limits,
+            launch.ssh.clone(),
+        ),
+    };
+    let auth = Arc::new(auth);
     // What Kelpy left on the server, checked against what is there: the differences wait in the Web UI.
     tokio::spawn({
         let agent = Arc::clone(&agent);
@@ -217,14 +381,19 @@ pub async fn run_foreground(home: &Home, launch: Launch, limits: Limits) -> Resu
         .ok()
         .and_then(|text| text.trim().parse::<u16>().ok())
         .filter(|&port| port != 0 && config.server.port == 0);
-    let listener = kelpy_gateway::bind(config.server.host, config.server.port, last_port)
-        .await
-        .context("cannot start the local server")?;
+    let listener = match port {
+        // The same port as before: the pages open there reconnect by themselves.
+        Some(port) => told(&mut ready, bind_released(config.server.host, port).await)?,
+        None => told(
+            &mut ready,
+            kelpy_gateway::bind(config.server.host, config.server.port, last_port)
+                .await
+                .context("cannot start the local server"),
+        )?,
+    };
     let address = listener.local_addr()?;
     // Best effort: without it, the next start only gets a port of the operating system's choice.
     let _ = fs::write(&last_port_path, address.port().to_string());
-    let auth = Arc::new(Auth::new().context("cannot create the access code")?);
-    let started_at = unix_now();
     let info = RuntimeInfo {
         pid: std::process::id(),
         port: address.port(),
@@ -232,16 +401,16 @@ pub async fn run_foreground(home: &Home, launch: Launch, limits: Limits) -> Resu
         version: VERSION.to_owned(),
         started_at,
         stops_at: limits.after.map(|limit| {
-            started_at.saturating_add(i64::try_from(limit.as_secs()).unwrap_or(i64::MAX))
+            unix_now().saturating_add(i64::try_from(limit.as_secs()).unwrap_or(i64::MAX))
         }),
         idle_limit: limits.idle.map(|limit| limit.as_secs()),
         access_code: auth.access_code(),
         token: auth.token().to_owned(),
     };
-    lock.announce(&info)?;
+    told(&mut ready, lock.announce(&info))?;
 
     // Kelpy's own SSH server, until Kelpy stops.
-    let remote = match &launch.ssh {
+    let remote = match &ssh {
         None => None,
         Some(ssh) => {
             agent.connections().allow_keys(ssh.allowed_keys.clone());
@@ -263,14 +432,268 @@ pub async fn run_foreground(home: &Home, launch: Launch, limits: Limits) -> Resu
                 ),
                 connections: Arc::clone(agent.connections()),
             };
-            Some(
+            Some(told(
+                &mut ready,
                 kelpy_remote::start(options)
                     .await
-                    .context("cannot start Kelpy's SSH server")?,
-            )
+                    .context("cannot start Kelpy's SSH server"),
+            )?)
         }
     };
-    let reachable = remote.as_ref().map(|remote| {
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Ok(()));
+    }
+    let mut banner = None;
+    if first {
+        banner = introduce(
+            home,
+            launch,
+            limits,
+            &agent,
+            &info,
+            remote.as_ref(),
+            last_port,
+        )
+        .await?;
+        if config.provider.is_none() && !launch.terminal_ui && prompt::interactive() {
+            let client = Client::new(info.url.clone(), info.token.clone())?;
+            // A thread of its own, not a task: the questions block on the terminal, and an unanswered one must not
+            // keep Kelpy from exiting.
+            thread::spawn(move || {
+                if let Err(error) = wizard::offer(client) {
+                    println!("Setup not completed: {error:#}");
+                }
+            });
+        }
+    }
+
+    let elevated = agent.account().elevated;
+    let elevation = Arc::new(Elevation::new(
+        elevated,
+        how_to_elevate(),
+        Arc::clone(&agent),
+    ));
+    let status = RuntimeStatus {
+        version: VERSION.to_owned(),
+        pid: std::process::id(),
+        home: home.root().to_path_buf(),
+        started_at,
+        account: agent.account().label(),
+        account_limits: agent.account().limits().map(str::to_owned),
+    };
+    let activity = Arc::new(Activity::new());
+    let stop_request = Arc::new(StopRequest::new());
+    let router = kelpy_gateway::router(
+        status,
+        address.port(),
+        Arc::clone(&activity),
+        Arc::clone(&auth),
+        Arc::clone(&agent),
+        Arc::clone(&stop_request),
+        Arc::clone(&elevation),
+    );
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = kelpy_gateway::serve(listener, router, async {
+        // Either a stop was sent or the sender is gone with the runtime: both mean stop.
+        let _ = stopped.await;
+    });
+    tokio::pin!(server);
+    let shutdown = shutdown_signal(limits, activity, stop_request);
+    tokio::pin!(shutdown);
+    // The terminal UI, when shown: quitting it stops Kelpy. Dropped when Kelpy stops otherwise, it gives the
+    // terminal back first, so that what follows prints on it.
+    let terminal_ui = async {
+        let Some(banner) = banner else {
+            return std::future::pending().await;
+        };
+        let api = kelpy_tui::Api::new(info.url.clone(), info.token.clone())?;
+        let options = kelpy_tui::Options {
+            banner,
+            stops_runtime: true,
+            screen: launch.terminal.screen,
+            background: launch.terminal.background,
+            open: browser(),
+        };
+        kelpy_tui::run_local(api, options)
+            .await
+            .context("the terminal UI failed")
+    };
+    let mut terminal_ui = Box::pin(terminal_ui);
+    let mut preparing: Option<tokio::task::JoinHandle<std::result::Result<Prepared, String>>> =
+        None;
+    let ending = loop {
+        tokio::select! {
+            result = &mut server => {
+                result.context("the local server failed")?;
+                break Ending::Stop(None);
+            }
+            reason = &mut shutdown => break Ending::Stop(Some(reason)),
+            exit = &mut terminal_ui => break Ending::Stop(Some(match exit {
+                Ok(kelpy_tui::Exit::Quit) => "the terminal UI was closed".to_owned(),
+                Ok(kelpy_tui::Exit::Stopped) => "requested from another interface".to_owned(),
+                Err(error) => format!("{error:#}"),
+            })),
+            cancel = elevation.requested(), if preparing.is_none() => {
+                preparing = Some(tokio::spawn(prepare(home.clone(), launch.terminal_ui, cancel)));
+            }
+            prepared = async { preparing.as_mut().expect("guarded").await }, if preparing.is_some() => {
+                preparing = None;
+                match prepared {
+                    Ok(Ok(prepared)) => break Ending::HandOver(prepared),
+                    Ok(Err(reason)) => elevation.set(ElevationStep::Failed { reason }),
+                    Err(error) => elevation.set(ElevationStep::Failed { reason: error.to_string() }),
+                }
+            }
+        }
+    };
+
+    let prepared = match ending {
+        Ending::Stop(reason) => {
+            if let Some(reason) = reason {
+                stop_now(&agent, &reason, stop, &mut server).await?;
+            }
+            // The SSH sessions end before the lock goes: nothing reaches Kelpy once it says it stopped.
+            if let Some(remote) = remote
+                && !remote.stop(SSH_GRACE).await
+            {
+                println!(
+                    "Some SSH sessions did not close within {}; closing them.",
+                    duration::format(SSH_GRACE)
+                );
+            }
+            drop(lock);
+            #[cfg(unix)]
+            if elevated {
+                elevate::give_back(home.root());
+            }
+            println!("Kelpy stopped.");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Ending::HandOver(prepared) => prepared,
+    };
+
+    // Restarting as administrator: this runtime stops without telling the interfaces, which reconnect to the new
+    // one, and without ending the ChatGPT session, which the new one goes on with. The terminal UI closes first.
+    elevation.set(ElevationStep::Restarting);
+    drop(terminal_ui);
+    println!();
+    println!("Restarting Kelpy as administrator.");
+    let Prepared { mut channel, pid } = prepared;
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+    let answers_saved = agent.stop_for_restart(SHUTDOWN_GRACE);
+    let _ = stop.send(());
+    answers_saved.await;
+    let _ = tokio::time::timeout_at(deadline, &mut server).await;
+    if let Some(remote) = remote {
+        remote.stop(SSH_GRACE).await;
+    }
+    agent.close(deadline).await;
+    let handover = Handover {
+        auth: auth.handed_over(),
+        agent: agent.handed_over(),
+        environment: kelpy_core::environment::handed_over(),
+        port: address.port(),
+        started_at,
+        stops_at: info.stops_at,
+        idle_limit: info.idle_limit,
+        ssh,
+    };
+    let sent = serde_json::to_vec(&handover)?;
+    drop(handover);
+    drop(lock);
+    channel.until(tokio::time::Instant::now() + HANDOVER_WAIT);
+    let outcome = match channel.send_state(&sent).await {
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+            Err("it did not take the state in time".to_owned())
+        }
+        Err(error) => Err(format!("it stopped answering ({error})")),
+        Ok(()) => match channel.receive().await {
+            Ok(Message::Ready) => Ok(()),
+            Ok(Message::Failed(reason)) => Err(format!("it could not start: {reason}")),
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                Err("it did not start in time".to_owned())
+            }
+            _ => Err("it stopped".to_owned()),
+        },
+    };
+    match outcome {
+        Ok(()) => {
+            println!(
+                "Kelpy runs as administrator (PID {pid}), without a window, at the same address: the Web UI reloads \
+                 by itself. `kelpy tui` opens the terminal UI, `kelpy stop` stops it."
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(reason) => {
+            println!(
+                "The Kelpy restarted as administrator did not take over: {reason}. Start Kelpy again."
+            );
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Stops this runtime for `reason`, as Kelpy always stops: answers stopped and kept as interrupted, connections
+/// given `SHUTDOWN_GRACE`, the ChatGPT session ended, then the work in the background and the database.
+async fn stop_now(
+    agent: &Agent,
+    reason: &str,
+    stop: tokio::sync::oneshot::Sender<()>,
+    server: &mut std::pin::Pin<&mut impl Future<Output = io::Result<()>>>,
+) -> Result<()> {
+    println!();
+    println!("Stopping Kelpy: {reason}.");
+    // Access ends at once: no new answers, then no new connections or requests. Answers being written are stopped
+    // and saved as interrupted; open connections, such as answer streams, get a bounded time to close.
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+    let answers_saved = agent.stop_all(SHUTDOWN_GRACE);
+    // Fails only if the server already ended on its own, which is just as stopped.
+    let _ = stop.send(());
+    if !answers_saved.await {
+        println!("Some answers could not be saved in time.");
+    }
+    // Access ends with the session: the ChatGPT tokens are revoked within the same grace, unless the user chose to
+    // save the sign-in on this computer.
+    if !agent.chatgpt().close(deadline).await {
+        println!(
+            "OpenAI did not confirm that the ChatGPT session was revoked; it ends on its own within 30 days."
+        );
+    }
+    match tokio::time::timeout_at(deadline, server.as_mut()).await {
+        Ok(result) => result.context("the local server failed")?,
+        Err(_) => println!(
+            "Some connections did not close within {}; closing them.",
+            duration::format(SHUTDOWN_GRACE)
+        ),
+    }
+    // Last, the work in the background and the database, which the steps above may still have used.
+    if !agent.close(deadline).await {
+        println!(
+            "Some work in the background did not end within {}; stopping it.",
+            duration::format(SHUTDOWN_GRACE)
+        );
+    }
+    Ok(())
+}
+
+/// Says where Kelpy runs, at its first start in this process: on the terminal UI's start screen, or as lines in the
+/// console; then opens the browser if asked.
+#[allow(clippy::too_many_arguments)]
+async fn introduce(
+    home: &Home,
+    launch: &Launch,
+    limits: Limits,
+    agent: &Agent,
+    info: &RuntimeInfo,
+    remote: Option<&kelpy_remote::Remote>,
+    last_port: Option<u16>,
+) -> Result<Option<kelpy_tui::Banner>> {
+    let address: SocketAddr = info
+        .url
+        .trim_start_matches("http://")
+        .parse()
+        .context("unexpected local address")?;
+    let reachable = remote.map(|remote| {
         format!(
             "port {}, host key {}: `ssh -p {} {}@<this server>`; each connection waits for your approval here or in the \
              Web UI",
@@ -280,7 +703,7 @@ pub async fn run_foreground(home: &Home, launch: Launch, limits: Limits) -> Resu
             login_name().as_deref().unwrap_or("you")
         )
     });
-    let vault = describe_vault(&agent).await;
+    let vault = describe_vault(agent).await;
     let moved = last_port.filter(|&last| last != address.port()).map(|last| {
         format!("Port {last} of the last start was not available: open the new link, and set up an SSH tunnel again.")
     });
@@ -329,7 +752,7 @@ pub async fn run_foreground(home: &Home, launch: Launch, limits: Limits) -> Resu
             info.access_code
         );
         println!("Home:     {}", home.root().display());
-        println!("Provider: {}", describe_provider(&agent));
+        println!("Provider: {}", describe_provider(agent));
         println!("Account:  {}", agent.account().label());
         if let Some(limits) = agent.account().limits() {
             println!("          {limits}");
@@ -361,118 +784,146 @@ pub async fn run_foreground(home: &Home, launch: Launch, limits: Limits) -> Resu
     if launch.open_browser {
         open_url(&info.sign_in_url());
     }
-    if config.provider.is_none() && banner.is_none() && prompt::interactive() {
-        let client = Client::new(info.url.clone(), info.token.clone())?;
-        // A thread of its own, not a task: the questions block on the terminal, and an unanswered one must not keep
-        // Kelpy from exiting.
-        thread::spawn(move || {
-            if let Err(error) = wizard::offer(client) {
-                println!("Setup not completed: {error:#}");
+    Ok(banner)
+}
+
+/// How this Kelpy can restart with administrator rights: User Account Control on Windows, where its prompt shows on
+/// this computer's screen (not over SSH); `sudo` in Kelpy's terminal elsewhere, or by hand without one.
+fn how_to_elevate() -> Option<How> {
+    if cfg!(windows) {
+        platform::ssh_connection().is_none().then_some(How::Prompt)
+    } else if prompt::interactive() {
+        Some(How::Terminal)
+    } else {
+        Some(How::Command)
+    }
+}
+
+/// Restarts Kelpy as administrator, up to the point where the new one is connected: the system's prompt, the
+/// channel. Until then nothing changes here; refused, cancelled or failed, the reason is returned and Kelpy goes on
+/// as it was.
+async fn prepare(
+    home: Home,
+    terminal_ui: bool,
+    cancel: kelpy_gateway::CancellationToken,
+) -> std::result::Result<Prepared, String> {
+    let listener =
+        handover::Listener::open().map_err(|error| format!("cannot open a channel ({error})"))?;
+    let program = std::env::current_exe().map_err(|error| error.to_string())?;
+    let arguments = vec![
+        "--home".to_owned(),
+        home.root().display().to_string(),
+        "handover".to_owned(),
+        listener.name().to_owned(),
+        std::process::id().to_string(),
+    ];
+    #[cfg(windows)]
+    let peer = {
+        let started = tokio::task::spawn_blocking(move || {
+            // Development builds can restart without the prompt, which no automated check can answer.
+            if cfg!(debug_assertions)
+                && std::env::var_os("KELPY_TEST_RESTART_WITHOUT_PROMPT").is_some()
+            {
+                use std::process::Stdio;
+                return std::process::Command::new(&program)
+                    .args(&arguments)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map(|child| Some(child.id()));
             }
-        });
+            elevate::through_prompt(&program, &arguments)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        match started {
+            Ok(Some(pid)) => handover::Peer::Process(pid),
+            Ok(None) => {
+                return Err("Windows did not allow it: the prompt was refused or closed".into());
+            }
+            Err(error) => return Err(format!("Windows could not start it ({error})")),
+        }
+    };
+    #[cfg(unix)]
+    let peer = {
+        // The terminal UI asked `sudo` for the password already, in its terminal; otherwise `sudo` asks there now.
+        match elevate::with_sudo(&program, &arguments, !terminal_ui).await {
+            Ok(true) => handover::Peer::Root,
+            Ok(false) if terminal_ui => {
+                return Err("sudo needs your password: press Ctrl+E in Kelpy's terminal".into());
+            }
+            Ok(false) => return Err("sudo did not allow it".into()),
+            Err(error) => return Err(format!("sudo could not start it ({error})")),
+        }
+    };
+    #[cfg(windows)]
+    let _ = terminal_ui;
+    // Connected and said hello by then, or given up.
+    let deadline = tokio::time::Instant::now() + HANDOVER_WAIT;
+    let accepted = tokio::select! {
+        accepted = listener.accept(peer, deadline) => Some(accepted),
+        () = cancel.cancelled() => None,
+    };
+    let Some(accepted) = accepted else {
+        return Err("Cancelled.".into());
+    };
+    let mut channel = match accepted {
+        Ok(channel) => channel,
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+            return Err("the Kelpy restarted as administrator did not connect in time".into());
+        }
+        Err(error) => return Err(format!("the channel was refused ({error})")),
+    };
+    let refuse = async |channel: &mut Channel<handover::Stream>, reason: &str| {
+        let _ = channel.send(&Message::Refused(reason.to_owned())).await;
+        reason.to_owned()
+    };
+    let pid = match channel.receive().await {
+        Ok(Message::Hello { version, pid }) if version == VERSION => pid,
+        Ok(Message::Hello { version, .. }) => {
+            return Err(refuse(
+                &mut channel,
+                &format!("the new Kelpy is version {version}, not {VERSION}"),
+            )
+            .await);
+        }
+        _ => return Err("the Kelpy restarted as administrator did not say hello".into()),
+    };
+    if cancel.is_cancelled() {
+        return Err(refuse(&mut channel, "Cancelled.").await);
     }
+    Ok(Prepared { channel, pid })
+}
 
-    let status = RuntimeStatus {
-        version: VERSION.to_owned(),
-        pid: std::process::id(),
-        home: home.root().to_path_buf(),
-        started_at,
-        account: agent.account().label(),
-        account_limits: agent.account().limits().map(str::to_owned),
-    };
-    let activity = Arc::new(Activity::new());
-    let stop_request = Arc::new(StopRequest::new());
-    let router = kelpy_gateway::router(
-        status,
-        address.port(),
-        Arc::clone(&activity),
-        auth,
-        Arc::clone(&agent),
-        Arc::clone(&stop_request),
-    );
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = kelpy_gateway::serve(listener, router, async {
-        // Either a stop was sent or the sender is gone with the runtime: both mean stop.
-        let _ = stopped.await;
-    });
-    tokio::pin!(server);
-    // The terminal UI, when shown: quitting it stops Kelpy. Dropped when Kelpy stops otherwise, it gives the
-    // terminal back first, so that what follows prints on it.
-    let terminal_ui = async {
-        let Some(banner) = banner else {
-            return std::future::pending().await;
-        };
-        let api = kelpy_tui::Api::new(info.url.clone(), info.token.clone())?;
-        let options = kelpy_tui::Options {
-            banner,
-            stops_runtime: true,
-            screen: launch.terminal.screen,
-            background: launch.terminal.background,
-        };
-        kelpy_tui::run_local(api, options)
-            .await
-            .context("the terminal UI failed")
-    };
-    let reason = tokio::select! {
-        result = &mut server => {
-            result.context("the local server failed")?;
-            None
+/// Waits for the runtime's lock, which the Kelpy before lets go of when it hands over.
+async fn wait_for_lock(home: &Home) -> Result<RuntimeLock> {
+    let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
+    loop {
+        if let Some(lock) = RuntimeLock::try_acquire(home)? {
+            return Ok(lock);
         }
-        reason = shutdown_signal(limits, activity, stop_request) => Some(reason),
-        exit = terminal_ui => Some(match exit {
-            Ok(kelpy_tui::Exit::Quit) => "the terminal UI was closed".to_owned(),
-            Ok(kelpy_tui::Exit::Stopped) => "requested from another interface".to_owned(),
-            Err(error) => format!("{error:#}"),
-        }),
-    };
-    if let Some(reason) = reason {
-        println!();
-        println!("Stopping Kelpy: {reason}.");
-        // Access ends at once: no new answers, then no new connections or requests. Answers being written
-        // are stopped and saved as interrupted; open connections, such as answer streams, get a bounded time
-        // to close.
-        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
-        let answers_saved = agent.stop_all(SHUTDOWN_GRACE);
-        // Fails only if the server already ended on its own, which is just as stopped.
-        let _ = stop.send(());
-        if !answers_saved.await {
-            println!("Some answers could not be saved in time.");
-        }
-        // Access ends with the session: the ChatGPT tokens are revoked within the same grace, unless the user
-        // chose to save the sign-in on this computer.
-        if !agent.chatgpt().close(deadline).await {
-            println!(
-                "OpenAI did not confirm that the ChatGPT session was revoked; it ends on its own within 30 days."
-            );
-        }
-        match tokio::time::timeout_at(deadline, &mut server).await {
-            Ok(result) => result.context("the local server failed")?,
-            Err(_) => println!(
-                "Some connections did not close within {}; closing them.",
-                duration::format(SHUTDOWN_GRACE)
-            ),
-        }
-        // Last, the work in the background and the database, which the steps above may still have used.
-        if !agent.close(deadline).await {
-            println!(
-                "Some work in the background did not end within {}; stopping it.",
-                duration::format(SHUTDOWN_GRACE)
-            );
-        }
-    }
-
-    // The SSH sessions end before the lock goes: nothing reaches Kelpy once it says it stopped.
-    if let Some(remote) = remote
-        && !remote.stop(SSH_GRACE).await
-    {
-        println!(
-            "Some SSH sessions did not close within {}; closing them.",
-            duration::format(SSH_GRACE)
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the Kelpy before did not let go of the home"
         );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    drop(lock);
-    println!("Kelpy stopped.");
-    Ok(ExitCode::SUCCESS)
+}
+
+/// Binds `port`, which the Kelpy before lets go of when it hands over: not another, so that the pages open there
+/// reconnect by themselves.
+async fn bind_released(host: IpAddr, port: u16) -> Result<tokio::net::TcpListener> {
+    let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
+    loop {
+        match kelpy_gateway::bind(host, port, None).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                return Err(error).context(format!("cannot take over port {port}"));
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
 }
 
 pub fn status(home: &Home) -> Result<ExitCode> {
@@ -535,6 +986,11 @@ pub async fn terminal_ui(
             return Ok(ExitCode::from(1));
         }
     };
+    attach(home, info, terminal).await
+}
+
+/// Shows the terminal UI of the Kelpy running for `home`, described by `info`; closing it leaves Kelpy running.
+async fn attach(home: &Home, info: RuntimeInfo, terminal: TerminalUi) -> Result<ExitCode> {
     let notes = vec![
         format!(
             "Code: {} (to sign in from another browser) · Home: {}",
@@ -549,6 +1005,7 @@ pub async fn terminal_ui(
         stops_runtime: false,
         screen: terminal.screen,
         background: terminal.background,
+        open: browser(),
     };
     if kelpy_tui::run_local(api, options).await? == kelpy_tui::Exit::Stopped {
         println!("Kelpy has stopped.");
@@ -574,6 +1031,142 @@ pub fn open(home: &Home) -> Result<ExitCode> {
             println!("{}", unreadable(&error));
             Ok(ExitCode::from(1))
         }
+    }
+}
+
+/// How long `kelpy` waits for a Kelpy still starting, or being updated, before saying it is not ready.
+const STARTING_WAIT: Duration = Duration::from_secs(30);
+
+/// `kelpy` with a Kelpy already running for `home`: what runs, since when, and, at a terminal, what to do with it.
+async fn already_running(home: &Home, launch: &Launch) -> Result<ExitCode> {
+    let info = match started(home).await {
+        Ok(Some(info)) => info,
+        Ok(None) => {
+            println!(
+                "Kelpy is starting, or being updated, and is not ready yet. Try again in a moment."
+            );
+            return Ok(ExitCode::from(1));
+        }
+        Err(error) => {
+            println!("Kelpy is already running. {}", unreadable(&error));
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
+    println!();
+    println!("Kelpy is already running.");
+    for (label, value) in running_facts(&info, home, unix_now()) {
+        println!("  {label:<7}  {value}");
+    }
+    if !prompt::interactive() {
+        println!("Stop it with: kelpy stop");
+        if launch.open_browser {
+            open_url(&info.sign_in_url());
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!();
+    println!("What now?");
+    println!("  1) Open the terminal UI here");
+    println!("  2) Open the Web UI in the browser");
+    println!("  3) Stop Kelpy");
+    println!("  4) Nothing, leave it running");
+    match prompt::choose(4, 1)? {
+        1 => attach(home, info, launch.terminal).await,
+        2 => {
+            open_url(&info.sign_in_url());
+            Ok(ExitCode::SUCCESS)
+        }
+        3 => {
+            if let Some(title) = answering(&info).await.first() {
+                println!();
+                println!("! An answer is being written in \"{title}\".");
+                if !prompt::confirm("  Stop Kelpy anyway? It is kept as interrupted.", false)? {
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
+            stop(home).await
+        }
+        _ => Ok(ExitCode::SUCCESS),
+    }
+}
+
+/// `runtime.json` of the Kelpy running for `home`, waiting up to `STARTING_WAIT` while it starts or is updated;
+/// `None` if it is still not there, or if Kelpy stopped meanwhile.
+async fn started(home: &Home) -> io::Result<Option<RuntimeInfo>> {
+    let deadline = Instant::now() + STARTING_WAIT;
+    let mut said = false;
+    loop {
+        if let Some(info) = read_info(home)? {
+            return Ok(Some(info));
+        }
+        if Instant::now() >= deadline || !is_running(home).unwrap_or(false) {
+            return Ok(None);
+        }
+        if !said {
+            println!(
+                "Kelpy is starting, or being updated. Waiting for it (Ctrl+C stops waiting)..."
+            );
+            said = true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// What `kelpy` says of the Kelpy running for `home` at `now` (Unix time): its link, since when, and where.
+fn running_facts(info: &RuntimeInfo, home: &Home, now: i64) -> [(&'static str, String); 3] {
+    use chrono::TimeZone;
+    let clock = chrono::Local
+        .timestamp_opt(info.started_at, 0)
+        .single()
+        .map_or_else(String::new, |at| format!("{}, ", at.format("%H:%M")));
+    [
+        ("Web UI", info.sign_in_url()),
+        (
+            "Since",
+            format!(
+                "{clock}{} · PID {} · v{}",
+                running_for(now - info.started_at),
+                info.pid,
+                info.version
+            ),
+        ),
+        ("Home", home.root().display().to_string()),
+    ]
+}
+
+/// How long ago something started, `seconds` back, as a person says it.
+fn running_for(seconds: i64) -> String {
+    let count = |amount: i64, unit: &str| {
+        let plural = if amount == 1 { "" } else { "s" };
+        format!("{amount} {unit}{plural} ago")
+    };
+    match seconds {
+        ..60 => "just now".to_owned(),
+        60..3600 => count(seconds / 60, "minute"),
+        3600..86_400 => count(seconds / 3600, "hour"),
+        _ => count(seconds / 86_400, "day"),
+    }
+}
+
+/// The titles of the conversations with an answer being written in the Kelpy described by `info`; none if it
+/// cannot be asked.
+async fn answering(info: &RuntimeInfo) -> Vec<String> {
+    #[derive(Deserialize)]
+    struct Listed {
+        title: String,
+        #[serde(default)]
+        running: bool,
+    }
+    let Ok(client) = Client::new(info.url.clone(), info.token.clone()) else {
+        return Vec::new();
+    };
+    match client.get::<Vec<Listed>>("/api/sessions").await {
+        Ok(listed) => listed
+            .into_iter()
+            .filter(|session| session.running)
+            .map(|session| session.title)
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -825,6 +1418,18 @@ fn login_name() -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+/// What opens a link in this computer's browser, for the terminal UI's Ctrl+O. None over SSH, where it would open
+/// on the server; and on a Linux without a desktop, where the browser would be one in the terminal, or none.
+fn browser() -> Option<fn(&str) -> std::io::Result<()>> {
+    let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    let desktop = cfg!(any(windows, target_os = "macos"))
+        || ["DISPLAY", "WAYLAND_DISPLAY", "WSL_DISTRO_NAME"]
+            .into_iter()
+            .any(set);
+    (desktop && platform::ssh_connection().is_none())
+        .then_some(webbrowser::open as fn(&str) -> std::io::Result<()>)
+}
+
 fn open_url(url: &str) {
     if let Err(error) = webbrowser::open(url) {
         println!("Could not open the browser ({error}). Open {url} manually.");
@@ -895,6 +1500,46 @@ async fn stop_requested() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn how_long_ago_is_said_as_a_person_says_it() {
+        assert_eq!(running_for(20), "just now");
+        assert_eq!(running_for(60), "1 minute ago");
+        assert_eq!(running_for(7_300), "2 hours ago");
+        assert_eq!(running_for(86_400), "1 day ago");
+    }
+
+    #[test]
+    fn a_kelpy_already_running_is_told_by_its_link_since_when_and_its_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::init(dir.path()).unwrap();
+        let info = RuntimeInfo {
+            pid: 18244,
+            port: 54321,
+            url: "http://127.0.0.1:54321".into(),
+            version: "0.4.1".into(),
+            started_at: 1_000_000,
+            stops_at: None,
+            idle_limit: None,
+            access_code: "K7QM-4ZP2".into(),
+            token: "token".into(),
+        };
+        let [link, since, place] = running_facts(&info, &home, 1_000_000 + 7_300);
+        assert_eq!(
+            link,
+            (
+                "Web UI",
+                "http://127.0.0.1:54321/#code=K7QM-4ZP2".to_owned()
+            )
+        );
+        assert_eq!(since.0, "Since");
+        assert!(
+            since.1.ends_with("2 hours ago · PID 18244 · v0.4.1"),
+            "{}",
+            since.1
+        );
+        assert_eq!(place, ("Home", home.root().display().to_string()));
+    }
 
     #[test]
     fn the_tunnel_command_uses_the_server_address_and_the_same_port() {

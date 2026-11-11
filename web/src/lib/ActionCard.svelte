@@ -3,6 +3,7 @@
   import CheckIcon from '@lucide/svelte/icons/check';
   import CircleAlertIcon from '@lucide/svelte/icons/circle-alert';
   import ShieldAlertIcon from '@lucide/svelte/icons/shield-alert';
+  import ShieldCheckIcon from '@lucide/svelte/icons/shield-check';
   import ClockIcon from '@lucide/svelte/icons/clock';
   import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
   import TriangleAlertIcon from '@lucide/svelte/icons/triangle-alert';
@@ -13,6 +14,9 @@
   import NoteText from './NoteText.svelte';
   import { diffLine, diffLines as linesOf, duration, stateLabels } from './actions';
   import type { Action, Approval } from './api';
+  import { canRestart, elevation, restartAsAdministrator } from './elevation.svelte';
+  import { failedForRights } from './rights';
+  import { runtime } from './runtime.svelte';
 
   interface Props {
     action: Action;
@@ -27,6 +31,26 @@
   let { action, approval, canDecide, onDecide, onStop }: Props = $props();
 
   let deciding = $state(false);
+
+  /** Failed for lack of rights, with Kelpy not elevated: the restart as administrator is offered under it. */
+  const offerRestart = $derived(
+    failedForRights(action) &&
+      elevation.view !== null &&
+      !elevation.view.elevated &&
+      elevation.view.how !== null &&
+      !elevation.dismissed.includes(action.id),
+  );
+  const offerText = $derived.by(() => {
+    const account = runtime.status?.account ?? 'its own account';
+    switch (elevation.view?.how) {
+      case 'prompt':
+        return `Kelpy runs as ${account}. Restarted as administrator, it can do it: Windows asks you to confirm. This page, the conversations, keys and secrets stay as they are.`;
+      case 'terminal':
+        return `Kelpy runs as ${account}. Restarted as root, it can do it: sudo asks for your password in Kelpy's terminal. This page, the conversations, keys and secrets stay as they are.`;
+      default:
+        return `Kelpy runs as ${account}, without root. To do it, stop Kelpy and start it again with sudo kelpy.`;
+    }
+  });
   let live = $state<HTMLPreElement>();
   /** Whether the output of a running command follows its end: the user has not scrolled up. */
   let following = true;
@@ -159,6 +183,23 @@
       {action.error}{#if action.state === 'uncertain'}. Kelpy will not do it again by itself: check the system
         first.{/if}
     </p>
+  {/if}
+  {#if offerRestart}
+    <div class="border-primary/40 bg-primary/5 mt-3 flex gap-3 rounded-lg border p-3">
+      <ShieldCheckIcon class="text-primary mt-0.5 size-4 shrink-0" />
+      <div class="grid gap-1">
+        <p class="font-medium">This needs administrator rights</p>
+        <p class="text-muted-foreground text-sm">{offerText}</p>
+        {#if canRestart()}
+          <div class="mt-1.5 flex flex-wrap gap-2">
+            <Button size="sm" onclick={() => void restartAsAdministrator()}>
+              <ShieldCheckIcon class="size-4" /> Restart as administrator
+            </Button>
+            <Button size="sm" variant="outline" onclick={() => elevation.dismissed.push(action.id)}>Not now</Button>
+          </div>
+        {/if}
+      </div>
+    </div>
   {/if}
   {#if waiting && written}
     <p class="text-muted-foreground mt-2 text-xs">

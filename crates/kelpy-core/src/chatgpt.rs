@@ -195,6 +195,17 @@ struct Session {
     lifetime: Lifetime,
 }
 
+/// A session handed over to the Kelpy restarted in this one's place: what renews it, its access token while valid,
+/// and whether it is also kept on disk.
+#[derive(Serialize, Deserialize)]
+pub struct SessionState {
+    kept: Kept,
+    access_token: String,
+    /// Seconds the access token stays valid.
+    valid_for: u64,
+    kept_on_disk: bool,
+}
+
 /// A session kept on disk: only what renews it, never an access token.
 #[derive(Serialize, Deserialize)]
 struct Kept {
@@ -301,6 +312,33 @@ impl ChatGpt {
             renewing: tokio::sync::Mutex::new(()),
             events,
         }
+    }
+
+    /// The session open, for the Kelpy restarted in this one's place. A sign-in under way is not handed over.
+    pub(crate) fn handed_over(&self) -> Option<SessionState> {
+        let state = lock(&self.state);
+        let session = state.session.as_ref()?;
+        Some(SessionState {
+            kept: session.kept(),
+            access_token: session.tokens.access_token.clone(),
+            valid_for: session
+                .expires_at
+                .saturating_duration_since(Instant::now())
+                .as_secs(),
+            kept_on_disk: session.lifetime == Lifetime::Kept,
+        })
+    }
+
+    /// Takes over the session the Kelpy before this one had open, in place of one kept on disk.
+    pub(crate) fn take_over(&self, handed: SessionState) {
+        let mut session = Session::restored(handed.kept);
+        session.tokens.access_token = handed.access_token;
+        session.expires_at = Instant::now() + Duration::from_secs(handed.valid_for);
+        if !handed.kept_on_disk {
+            session.lifetime = Lifetime::Run;
+        }
+        lock(&self.state).session = Some(session);
+        self.events.publish(Event::ProviderChanged);
     }
 
     /// Whether a session is open: answers can use the plan.
@@ -947,6 +985,33 @@ pub(crate) mod tests {
         let (server, endpoints) = fake_openai().await;
         let chatgpt = ChatGpt::new(&home, Provider::new().unwrap(), endpoints, Events::new());
         (dir, home, server, chatgpt)
+    }
+
+    #[tokio::test]
+    async fn a_kelpy_restarted_in_another_process_goes_on_with_the_session_and_its_token() {
+        let (_dir, home, server, before) = fixture().await;
+        sign_in(&before, &server, "user-1", 3600).await.unwrap();
+        let state = serde_json::to_string(&before.handed_over().unwrap()).unwrap();
+        let endpoints = before.endpoints.clone();
+        let after = ChatGpt::new(&home, Provider::new().unwrap(), endpoints, Events::new());
+        assert!(!after.signed_in());
+        after.take_over(serde_json::from_str(&state).unwrap());
+        let status = after.status();
+        assert_eq!(status.signed_in.unwrap().sub, "user-1");
+        assert!(!status.kept);
+        // The same access token, not renewed: the session goes on as it was.
+        let mut settings = Settings {
+            kind: kelpy_providers::Kind::ChatGpt,
+            model: "gpt-5".into(),
+            base_url: None,
+            api_key: None,
+            headers: Vec::new(),
+        };
+        after.authorize(&mut settings).await.unwrap();
+        assert_eq!(settings.api_key.as_deref(), Some("access-user-1"));
+        assert!(requests_with(&server, "refresh-user-1").is_empty());
+        // Nothing of it was written to disk.
+        assert!(!after.session_path.exists());
     }
 
     #[tokio::test]

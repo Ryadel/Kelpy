@@ -11,6 +11,7 @@
   import { Label } from '$lib/components/ui/label';
   import ChatGptAccount from './ChatGptAccount.svelte';
   import OllamaPanel from './OllamaPanel.svelte';
+  import WelcomePanel from './WelcomePanel.svelte';
   import {
     describe,
     fetchModels,
@@ -51,6 +52,8 @@
   /** Numbers the lists asked for, so that only the latest one is shown. */
   let listings = 0;
 
+  /** No provider chosen yet, as on the first run: the first question comes with Kelpy's welcome. */
+  const welcoming = $derived(info.configured === null && way === null);
   const choices = $derived(info.services.filter((candidate) => candidate.way === way));
   const kindInfo = $derived(info.kinds.find((candidate) => candidate.id === service?.kind));
   const configuredHere = $derived(info.configured !== null && configuredService()?.id === service?.id);
@@ -188,142 +191,164 @@
   }
 </script>
 
-<Dialog.Root bind:open>
-  <Dialog.Content class={['max-h-[90dvh] overflow-y-auto', kindInfo?.signs_in ? 'sm:max-w-3xl' : 'sm:max-w-lg']}>
-    <Dialog.Header>
-      <Dialog.Title>How does Kelpy connect to AI?</Dialog.Title>
-      <Dialog.Description>
-        The choice is saved in <code>config.toml</code>. API keys stay in memory until Kelpy stops; so do sign-ins, unless you save them.
-      </Dialog.Description>
-    </Dialog.Header>
+{#snippet header(title: string)}
+  <Dialog.Header>
+    <Dialog.Title>{title}</Dialog.Title>
+    <Dialog.Description>
+      The choice is saved in <code>config.toml</code>. API keys stay in memory until Kelpy stops; so do sign-ins, unless you save them.
+    </Dialog.Description>
+  </Dialog.Header>
+{/snippet}
 
-    {#if way === null}
-      <div class="grid gap-2">
-        {#each info.ways as option (option.id)}
-          {@const Icon = WAY_ICONS[option.id]}
-          <button
-            type="button"
-            class="hover:bg-accent flex items-start gap-3 rounded-md border p-3 text-left"
-            onclick={() => chooseWay(option.id)}
-          >
-            <Icon class="text-muted-foreground mt-0.5 size-5 shrink-0" aria-hidden="true" />
-            <span>
-              <span class="block text-sm font-medium">{option.name}</span>
-              <span class="text-muted-foreground block text-xs">{option.description}</span>
-            </span>
-          </button>
-        {/each}
+{#snippet ways()}
+  <div class="grid gap-2">
+    {#each info.ways as option (option.id)}
+      {@const Icon = WAY_ICONS[option.id]}
+      <button
+        type="button"
+        class="hover:bg-accent flex items-start gap-3 rounded-md border p-3 text-left"
+        onclick={() => chooseWay(option.id)}
+      >
+        <Icon class="text-muted-foreground mt-0.5 size-5 shrink-0" aria-hidden="true" />
+        <span>
+          <span class="block text-sm font-medium">{option.name}</span>
+          <span class="text-muted-foreground block text-xs">{option.description}</span>
+        </span>
+      </button>
+    {/each}
+  </div>
+{/snippet}
+
+<Dialog.Root bind:open>
+  <Dialog.Content
+    class={welcoming
+      ? 'max-h-[90dvh] gap-0 overflow-y-auto p-0 sm:max-w-lg md:max-w-[60rem]'
+      : ['max-h-[90dvh] overflow-y-auto', kindInfo?.signs_in ? 'sm:max-w-3xl' : 'sm:max-w-lg']}
+  >
+    {#if welcoming}
+      <div class="grid md:grid-cols-[23rem_minmax(0,1fr)]">
+        <WelcomePanel />
+        <div class="grid content-start gap-4 p-5 md:p-7">
+          {@render header('Welcome. First, how does Kelpy connect to AI?')}
+          {@render ways()}
+        </div>
       </div>
     {:else}
-      <form class="grid gap-4" onsubmit={submit}>
-        <Button type="button" variant="ghost" size="sm" class="justify-self-start" onclick={back}>
-          <ArrowLeftIcon /> Back
-        </Button>
+      {@render header('How does Kelpy connect to AI?')}
 
-        {#if service === null}
-          <div class="grid gap-2">
-            {#each choices as option (option.id)}
-              <button
-                type="button"
-                class="hover:bg-accent rounded-md border p-3 text-left"
-                onclick={() => choose(option)}
-              >
-                <span class="block text-sm font-medium">{option.name}</span>
-                <span class="text-muted-foreground block text-xs">{option.description}</span>
-              </button>
-            {/each}
-          </div>
-        {:else}
-          <div>
-            <p class="text-sm font-medium">{service.name}</p>
-            <p class="text-muted-foreground text-xs">{service.description}</p>
-          </div>
+      {#if way === null}
+        {@render ways()}
+      {:else}
+        <form class="grid gap-4" onsubmit={submit}>
+          <Button type="button" variant="ghost" size="sm" class="justify-self-start" onclick={back}>
+            <ArrowLeftIcon /> Back
+          </Button>
 
-          {#if kindInfo?.signs_in}
-            <ChatGptAccount methods={info.sign_in_methods} bind:model bind:signedIn={chatgptSignedIn} />
-          {:else if service.kind === 'ollama'}
-            <OllamaPanel {service} bind:model bind:baseUrl />
+          {#if service === null}
+            <div class="grid gap-2">
+              {#each choices as option (option.id)}
+                <button
+                  type="button"
+                  class="hover:bg-accent rounded-md border p-3 text-left"
+                  onclick={() => choose(option)}
+                >
+                  <span class="block text-sm font-medium">{option.name}</span>
+                  <span class="text-muted-foreground block text-xs">{option.description}</span>
+                </button>
+              {/each}
+            </div>
           {:else}
-            {#if service.steps.length > 0}
-              <ol class="text-muted-foreground list-decimal space-y-1 pl-5 text-sm">
-                {#each service.steps as step (step)}
-                  <li>{step}</li>
-                {/each}
-              </ol>
-            {/if}
-            {#if service.key_page}
-              <a class="text-sm underline" href={service.key_page} target="_blank" rel="noreferrer">
-                Open {new URL(service.key_page).host}
-              </a>
-            {/if}
+            <div>
+              <p class="text-sm font-medium">{service.name}</p>
+              <p class="text-muted-foreground text-xs">{service.description}</p>
+            </div>
 
-            {#if needsBaseUrl}
+            {#if kindInfo?.signs_in}
+              <ChatGptAccount methods={info.sign_in_methods} bind:model bind:signedIn={chatgptSignedIn} />
+            {:else if service.kind === 'ollama'}
+              <OllamaPanel {service} bind:model bind:baseUrl />
+            {:else}
+              {#if service.steps.length > 0}
+                <ol class="text-muted-foreground list-decimal space-y-1 pl-5 text-sm">
+                  {#each service.steps as step (step)}
+                    <li>{step}</li>
+                  {/each}
+                </ol>
+              {/if}
+              {#if service.key_page}
+                <a class="text-sm underline" href={service.key_page} target="_blank" rel="noreferrer">
+                  Open {new URL(service.key_page).host}
+                </a>
+              {/if}
+
+              {#if needsBaseUrl}
+                <div class="grid gap-2">
+                  <Label for="provider-url">API address</Label>
+                  <Input
+                    id="provider-url"
+                    bind:value={baseUrl}
+                    placeholder="http://10.0.0.5:8000/v1"
+                    required
+                    autocomplete="off"
+                  />
+                </div>
+              {/if}
+
+              {#if kindInfo?.accepts_key}
+                <div class="grid gap-2">
+                  <Label for="provider-key">API key{kindInfo.requires_key || service.way !== 'local' ? '' : ' (if the server needs one)'}</Label>
+                  <Input id="provider-key" type="password" bind:value={apiKey} autocomplete="off" />
+                  <p class="text-muted-foreground text-xs">
+                    {#if configuredHere && info.key === 'session'}
+                      A key entered earlier is in use. A new one replaces it.
+                    {:else if configuredHere && info.key === 'environment'}
+                      The key in {kindInfo.key_variable} is in use. A key entered here takes its place.
+                    {:else if kindInfo.key_variable && kindInfo.key_in_environment}
+                      Empty to use the key in {kindInfo.key_variable}.
+                    {/if}
+                  </p>
+                </div>
+              {/if}
+
               <div class="grid gap-2">
-                <Label for="provider-url">API address</Label>
+                <Label for="provider-model">Model</Label>
                 <Input
-                  id="provider-url"
-                  bind:value={baseUrl}
-                  placeholder="http://10.0.0.5:8000/v1"
+                  id="provider-model"
+                  bind:value={model}
+                  list="provider-models"
+                  placeholder={recommended[0] ?? 'Model name'}
                   required
                   autocomplete="off"
                 />
-              </div>
-            {/if}
-
-            {#if kindInfo?.accepts_key}
-              <div class="grid gap-2">
-                <Label for="provider-key">API key{kindInfo.requires_key || service.way !== 'local' ? '' : ' (if the server needs one)'}</Label>
-                <Input id="provider-key" type="password" bind:value={apiKey} autocomplete="off" />
+                <datalist id="provider-models">
+                  {#each modelChoices as choice (choice.id)}
+                    <option value={choice.id} label={choice.recommended ? 'Recommended' : undefined}></option>
+                  {/each}
+                </datalist>
                 <p class="text-muted-foreground text-xs">
-                  {#if configuredHere && info.key === 'session'}
-                    A key entered earlier is in use. A new one replaces it.
-                  {:else if configuredHere && info.key === 'environment'}
-                    The key in {kindInfo.key_variable} is in use. A key entered here takes its place.
-                  {:else if kindInfo.key_variable && kindInfo.key_in_environment}
-                    Empty to use the key in {kindInfo.key_variable}.
+                  {#if recommended.length > 0}Recommended: {recommended.join(', ')}.{/if}
+                  {#if listing}
+                    Listing the service's models…
+                  {:else if listed?.error}
+                    The service's list is unavailable: {listed.error}. Any model name can be typed.
+                  {:else if listed}
+                    {listedNote(listed.models.length - recommended.length, recommended.length > 0)}
                   {/if}
                 </p>
               </div>
             {/if}
 
-            <div class="grid gap-2">
-              <Label for="provider-model">Model</Label>
-              <Input
-                id="provider-model"
-                bind:value={model}
-                list="provider-models"
-                placeholder={recommended[0] ?? 'Model name'}
-                required
-                autocomplete="off"
-              />
-              <datalist id="provider-models">
-                {#each modelChoices as choice (choice.id)}
-                  <option value={choice.id} label={choice.recommended ? 'Recommended' : undefined}></option>
-                {/each}
-              </datalist>
-              <p class="text-muted-foreground text-xs">
-                {#if recommended.length > 0}Recommended: {recommended.join(', ')}.{/if}
-                {#if listing}
-                  Listing the service's models…
-                {:else if listed?.error}
-                  The service's list is unavailable: {listed.error}. Any model name can be typed.
-                {:else if listed}
-                  {listedNote(listed.models.length - recommended.length, recommended.length > 0)}
-                {/if}
-              </p>
-            </div>
-          {/if}
+            {#if error}
+              <p class="text-destructive text-sm" role="alert">{error}</p>
+            {/if}
 
-          {#if error}
-            <p class="text-destructive text-sm" role="alert">{error}</p>
+            <Dialog.Footer>
+              <Button type="button" variant="outline" onclick={() => (open = false)}>Cancel</Button>
+              <Button type="submit" disabled={busy || !ready}>Save</Button>
+            </Dialog.Footer>
           {/if}
-
-          <Dialog.Footer>
-            <Button type="button" variant="outline" onclick={() => (open = false)}>Cancel</Button>
-            <Button type="submit" disabled={busy || !ready}>Save</Button>
-          </Dialog.Footer>
-        {/if}
-      </form>
+        </form>
+      {/if}
     {/if}
   </Dialog.Content>
 </Dialog.Root>

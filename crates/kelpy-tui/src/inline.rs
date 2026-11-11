@@ -233,7 +233,7 @@ fn banner(app: &App, width: u16, theme: Theme) -> Buffer {
             .into_iter()
             .map(|line| Line::styled(line, text)),
     );
-    let facts = start_facts(app, theme);
+    let facts = start_facts(app, theme, false);
     lines.extend(fact_lines(&facts[..1], text_width, dim));
     if !app.sessions.is_empty() {
         let mut recent: Vec<String> = app

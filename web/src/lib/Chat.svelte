@@ -19,6 +19,7 @@
   import { commandLog, mergeOperations, pending, segments, stepStates } from './actions';
   import { copyText } from './clipboard';
   import { hasCallouts } from './explanations';
+  import { sentMessages } from './history';
   import { advance, settled } from './reveal';
   import {
     ApiError,
@@ -96,6 +97,9 @@
   let listening: AbortController | null = null;
   /** Counts the loads, so that only the latest one shows. */
   let loads = 0;
+
+  /** What Up and Down bring back in the message box: this conversation's messages. */
+  const sent = $derived(sentMessages(messages));
 
   /** Before its first message a conversation shows the welcome, with the message box in the middle. */
   const empty = $derived(loaded && messages.length === 0 && !running);
@@ -533,6 +537,7 @@
     {running}
     onSend={send}
     onStop={stop}
+    history={sent}
   />
 {/snippet}
 
@@ -549,7 +554,7 @@
     {:else}
       <div class="relative flex min-h-0 flex-1 flex-col">
       <div class="min-h-0 flex-1 overflow-y-auto" bind:this={scroller} onscroll={scrolled}>
-        <div class="mx-auto flex max-w-3xl flex-col gap-8 px-5 pt-4 pb-10" bind:this={content}>
+        <div class="mx-auto flex max-w-conversation flex-col gap-8 px-5 pt-4 pb-10" bind:this={content}>
           {#each messages as message (message.id)}
             {#if message.id === firstUnsummarised}
               <div class="text-muted-foreground flex items-center gap-3 text-xs" role="separator">
@@ -637,7 +642,7 @@
         </Button>
       {/if}
       </div>
-      <div class="mx-auto w-full max-w-3xl px-4 pb-3">
+      <div class="mx-auto w-full max-w-conversation px-4 pb-3">
         {@render messageBox()}
         <p class="text-muted-foreground mt-2 text-center text-xs">Enter sends, Shift+Enter starts a new line.</p>
       </div>

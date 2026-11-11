@@ -11,7 +11,7 @@ use axum::response::Response;
 use kelpy_core::home::Home;
 use kelpy_core::providers::chatgpt::Endpoints;
 use kelpy_core::storage::Store;
-use kelpy_gateway::{Activity, Agent, Auth, RuntimeStatus, StopRequest, bind};
+use kelpy_gateway::{Activity, Agent, Auth, Elevation, How, RuntimeStatus, StopRequest, bind};
 use kelpy_test_support::{FakeServer, chat_completions, id_token};
 use tower::ServiceExt;
 
@@ -38,7 +38,13 @@ fn router(status: RuntimeStatus, port: u16, activity: Arc<Activity>, auth: Arc<A
         auth,
         agent(),
         Arc::new(StopRequest::new()),
+        no_elevation(),
     )
+}
+
+/// Restarting as administrator, impossible here: what most tests need.
+fn no_elevation() -> Arc<Elevation> {
+    Arc::new(Elevation::new(false, None, agent()))
 }
 
 fn status() -> RuntimeStatus {
@@ -278,6 +284,7 @@ async fn interfaces_receive_every_change_until_kelpy_stops() {
         Arc::clone(&auth),
         Arc::clone(&agent),
         Arc::new(StopRequest::new()),
+        no_elevation(),
     );
     let anonymous = call(&app, Request::get("/api/events"), Body::empty()).await;
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
@@ -332,6 +339,7 @@ async fn a_stop_needs_credentials_and_says_where_it_came_from() {
         Arc::clone(&auth),
         agent(),
         Arc::clone(&stop),
+        no_elevation(),
     );
     let anonymous = Request::post("/api/shutdown");
     assert_eq!(
@@ -347,6 +355,63 @@ async fn a_stop_needs_credentials_and_says_where_it_came_from() {
         .await
         .unwrap();
     assert_eq!(from, "`kelpy stop`");
+}
+
+#[tokio::test]
+async fn a_restart_as_administrator_is_asked_once_and_can_be_cancelled_while_the_prompt_is_open() {
+    let auth = auth();
+    let kelpy = agent();
+    let elevation = Arc::new(Elevation::new(false, Some(How::Prompt), Arc::clone(&kelpy)));
+    let app = kelpy_gateway::router(
+        status(),
+        PORT,
+        Arc::new(Activity::new()),
+        Arc::clone(&auth),
+        kelpy,
+        Arc::new(StopRequest::new()),
+        Arc::clone(&elevation),
+    );
+    let read = async || {
+        let response = call(
+            &app,
+            authorized(Request::get("/api/elevation"), &auth),
+            Body::empty(),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+    };
+    assert_eq!(
+        read().await,
+        serde_json::json!({ "elevated": false, "how": "prompt", "step": "idle" })
+    );
+    let ask = || authorized(Request::post("/api/elevation"), &auth);
+    let asked = call(&app, ask(), Body::empty()).await;
+    assert_eq!(asked.status(), StatusCode::ACCEPTED);
+    let cancel = tokio::time::timeout(Duration::from_secs(1), elevation.requested())
+        .await
+        .unwrap();
+    assert_eq!(read().await["step"], "prompt");
+    // One at a time.
+    let again = call(&app, ask(), Body::empty()).await;
+    assert_eq!(again.status(), StatusCode::CONFLICT);
+    let cancelled = call(
+        &app,
+        authorized(Request::delete("/api/elevation"), &auth),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(cancelled.status(), StatusCode::ACCEPTED);
+    assert!(cancel.is_cancelled());
+
+    // Where the system has no prompt to show, an interface cannot ask.
+    let by_hand = Arc::new(Elevation::new(false, Some(How::Command), agent()));
+    assert!(by_hand.request().is_err());
+    // Already elevated: nothing to offer.
+    let elevated = Elevation::new(true, Some(How::Prompt), agent());
+    assert_eq!(elevated.view().how, None);
 }
 
 #[tokio::test]
@@ -458,6 +523,7 @@ async fn a_stop_from_the_web_ui_is_reported_as_such() {
         Arc::clone(&auth),
         agent(),
         Arc::clone(&stop),
+        no_elevation(),
     );
     let session = session(&app, &auth).await;
     let request = with_session(Request::post("/api/shutdown"), &session);
@@ -580,6 +646,7 @@ async fn a_conversation_streams_its_answer_and_keeps_it() {
         Arc::clone(&auth),
         agent(),
         Arc::new(StopRequest::new()),
+        no_elevation(),
     );
 
     let response = call(
@@ -659,7 +726,10 @@ async fn a_conversation_streams_its_answer_and_keeps_it() {
         Body::empty(),
     )
     .await;
-    assert_eq!(json_body(response).await[0]["title"], "Install nginx");
+    let listed = json_body(response).await;
+    assert_eq!(listed[0]["title"], "Install nginx");
+    // The answer has ended.
+    assert_eq!(listed[0]["running"], false);
 
     let delete = json_request(Method::DELETE, &format!("/api/sessions/{id}"), &auth);
     assert_eq!(
@@ -680,6 +750,7 @@ async fn a_conversation_can_be_created_with_explanations() {
         Arc::clone(&auth),
         agent(),
         Arc::new(StopRequest::new()),
+        no_elevation(),
     );
 
     let response = call(
@@ -728,6 +799,7 @@ async fn ollama_reports_its_models_and_streams_a_download_to_its_end() {
         Arc::clone(&auth),
         agent(),
         Arc::new(StopRequest::new()),
+        no_elevation(),
     );
 
     let path = format!("/api/ollama?base_url={}/v1", ollama.url);
@@ -802,6 +874,7 @@ async fn a_code_sign_in_streams_the_code_then_the_account() {
         Arc::clone(&auth),
         agent_signing_in_at(endpoints),
         Arc::new(StopRequest::new()),
+        no_elevation(),
     );
     let response = call(
         &app,

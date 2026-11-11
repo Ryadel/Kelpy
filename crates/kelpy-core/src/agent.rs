@@ -12,6 +12,7 @@
 //! only passes requests on, and publishes what changed to the interfaces' [`Events`].
 
 mod context;
+mod handover;
 mod providers;
 mod server;
 mod turns;
@@ -37,6 +38,7 @@ use crate::ollama::Ollama;
 use crate::ssh_agent::SshAgent;
 use crate::vault::{Unlock, Vault, VaultError};
 pub use context::ContextUse;
+pub use handover::AgentState;
 use providers::Providers;
 pub use providers::{
     KeySource, KindInfo, ModelChoice, ModelList, ModelQuery, Needed, ProviderInfo, ProviderUpdate,
@@ -496,6 +498,20 @@ impl Agent {
         self.vault().stop();
         self.events.close();
         self.turns.stop_all(limit)
+    }
+
+    /// As [`Agent::stop_all`], for Kelpy restarting in another process: the interfaces are not told it stops, as
+    /// they go on with the new one.
+    pub fn stop_for_restart(&self, limit: Duration) -> impl Future<Output = bool> + use<> {
+        self.providers.ollama().close();
+        self.vault().stop();
+        self.events.close_for_restart();
+        self.turns.stop_all(limit)
+    }
+
+    /// Tells the interfaces that restarting as administrator changed: they read it again.
+    pub fn elevation_changed(&self) {
+        self.events.publish(Event::ElevationChanged);
     }
 
     /// Kelpy is stopping, after [`Agent::stop_all`]: waits for the work in the background and the vault's changes to
@@ -2407,6 +2423,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_kelpy_restarted_in_another_process_takes_over_what_was_only_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = model("Done.").await;
+        server.respond_once(
+            CHAT,
+            "200 OK",
+            calling(
+                "generate_secret",
+                &json!({ "reason": "Database password", "name": "wp_db" }),
+            ),
+        );
+        let before = agent(&dir, format!("{}/v1", server.url));
+        before
+            .configure_provider(ProviderUpdate {
+                kind: Kind::OpenAiCompatible,
+                model: "llama3".into(),
+                base_url: Some(format!("{}/v1", server.url)),
+                api_key: Some("session-key".into()),
+                service: None,
+            })
+            .unwrap();
+        let passphrase = || Unlock::Passphrase(zeroize::Zeroizing::new("a long passphrase".into()));
+        before.vault().create(passphrase()).await.unwrap();
+        let secret = |value: &str| zeroize::Zeroizing::new(value.to_owned());
+        before
+            .vault()
+            .add("smtp", secret("kept-value"), true)
+            .await
+            .unwrap();
+        before
+            .vault()
+            .add("token", secret("run-value"), false)
+            .await
+            .unwrap();
+        let session = before
+            .create_session(None, full(Approval::Auto))
+            .await
+            .unwrap();
+        collect(before.send(session.id, "A password", ()).await.unwrap()).await;
+        let generated = before.secret_value(Some(session.id), "wp_db").unwrap();
+
+        let state = serde_json::to_string(&before.handed_over()).unwrap();
+        let home = Home::init(dir.path()).unwrap();
+        let config = crate::config::Config::load(&home.config_path()).unwrap();
+        let after = Agent::new(
+            &home,
+            Store::in_memory().unwrap(),
+            config.provider,
+            Endpoints::default(),
+        )
+        .unwrap();
+        assert!(after.vault().view().state == crate::vault::VaultState::Locked);
+        let problems = after.take_over(serde_json::from_str(&state).unwrap()).await;
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(after.provider_info().key, Some(KeySource::Session));
+        assert!(after.vault().view().state == crate::vault::VaultState::Unlocked);
+        assert_eq!(
+            after.secret_value(None, "smtp").as_deref(),
+            Some("kept-value")
+        );
+        assert_eq!(
+            after.secret_value(None, "token").as_deref(),
+            Some("run-value")
+        );
+        assert_eq!(
+            after.secret_value(Some(session.id), "wp_db"),
+            Some(generated)
+        );
+        let view = after.secrets().await;
+        let kept: Vec<_> = view
+            .shared
+            .iter()
+            .map(|secret| (secret.name.as_str(), secret.kept))
+            .collect();
+        assert_eq!(kept, [("smtp", true), ("token", false)]);
+    }
+
+    #[tokio::test]
+    async fn the_vault_s_secrets_come_back_only_once_the_vault_is_open_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = model("Done.").await;
+        let before = agent(&dir, format!("{}/v1", server.url));
+        let passphrase = || Unlock::Passphrase(zeroize::Zeroizing::new("a long passphrase".into()));
+        before.vault().create(passphrase()).await.unwrap();
+        let secret = |value: &str| zeroize::Zeroizing::new(value.to_owned());
+        before
+            .vault()
+            .add("smtp", secret("kept-value"), true)
+            .await
+            .unwrap();
+        before
+            .vault()
+            .add("token", secret("run-value"), false)
+            .await
+            .unwrap();
+        let state = serde_json::to_string(&before.handed_over()).unwrap();
+
+        // The vault's file changed meanwhile: the key handed over no longer opens it.
+        let home = Home::init(dir.path()).unwrap();
+        let path = home.data_dir().join("vault.json");
+        let mut file: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        file["secrets"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        fs::write(&path, file.to_string()).unwrap();
+        let config = crate::config::Config::load(&home.config_path()).unwrap();
+        let after = Agent::new(
+            &home,
+            Store::in_memory().unwrap(),
+            config.provider,
+            Endpoints::default(),
+        )
+        .unwrap();
+        let problems = after.take_over(serde_json::from_str(&state).unwrap()).await;
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(after.vault().view().state == crate::vault::VaultState::Locked);
+        // Locked, the vault's secret cannot be used, now or once locked again; the one added without keeping can.
+        assert_eq!(after.secret_value(None, "smtp"), None);
+        after.vault().lock();
+        assert_eq!(after.secret_value(None, "smtp"), None);
+        assert_eq!(
+            after.secret_value(None, "token").as_deref(),
+            Some("run-value")
+        );
+    }
+
+    #[tokio::test]
     async fn a_secret_is_written_where_it_goes_and_never_reaches_the_model() {
         let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let config = folder.path().join("wp-config.php");
@@ -2438,7 +2580,18 @@ mod tests {
             .unwrap();
         let events = collect(agent.send(session.id, "Configure", ()).await.unwrap()).await;
         let actions = actions_of(&events);
-        let written = fs::read_to_string(&config).unwrap();
+        // Once, on a Windows runner, the file was not there: say what each action did and how the answer ended.
+        let written = fs::read_to_string(&config).unwrap_or_else(|error| {
+            let done: Vec<_> = actions
+                .iter()
+                .map(|action| (&action.tool, action.state, &action.error, &action.output))
+                .collect();
+            let end = &events[events.len().saturating_sub(3)..];
+            panic!(
+                "{} not read ({error}); the actions: {done:#?}; the answer's last events: {end:#?}",
+                config.display()
+            )
+        });
         let value = &written["<?php define('DB_PASSWORD', '".len()..written.len() - "');\n".len()];
         assert_eq!(value.len(), 32);
         assert!(

@@ -8,7 +8,7 @@ mod operations;
 mod report;
 mod secrets;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -16,10 +16,11 @@ use std::time::Instant;
 use kelpy_common::lock;
 use kelpy_storage::{Change, RecordKind, Storage};
 use kelpy_tools::{Card, Executor, Registry, Secrets};
+use zeroize::Zeroizing;
 
 use crate::events::Events;
 use crate::ssh_agent::SshAgent;
-use crate::vault::Vault;
+use crate::vault::{Vault, VaultError};
 
 pub use drift::DifferenceView;
 pub use operations::Operated;
@@ -85,6 +86,54 @@ impl Server {
 
     pub(super) fn vault(&self) -> &Vault {
         &self.vault
+    }
+
+    /// The secrets, for the Kelpy restarted in this one's place: the values masked, the administrator's by name
+    /// but for those kept in the vault, each conversation's by name, and the vault's key while it is unlocked.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn handed_over(
+        &self,
+    ) -> (
+        BTreeSet<String>,
+        BTreeMap<String, String>,
+        BTreeMap<i64, BTreeMap<String, String>>,
+        Option<Zeroizing<Vec<u8>>>,
+    ) {
+        let generated = lock(&self.secrets)
+            .iter()
+            .map(|(&session_id, secrets)| (session_id, secrets.handed_over()))
+            .filter(|(_, own)| !own.is_empty())
+            .collect();
+        // One copy under the vault's state: a lock in between cannot turn a kept secret into one not kept.
+        let administrator = self.vault.handed_over();
+        (
+            administrator.masked,
+            administrator.shared,
+            generated,
+            administrator.key,
+        )
+    }
+
+    /// Takes over the secrets the Kelpy before this one handed over, then opens the vault with its key: only
+    /// then are the secrets kept in it usable.
+    pub(super) async fn take_over(
+        &self,
+        masked: BTreeSet<String>,
+        shared: BTreeMap<String, String>,
+        generated: BTreeMap<i64, BTreeMap<String, String>>,
+        vault_key: Option<Zeroizing<Vec<u8>>>,
+    ) -> Result<(), VaultError> {
+        self.registry.take_over(masked, shared);
+        {
+            let mut secrets = lock(&self.secrets);
+            for (session_id, own) in generated {
+                secrets.insert(session_id, Secrets::taking_over(&self.registry, own));
+            }
+        }
+        match vault_key {
+            Some(key) => self.vault.take_over(&key).await,
+            None => Ok(()),
+        }
     }
 
     /// Forgets the secrets of a conversation deleted: its placeholders no longer work, but the values stay masked

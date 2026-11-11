@@ -197,6 +197,16 @@ impl Providers {
         &self.chatgpt
     }
 
+    /// The key entered for the provider in this session, for the Kelpy restarted in this one's place.
+    pub(super) fn handed_over(&self) -> Option<String> {
+        lock(&self.selection).key.clone()
+    }
+
+    /// Takes over the key the Kelpy before this one had for the same provider.
+    pub(super) fn take_over(&self, key: Option<String>) {
+        lock(&self.selection).key = key;
+    }
+
     pub(super) fn ollama(&self) -> &Arc<Ollama> {
         &self.ollama
     }
@@ -356,7 +366,7 @@ fn info(selection: &Selection, signed_in: bool) -> ProviderInfo {
 
 fn environment_key(kind: Kind) -> Option<String> {
     kind.key_variable()
-        .and_then(|variable| std::env::var(variable).ok())
+        .and_then(crate::environment::var)
         .map(|key| key.trim().to_owned())
         .filter(|key| !key.is_empty())
 }
