@@ -4,8 +4,9 @@
 //! Only Kelpy's own files are deleted: the marker, `config.toml`, the executable, and Kelpy's folders, which are
 //! Kelpy's whole because a home is never created over names that were already there (see `Home::init`). A home in a
 //! folder shared with other files ("this folder") keeps those files, and the folder stays unless it ends up empty.
-//! The marker goes last, once everything else is gone: until then the folder is still a home, what is left in it is
-//! still provably Kelpy's, and the cleanup can be run again.
+//! The configuration and the marker go last, once everything else is gone: until then the folder is still a home,
+//! what is left in it is still provably Kelpy's, and the cleanup can be run again, still knowing from the
+//! configuration where the server's shared memory is, which stays. A server folder found in the home stays too.
 
 use std::env;
 use std::fs;
@@ -14,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Result;
+use kelpy_core::config::Config;
 use kelpy_core::home::{self, Home};
+use kelpy_core::server_folder;
 
 use crate::setup::same_file;
 use crate::{platform, prompt, runtime};
@@ -30,8 +33,43 @@ pub fn run(home: &Home, assume_yes: bool) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     };
     let lock = runtime::lock_path(home);
+    // Kept whatever happens: the runtime's lock, and the server's memory shared with the other administrators.
+    // The configuration says where that is: it goes last, so that a cleanup run again still knows.
+    let mut keep = vec![lock.clone()];
+    let shared = match Config::load(&home.config_path()) {
+        Ok(config) => config.memory.shared,
+        Err(_) if !home.config_path().exists() => None,
+        Err(error) => {
+            println!(
+                "Cannot read {}: {error}. It says where the server's memory shared with the other administrators \
+                 is, which must stay. Nothing removed: correct it, then run this again.",
+                home.config_path().display()
+            );
+            return Ok(ExitCode::from(1));
+        }
+    };
+    if let Some(shared) = &shared {
+        match shared_folder(root, shared) {
+            SharedFolder::Elsewhere => {}
+            SharedFolder::Inside(path) => keep.push(path),
+            SharedFolder::Around => {
+                println!(
+                    "Kelpy's home {} is inside the server's shared memory, {}: removing it could delete what the \
+                     other administrators share. Nothing removed.",
+                    root.display(),
+                    shared.display()
+                );
+                return Ok(ExitCode::from(1));
+            }
+        }
+    }
 
     let entries = own_entries(home);
+    // Whatever the configuration says, a server folder found in the home stays, and so does a folder that cannot
+    // be read: it might hold one.
+    for entry in entries.iter().filter(|entry| is_real_dir(entry)) {
+        server_folders(entry, &mut keep);
+    }
     println!("This removes Kelpy from this computer:");
     println!("  - from {}:", root.display());
     for entry in &entries {
@@ -39,7 +77,18 @@ pub fn run(home: &Home, assume_yes: bool) -> Result<ExitCode> {
         let slash = if entry.is_dir() { "/" } else { "" };
         println!("      {name}{slash}");
     }
-    println!("    conversations, server memory and workspace files are deleted for good;");
+    match &shared {
+        None => {
+            println!("    conversations, server memory and workspace files are deleted for good;")
+        }
+        Some(shared) => {
+            println!("    conversations and workspace files are deleted for good;");
+            println!(
+                "    the server's memory, shared in {}, stays for the other administrators;",
+                shared.display()
+            );
+        }
+    }
     println!("  - the Kelpy folder from your PATH, and the record of this home for your user.");
     if has_other_files(root, &entries) {
         println!(
@@ -75,8 +124,12 @@ pub fn run(home: &Home, assume_yes: bool) -> Result<ExitCode> {
 
     let running = env::current_exe().ok();
     let marker = home.marker_path();
+    let config = home.config_path();
     let mut files_left = false;
-    for entry in entries.iter().filter(|entry| **entry != marker) {
+    for entry in entries
+        .iter()
+        .filter(|entry| **entry != marker && **entry != config)
+    {
         let result = if running
             .as_deref()
             .is_some_and(|running| same_file(running, entry))
@@ -84,7 +137,7 @@ pub fn run(home: &Home, assume_yes: bool) -> Result<ExitCode> {
             // This very executable: Unix deletes it; Windows moves it to the temp folder.
             platform::remove_running_executable(entry)
         } else if entry.is_dir() {
-            remove_dir_keeping(entry, &lock)
+            remove_dir_keeping(entry, &keep)
         } else {
             fs::remove_file(entry)
         };
@@ -93,7 +146,24 @@ pub fn run(home: &Home, assume_yes: bool) -> Result<ExitCode> {
             files_left = true;
         }
     }
+    let mut kept: Vec<&PathBuf> = keep
+        .iter()
+        .filter(|kept| **kept != lock && fs::symlink_metadata(kept).is_ok())
+        .collect();
+    kept.sort();
+    kept.dedup();
+    for kept in &kept {
+        println!(
+            "✓ Kept {}: it holds, or may hold, a server's shared memory",
+            kept.display()
+        );
+    }
     if files_left {
+        complete = false;
+    } else if let Err(error) = fs::remove_file(&config)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        println!("! Could not delete {}: {error}", config.display());
         complete = false;
     } else if let Err(error) = fs::remove_file(&marker) {
         println!("! Could not delete {}: {error}", marker.display());
@@ -117,17 +187,73 @@ pub fn run(home: &Home, assume_yes: bool) -> Result<ExitCode> {
     }
 }
 
-/// Deletes `dir` with everything in it but `keep` and the folders that lead to it, which stay.
-fn remove_dir_keeping(dir: &Path, keep: &Path) -> io::Result<()> {
-    if !keep.starts_with(dir) {
+/// Where the server folder is, against the home.
+#[derive(Debug, PartialEq, Eq)]
+enum SharedFolder {
+    Elsewhere,
+    /// Inside the home, at this path under it: kept.
+    Inside(PathBuf),
+    /// Around the home, or the home itself.
+    Around,
+}
+
+/// Where the server folder `shared` is against the home `root`, as the system finds both. Kelpy refuses a server
+/// folder that overlaps the home, but a configuration made before, or by hand, may still have one.
+fn shared_folder(root: &Path, shared: &Path) -> SharedFolder {
+    let (home, shared) = (
+        server_folder::resolved(root),
+        server_folder::resolved(shared),
+    );
+    if home.starts_with(&shared) {
+        SharedFolder::Around
+    } else if let Ok(under) = shared.strip_prefix(&home) {
+        SharedFolder::Inside(root.join(under))
+    } else {
+        SharedFolder::Elsewhere
+    }
+}
+
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// Adds to `keep` the server folders in `dir` (marked by their marker file), and the folders that cannot be read.
+/// Links are not followed: deleting one deletes the link only.
+fn server_folders(dir: &Path, keep: &mut Vec<PathBuf>) {
+    if dir.join(server_folder::MARKER_FILE).is_file() {
+        keep.push(dir.to_path_buf());
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        keep.push(dir.to_path_buf());
+        return;
+    };
+    for entry in entries {
+        match entry {
+            Ok(entry) if is_real_dir(&entry.path()) => server_folders(&entry.path(), keep),
+            Ok(_) => {}
+            Err(_) => {
+                keep.push(dir.to_path_buf());
+                return;
+            }
+        }
+    }
+}
+
+/// Deletes `dir` with everything in it but what is in `keep` and the folders that lead to it, which stay.
+fn remove_dir_keeping(dir: &Path, keep: &[PathBuf]) -> io::Result<()> {
+    if keep.iter().any(|keep| dir.starts_with(keep)) {
+        return Ok(());
+    }
+    if !keep.iter().any(|keep| keep.starts_with(dir)) {
         return fs::remove_dir_all(dir);
     }
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if path == keep {
+        if keep.contains(&path) {
             continue;
         }
-        if keep.starts_with(&path) {
+        if keep.iter().any(|keep| keep.starts_with(&path)) {
             remove_dir_keeping(&path, keep)?;
         } else if fs::symlink_metadata(&path)?.is_dir() {
             fs::remove_dir_all(&path)?;
@@ -229,6 +355,98 @@ mod tests {
     }
 
     #[test]
+    fn the_server_s_shared_memory_in_the_home_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Kelpy");
+        let home = Home::init(&root).unwrap();
+        // Configured before Kelpy refused a shared folder in the home, or by hand.
+        let shared = home.workspace_dir().join("server");
+        fs::create_dir_all(shared.join("memory")).unwrap();
+        fs::write(shared.join("server.db"), b"records").unwrap();
+        fs::write(home.workspace_dir().join("draft.txt"), b"mine").unwrap();
+        kelpy_core::config::save_shared_memory(&home.config_path(), &shared).unwrap();
+
+        run(&home, true).unwrap();
+        assert!(shared.join("server.db").is_file());
+        assert!(shared.join("memory").is_dir());
+        assert!(!home.workspace_dir().join("draft.txt").exists());
+        assert!(!home.config_path().exists());
+        assert!(!home::is_home(&root));
+    }
+
+    #[test]
+    fn a_cleanup_run_again_still_keeps_the_server_s_shared_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Kelpy");
+        let home = Home::init(&root).unwrap();
+        let shared = home.workspace_dir().join("server");
+        fs::create_dir_all(shared.join("memory")).unwrap();
+        fs::write(shared.join("server.db"), b"records").unwrap();
+        kelpy_core::config::save_shared_memory(&home.config_path(), &shared).unwrap();
+        let log = home.logs_dir().join("kelpy.log");
+        fs::write(&log, b"log").unwrap();
+        {
+            let Some(_held) = hold_undeletable(&log) else {
+                return; // Deleting cannot be refused here (e.g. running as root): nothing to check.
+            };
+            // The first stops on the log: the configuration, which says what to keep, is still there.
+            assert_eq!(run(&home, true).unwrap(), ExitCode::from(1));
+            assert!(home.config_path().exists());
+            assert!(shared.join("server.db").is_file());
+        }
+        assert_eq!(run(&home, true).unwrap(), ExitCode::SUCCESS);
+        assert!(shared.join("server.db").is_file());
+        assert!(!log.exists());
+        assert!(!home::is_home(&root));
+    }
+
+    #[test]
+    fn a_configuration_that_cannot_be_read_stops_the_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::init(dir.path().join("Kelpy")).unwrap();
+        let draft = home.workspace_dir().join("draft.txt");
+        fs::write(&draft, b"mine").unwrap();
+        fs::write(home.config_path(), "[memory\nshared = ").unwrap();
+
+        assert_eq!(run(&home, true).unwrap(), ExitCode::from(1));
+        assert!(draft.is_file());
+        assert!(home::is_home(home.root()));
+    }
+
+    #[test]
+    fn a_server_folder_in_the_home_is_kept_without_the_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Kelpy");
+        let home = Home::init(&root).unwrap();
+        let shared = home.workspace_dir().join("team").join("server");
+        fs::create_dir_all(shared.join("memory")).unwrap();
+        fs::write(
+            shared.join(server_folder::MARKER_FILE),
+            b"Kelpy server folder",
+        )
+        .unwrap();
+        fs::write(shared.join("server.db"), b"records").unwrap();
+        fs::write(home.workspace_dir().join("team").join("draft.txt"), b"mine").unwrap();
+        fs::remove_file(home.config_path()).unwrap();
+
+        assert_eq!(run(&home, true).unwrap(), ExitCode::SUCCESS);
+        assert!(shared.join("server.db").is_file());
+        assert!(!home.workspace_dir().join("team").join("draft.txt").exists());
+        assert!(!home::is_home(&root));
+    }
+
+    #[test]
+    fn a_home_inside_the_server_s_shared_memory_is_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::init(dir.path().join("Kelpy")).unwrap();
+        kelpy_core::config::save_shared_memory(&home.config_path(), dir.path()).unwrap();
+
+        assert_eq!(run(&home, true).unwrap(), ExitCode::from(1));
+        assert!(home.config_path().exists());
+        assert!(home::is_home(home.root()));
+    }
+
+    #[test]
     fn the_marker_stays_while_anything_of_kelpy_is_left() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("Kelpy");
@@ -240,7 +458,7 @@ mod tests {
         };
 
         assert_eq!(run(&home, true).unwrap(), ExitCode::from(1));
-        assert!(!home.config_path().exists());
+        assert!(home.config_path().exists());
         assert!(log.exists());
         assert!(home::is_home(&root), "a partial cleanup must keep the home");
     }
@@ -314,7 +532,7 @@ mod tests {
         fs::write(home.data_dir().join("kelpy.db"), b"conversations").unwrap();
         fs::create_dir(home.data_dir().join("backups")).unwrap();
 
-        remove_dir_keeping(&home.data_dir(), &runtime::lock_path(&home)).unwrap();
+        remove_dir_keeping(&home.data_dir(), &[runtime::lock_path(&home)]).unwrap();
         assert!(!home.data_dir().join("kelpy.db").exists());
         assert!(!home.data_dir().join("backups").exists());
         // The same lock, still held: no second owner while the first one lives.

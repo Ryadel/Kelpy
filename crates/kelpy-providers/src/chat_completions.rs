@@ -22,7 +22,20 @@ pub fn request(
         messages.push(json!({ "role": "system", "content": chat.system }));
     }
     messages.extend(chat.messages.iter().map(|message| match message {
-        ChatMessage::User(text) => json!({ "role": "user", "content": text }),
+        ChatMessage::User { text, images } => {
+            let (text, images) = ChatMessage::user_parts(text, images.as_ref());
+            if images.is_empty() {
+                // As a string: servers for text alone refuse content given as parts.
+                json!({ "role": "user", "content": text })
+            } else {
+                let mut content: Vec<Value> = images
+                    .iter()
+                    .map(|image| json!({ "type": "image_url", "image_url": { "url": image.data_url() } }))
+                    .collect();
+                content.push(json!({ "type": "text", "text": text }));
+                json!({ "role": "user", "content": content })
+            }
+        }
         ChatMessage::Assistant { text, calls, .. } if calls.is_empty() => {
             json!({ "role": "assistant", "content": text })
         }

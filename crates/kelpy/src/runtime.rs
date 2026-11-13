@@ -6,7 +6,7 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
@@ -16,13 +16,16 @@ use anyhow::{Context, Result};
 use kelpy_common::unix_now;
 use kelpy_core::VERSION;
 use kelpy_core::agent::{Agent, KeySource, Needed, ProviderInfo};
-use kelpy_core::config::Config;
+use kelpy_core::config::{Config, MemoryUse};
 use kelpy_core::home::{self, Home};
 use kelpy_core::private_file;
 use kelpy_core::providers::chatgpt::Endpoints;
+use kelpy_core::server_folder::ServerFolder;
 use kelpy_core::storage::Store;
 use kelpy_core::vault::VaultState;
-use kelpy_gateway::{Activity, Auth, Elevation, ElevationStep, How, RuntimeStatus, StopRequest};
+use kelpy_gateway::{
+    Activity, Auth, Elevation, ElevationStep, How, MemoryView, RuntimeStatus, StopRequest,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::handover::{self, Channel, Handover, Message};
@@ -189,9 +192,46 @@ const RELEASE_WAIT: Duration = Duration::from_secs(10);
 /// one stops.
 pub async fn run_foreground(home: &Home, launch: Launch, limits: Limits) -> Result<ExitCode> {
     platform::remove_leftovers(&home.root().join(home::executable_name()), &home.data_dir());
-    let Some(lock) = RuntimeLock::try_acquire(home)? else {
+    // Taken again only on Windows, after the prompt to start as administrator was refused.
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let Some(mut lock) = RuntimeLock::try_acquire(home)? else {
         return already_running(home, &launch).await;
     };
+    // The shared memory chosen needs administrator rights: started without them, Kelpy offers to start again with
+    // them; otherwise it goes on with the home's own memory, and says so.
+    if let Ok(config) = Config::load(&home.config_path())
+        && config.memory.chosen() == MemoryUse::Shared
+        && let Some(shared) = config.memory.shared_folder()
+        && !kelpy_core::Account::current().elevated
+    {
+        println!("{}.", needs_administrator(&shared));
+        #[cfg(windows)]
+        if prompt::interactive()
+            && prompt::confirm(
+                "Start Kelpy as administrator now? Windows asks you to confirm. If not, Kelpy uses your private memory.",
+                true,
+            )?
+        {
+            drop(lock);
+            if start_as_administrator().await? {
+                println!("Kelpy runs as administrator in a new window.");
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!("Windows did not allow it: the prompt was refused or closed.");
+            lock = match RuntimeLock::try_acquire(home)? {
+                Some(lock) => lock,
+                None => return already_running(home, &launch).await,
+            };
+        }
+        if cfg!(windows) {
+            println!(
+                "Kelpy uses your private memory meanwhile: choose Shared in the Memory menu, under the message box, to \
+                 restart it as administrator."
+            );
+        } else {
+            println!("Kelpy uses your private memory meanwhile.");
+        }
+    }
     let start = Start {
         lock,
         handover: None,
@@ -306,6 +346,144 @@ fn told<T>(
     result
 }
 
+/// `home`, with the server's memory in the server folder `shared`, which only administrators can open: its pages,
+/// and the records `store` keeps from now on, each saying which administrator's Kelpy made the change.
+fn share_memory(home: &Home, shared: &Path, store: &mut Store) -> Result<Home> {
+    apart(home, shared)?;
+    let account = kelpy_core::Account::current();
+    if !account.elevated {
+        anyhow::bail!("{}", needs_administrator(shared));
+    }
+    let folder = ServerFolder::open_or_create(shared).with_context(|| {
+        format!(
+            "cannot open the server's shared memory in {}",
+            shared.display()
+        )
+    })?;
+    store
+        .share_records(&folder.database_path())
+        .context("cannot open the server's shared records")?;
+    store.set_recorder(&account.name);
+    Ok(home.clone().with_memory(folder.memory_dir()))
+}
+
+/// Refuses a server folder `shared` that overlaps the home: the home is one administrator's, and `kelpy cleanup`
+/// deletes it.
+fn apart(home: &Home, shared: &Path) -> Result<()> {
+    if kelpy_core::server_folder::overlaps(shared, home.root()) {
+        anyhow::bail!(
+            "the server's shared memory, {}, and Kelpy's home, {}, overlap: the home is yours alone, and \
+             `kelpy cleanup` deletes it. Set a folder outside the home in the [memory] section of {}",
+            shared.display(),
+            home.root().display(),
+            home.config_path().display()
+        );
+    }
+    Ok(())
+}
+
+/// Starts Kelpy again as administrator, as it was started, in a window of its own, once Windows' prompt allows it.
+/// Returns whether it did.
+#[cfg(windows)]
+async fn start_as_administrator() -> Result<bool> {
+    let program = std::env::current_exe().context("cannot locate the Kelpy executable")?;
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let started =
+        tokio::task::spawn_blocking(move || elevate::through_prompt(&program, &arguments, true))
+            .await??;
+    Ok(started.is_some())
+}
+
+/// Why Kelpy, not running as administrator, cannot use the shared memory in `shared`, and what to do.
+pub fn needs_administrator(shared: &Path) -> String {
+    let how = if cfg!(windows) {
+        "start Kelpy as administrator"
+    } else {
+        "start Kelpy with `sudo kelpy`"
+    };
+    format!(
+        "Only administrators can open the server's shared memory, in {}: to use it, {how}",
+        shared.display()
+    )
+}
+
+/// The memory of the server this Kelpy uses: `chosen`, unless it is the shared one and cannot be opened, when the
+/// home's own is used and the interfaces say why. With the shared one, `home` is returned with its folder, and
+/// `store` keeps its records there.
+fn memory_of(
+    home: &Home,
+    config: &kelpy_core::config::MemoryConfig,
+    chosen: MemoryUse,
+    store: &mut Store,
+) -> (Home, MemoryView) {
+    let shared = config.shared_folder();
+    let mut view = MemoryView {
+        using: MemoryUse::Private,
+        chosen,
+        shared: shared.as_ref().map(|folder| folder.display().to_string()),
+        problem: None,
+    };
+    let (MemoryUse::Shared, Some(shared)) = (chosen, shared) else {
+        return (home.clone(), view);
+    };
+    match share_memory(home, &shared, store) {
+        Ok(home) => {
+            view.using = MemoryUse::Shared;
+            (home, view)
+        }
+        Err(error) => {
+            view.problem = Some(format!("{error:#}"));
+            (home.clone(), view)
+        }
+    }
+}
+
+/// The memory to use: `asked` from an interface, once recorded in the configuration at `config`, or the one
+/// `recorded` there, with why `asked` could not be.
+fn record_memory(
+    config: &Path,
+    recorded: MemoryUse,
+    asked: Option<MemoryUse>,
+) -> (MemoryUse, Option<String>) {
+    let Some(asked) = asked else {
+        return (recorded, None);
+    };
+    match kelpy_core::config::save_memory(config, asked, None) {
+        Ok(()) => (asked, None),
+        Err(error) => {
+            tracing::warn!("cannot record the memory chosen: {error}");
+            let problem = format!(
+                "the {} memory could not be recorded as the one chosen, so Kelpy goes on with the one recorded \
+                 before: {error}",
+                memory_name(asked)
+            );
+            (recorded, Some(problem))
+        }
+    }
+}
+
+/// The memory `using`, as the interfaces name it.
+fn memory_name(using: MemoryUse) -> &'static str {
+    match using {
+        MemoryUse::Private => "private",
+        MemoryUse::Shared => "shared",
+    }
+}
+
+/// The memory line of the start screen and the start-up lines.
+fn memory_line(home: &Home, memory: &MemoryView) -> String {
+    match (memory.using, &memory.problem) {
+        (MemoryUse::Shared, _) => format!(
+            "shared with the other administrators, in {}",
+            home.memory_dir().display()
+        ),
+        (MemoryUse::Private, Some(problem)) => {
+            format!("private, as the shared one is not available: {problem}")
+        }
+        (MemoryUse::Private, None) => "private, only for you".to_owned(),
+    }
+}
+
 /// Runs one runtime in this process: fresh, or going on with what the Kelpy before handed over.
 async fn serve(home: &Home, launch: &Launch, limits: Limits, start: Start) -> Result<ExitCode> {
     let Start {
@@ -327,11 +505,27 @@ async fn serve(home: &Home, launch: &Launch, limits: Limits, start: Start) -> Re
             home.data_dir().display()
         );
     }
-    let store = told(
+    let mut store = told(
         &mut ready,
         Store::open(&home.data_dir().join(DATABASE_FILE))
             .context("cannot open the conversation database"),
     )?;
+    // The server's memory: the home's own, or shared with the other administrators, its pages and records in the
+    // server folder. Chosen from an interface, the Kelpy before hands the choice over: recorded first, then used, so
+    // that the next start uses it too. Not recorded, Kelpy goes on with the one recorded, and says why.
+    let (chosen, unrecorded) = record_memory(
+        &home.config_path(),
+        config.memory.chosen(),
+        handover.as_ref().and_then(|handover| handover.memory),
+    );
+    let (home, mut memory) = memory_of(home, &config.memory, chosen, &mut store);
+    if let Some(unrecorded) = unrecorded {
+        memory.problem = Some(match memory.problem.take() {
+            Some(problem) => format!("{unrecorded}; {problem}"),
+            None => unrecorded,
+        });
+    }
+    let home = &home;
     let agent = Arc::new(told(
         &mut ready,
         Agent::new(home, store, config.provider.clone(), Endpoints::default()).map_err(Into::into),
@@ -453,6 +647,7 @@ async fn serve(home: &Home, launch: &Launch, limits: Limits, start: Start) -> Re
             &info,
             remote.as_ref(),
             last_port,
+            &memory_line(home, &memory),
         )
         .await?;
         if config.provider.is_none() && !launch.terminal_ui && prompt::interactive() {
@@ -468,11 +663,18 @@ async fn serve(home: &Home, launch: &Launch, limits: Limits, start: Start) -> Re
     }
 
     let elevated = agent.account().elevated;
-    let elevation = Arc::new(Elevation::new(
-        elevated,
-        how_to_elevate(),
-        Arc::clone(&agent),
-    ));
+    let elevation = Arc::new(
+        Elevation::new(elevated, how_to_elevate(), Arc::clone(&agent)).with_memory(
+            memory.clone(),
+            {
+                let config = home.config_path();
+                move |using| {
+                    kelpy_core::config::save_memory(&config, using, None)
+                        .map_err(|error| format!("cannot record the memory chosen: {error}"))
+                }
+            },
+        ),
+    );
     let status = RuntimeStatus {
         version: VERSION.to_owned(),
         pid: std::process::id(),
@@ -521,6 +723,8 @@ async fn serve(home: &Home, launch: &Launch, limits: Limits, start: Start) -> Re
     let mut terminal_ui = Box::pin(terminal_ui);
     let mut preparing: Option<tokio::task::JoinHandle<std::result::Result<Prepared, String>>> =
         None;
+    // The restart under way: whether as administrator, and with which memory.
+    let mut restarting = (true, None);
     let ending = loop {
         tokio::select! {
             result = &mut server => {
@@ -533,8 +737,14 @@ async fn serve(home: &Home, launch: &Launch, limits: Limits, start: Start) -> Re
                 Ok(kelpy_tui::Exit::Stopped) => "requested from another interface".to_owned(),
                 Err(error) => format!("{error:#}"),
             })),
-            cancel = elevation.requested(), if preparing.is_none() => {
-                preparing = Some(tokio::spawn(prepare(home.clone(), launch.terminal_ui, cancel)));
+            restart = elevation.requested(), if preparing.is_none() => {
+                restarting = (restart.elevate, restart.memory);
+                preparing = Some(tokio::spawn(prepare(
+                    home.clone(),
+                    launch.terminal_ui,
+                    restart.cancel,
+                    restart.elevate,
+                )));
             }
             prepared = async { preparing.as_mut().expect("guarded").await }, if preparing.is_some() => {
                 preparing = None;
@@ -572,12 +782,18 @@ async fn serve(home: &Home, launch: &Launch, limits: Limits, start: Start) -> Re
         Ending::HandOver(prepared) => prepared,
     };
 
-    // Restarting as administrator: this runtime stops without telling the interfaces, which reconnect to the new
-    // one, and without ending the ChatGPT session, which the new one goes on with. The terminal UI closes first.
+    // Restarting, as administrator or with the other memory: this runtime stops without telling the interfaces,
+    // which reconnect to the new one, and without ending the ChatGPT session, which the new one goes on with. The
+    // terminal UI closes first.
+    let (as_administrator, with_memory) = restarting;
     elevation.set(ElevationStep::Restarting);
     drop(terminal_ui);
     println!();
-    println!("Restarting Kelpy as administrator.");
+    match with_memory {
+        Some(MemoryUse::Shared) => println!("Restarting Kelpy with the shared memory."),
+        Some(MemoryUse::Private) => println!("Restarting Kelpy with your private memory."),
+        None => println!("Restarting Kelpy as administrator."),
+    }
     let Prepared { mut channel, pid } = prepared;
     let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
     let answers_saved = agent.stop_for_restart(SHUTDOWN_GRACE);
@@ -597,6 +813,7 @@ async fn serve(home: &Home, launch: &Launch, limits: Limits, start: Start) -> Re
         stops_at: info.stops_at,
         idle_limit: info.idle_limit,
         ssh,
+        memory: with_memory,
     };
     let sent = serde_json::to_vec(&handover)?;
     drop(handover);
@@ -618,16 +835,19 @@ async fn serve(home: &Home, launch: &Launch, limits: Limits, start: Start) -> Re
     };
     match outcome {
         Ok(()) => {
+            let how = if as_administrator {
+                " as administrator"
+            } else {
+                ""
+            };
             println!(
-                "Kelpy runs as administrator (PID {pid}), without a window, at the same address: the Web UI reloads \
-                 by itself. `kelpy tui` opens the terminal UI, `kelpy stop` stops it."
+                "Kelpy runs{how} (PID {pid}), without a window, at the same address: the Web UI reloads by itself. \
+                 `kelpy tui` opens the terminal UI, `kelpy stop` stops it."
             );
             Ok(ExitCode::SUCCESS)
         }
         Err(reason) => {
-            println!(
-                "The Kelpy restarted as administrator did not take over: {reason}. Start Kelpy again."
-            );
+            println!("The Kelpy restarted did not take over: {reason}. Start Kelpy again.");
             Ok(ExitCode::FAILURE)
         }
     }
@@ -687,6 +907,7 @@ async fn introduce(
     info: &RuntimeInfo,
     remote: Option<&kelpy_remote::Remote>,
     last_port: Option<u16>,
+    memory: &str,
 ) -> Result<Option<kelpy_tui::Banner>> {
     let address: SocketAddr = info
         .url
@@ -732,6 +953,7 @@ async fn introduce(
             account.push_str(&format!(" · Vault: {vault}"));
         }
         header.push(account);
+        header.push(format!("Memory: {memory}"));
         header.extend(agent.account().limits().map(str::to_owned));
         header.extend(reachable.iter().map(|line| format!("SSH: {line}")));
         header.extend(moved);
@@ -752,6 +974,7 @@ async fn introduce(
             info.access_code
         );
         println!("Home:     {}", home.root().display());
+        println!("Memory:   {memory}");
         println!("Provider: {}", describe_provider(agent));
         println!("Account:  {}", agent.account().label());
         if let Some(limits) = agent.account().limits() {
@@ -799,13 +1022,73 @@ fn how_to_elevate() -> Option<How> {
     }
 }
 
-/// Restarts Kelpy as administrator, up to the point where the new one is connected: the system's prompt, the
-/// channel. Until then nothing changes here; refused, cancelled or failed, the reason is returned and Kelpy goes on
-/// as it was.
+/// Starts `program` with `arguments` again, with this Kelpy's rights, without a window or a terminal. Returns its PID.
+fn start_again(program: &Path, arguments: &[String]) -> io::Result<u32> {
+    use std::process::Stdio;
+    let mut command = std::process::Command::new(program);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own process group: a Ctrl+C in this terminal does not reach it.
+        command.process_group(0);
+    }
+    Ok(command.spawn()?.id())
+}
+
+/// Starts `program` with `arguments` as administrator, through the system's prompt: User Account Control, or `sudo`
+/// in Kelpy's terminal. Returns who the new Kelpy will be.
+async fn as_administrator(
+    program: std::path::PathBuf,
+    arguments: Vec<String>,
+    terminal_ui: bool,
+) -> std::result::Result<handover::Peer, String> {
+    #[cfg(windows)]
+    {
+        let _ = terminal_ui;
+        let started = tokio::task::spawn_blocking(move || {
+            elevate::through_prompt(&program, &arguments, false)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        match started {
+            Ok(Some(pid)) => Ok(handover::Peer::Process(pid)),
+            Ok(None) => Err("Windows did not allow it: the prompt was refused or closed".into()),
+            Err(error) => Err(format!("Windows could not start it ({error})")),
+        }
+    }
+    #[cfg(unix)]
+    {
+        // The terminal UI asked `sudo` for the password already, in its terminal; otherwise `sudo` asks there now.
+        match elevate::with_sudo(&program, &arguments, !terminal_ui).await {
+            Ok(true) => Ok(handover::Peer::Root),
+            Ok(false) if terminal_ui => {
+                Err("sudo needs your password: press Ctrl+E in Kelpy's terminal".into())
+            }
+            Ok(false) => Err("sudo did not allow it".into()),
+            Err(error) => Err(format!("sudo could not start it ({error})")),
+        }
+    }
+}
+
+/// Restarts Kelpy, as administrator if `elevate`, up to the point where the new one is connected: the system's
+/// prompt, the channel. Until then nothing changes here; refused, cancelled or failed, the reason is returned and
+/// Kelpy goes on as it was.
 async fn prepare(
     home: Home,
     terminal_ui: bool,
     cancel: kelpy_gateway::CancellationToken,
+    elevate: bool,
 ) -> std::result::Result<Prepared, String> {
     let listener =
         handover::Listener::open().map_err(|error| format!("cannot open a channel ({error})"))?;
@@ -817,48 +1100,19 @@ async fn prepare(
         listener.name().to_owned(),
         std::process::id().to_string(),
     ];
-    #[cfg(windows)]
-    let peer = {
-        let started = tokio::task::spawn_blocking(move || {
-            // Development builds can restart without the prompt, which no automated check can answer.
-            if cfg!(debug_assertions)
-                && std::env::var_os("KELPY_TEST_RESTART_WITHOUT_PROMPT").is_some()
-            {
-                use std::process::Stdio;
-                return std::process::Command::new(&program)
-                    .args(&arguments)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .map(|child| Some(child.id()));
-            }
-            elevate::through_prompt(&program, &arguments)
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-        match started {
-            Ok(Some(pid)) => handover::Peer::Process(pid),
-            Ok(None) => {
-                return Err("Windows did not allow it: the prompt was refused or closed".into());
-            }
-            Err(error) => return Err(format!("Windows could not start it ({error})")),
-        }
+    // Development builds can restart without the prompt, which no automated check can answer.
+    let without_prompt = !elevate
+        || (cfg!(debug_assertions)
+            && std::env::var_os("KELPY_TEST_RESTART_WITHOUT_PROMPT").is_some());
+    let peer = if without_prompt {
+        let _ = terminal_ui;
+        handover::Peer::Process(
+            start_again(&program, &arguments)
+                .map_err(|error| format!("cannot start it ({error})"))?,
+        )
+    } else {
+        as_administrator(program, arguments, terminal_ui).await?
     };
-    #[cfg(unix)]
-    let peer = {
-        // The terminal UI asked `sudo` for the password already, in its terminal; otherwise `sudo` asks there now.
-        match elevate::with_sudo(&program, &arguments, !terminal_ui).await {
-            Ok(true) => handover::Peer::Root,
-            Ok(false) if terminal_ui => {
-                return Err("sudo needs your password: press Ctrl+E in Kelpy's terminal".into());
-            }
-            Ok(false) => return Err("sudo did not allow it".into()),
-            Err(error) => return Err(format!("sudo could not start it ({error})")),
-        }
-    };
-    #[cfg(windows)]
-    let _ = terminal_ui;
     // Connected and said hello by then, or given up.
     let deadline = tokio::time::Instant::now() + HANDOVER_WAIT;
     let accepted = tokio::select! {
@@ -871,7 +1125,7 @@ async fn prepare(
     let mut channel = match accepted {
         Ok(channel) => channel,
         Err(error) if error.kind() == io::ErrorKind::TimedOut => {
-            return Err("the Kelpy restarted as administrator did not connect in time".into());
+            return Err("the Kelpy restarted did not connect in time".into());
         }
         Err(error) => return Err(format!("the channel was refused ({error})")),
     };
@@ -1500,6 +1754,36 @@ async fn stop_requested() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_memory_chosen_from_an_interface_is_used_only_once_recorded() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        fs::write(&config, "[memory]\nuse = \"shared\"\n").unwrap();
+
+        // Recorded first, then used.
+        assert_eq!(
+            record_memory(&config, MemoryUse::Shared, Some(MemoryUse::Private)),
+            (MemoryUse::Private, None)
+        );
+        let recorded = Config::load(&config).unwrap();
+        assert_eq!(recorded.memory.chosen(), MemoryUse::Private);
+        // Nothing asked: the one recorded.
+        assert_eq!(
+            record_memory(&config, MemoryUse::Private, None),
+            (MemoryUse::Private, None)
+        );
+        // Not recorded: the one recorded before goes on, and the interfaces say why.
+        let unwritable = home.path().join("missing").join("config.toml");
+        let (using, problem) =
+            record_memory(&unwritable, MemoryUse::Shared, Some(MemoryUse::Private));
+        assert_eq!(using, MemoryUse::Shared);
+        assert!(
+            problem
+                .unwrap()
+                .starts_with("the private memory could not be recorded as the one chosen")
+        );
+    }
 
     #[test]
     fn how_long_ago_is_said_as_a_person_says_it() {

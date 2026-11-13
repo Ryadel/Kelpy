@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use kelpy_common::{lock, unix_now};
-use kelpy_providers::{ChatMessage, ToolCall, ToolResult};
+use kelpy_providers::{ChatMessage, Images, ToolCall, ToolResult};
 use kelpy_storage::{
     Access, Action, ActionState, Approval, Message, NewAction, Plan, PlanStep, PlanStepRef, Role,
     Session,
@@ -112,6 +112,7 @@ impl Turns {
         let never_asks = ready.is_some_and(Prepared::never_asks);
         let changes = ready.is_some_and(Prepared::changes);
         let script = ready.is_some_and(|prepared| matches!(prepared.work, Work::Script { .. }));
+        let risk = ready.and_then(Prepared::risk);
         let proposal = ready.and_then(Prepared::proposal).map(plan_of);
         // A change, a plan or a secret: only with System access Full.
         let needs_full = changes || proposal.is_some() || never_asks;
@@ -155,6 +156,11 @@ impl Turns {
                         (ActionState::Running, None)
                     }
                     (None, _, Approval::Ask) => (ActionState::Waiting, None),
+                    // A command the model wrote, in Auto with Full: it runs, unless it looks like it could lose
+                    // data, lock the administrator out or stop the system.
+                    (None, Access::Full, Approval::Auto) if script && risk.is_none() => {
+                        (ActionState::Running, None)
+                    }
                     (None, _, _) if always_asks => (ActionState::Waiting, None),
                     // In Plan, a change outside the plan asks on its own.
                     (None, _, Approval::Plan) if changes => (ActionState::Waiting, None),
@@ -182,6 +188,7 @@ impl Turns {
                     change: change.as_ref(),
                     plan: proposal.as_ref(),
                     plan_step,
+                    risk,
                     state,
                     error: error.as_deref(),
                 })?;
@@ -566,12 +573,14 @@ fn show(answer: &watch::Sender<AnswerState>, action: &Action) {
 /// The conversation as the model reads it. An answer with actions becomes its steps: the text before each step's
 /// calls, the calls, their results, and the text after the last step. The answer being written, `current`, carries
 /// back what the model wrote besides text in each step, from `replays`. The operations the `administrator` asked
-/// for come before the user's message that follows them.
+/// for come before the user's message that follows them. A user's message with images in `shown` shows them, with
+/// the text that goes with them.
 pub(super) fn chat_messages(
     messages: &[Message],
     current: i64,
     replays: &HashMap<u32, Vec<Value>>,
     administrator: &[Action],
+    shown: &HashMap<i64, Images>,
 ) -> Vec<ChatMessage> {
     let mut chat = Vec::with_capacity(messages.len());
     // Those before the messages given are in their summary, or older.
@@ -589,15 +598,23 @@ pub(super) fn chat_messages(
                 {
                     notes.push(format!("- {}", context::administrator_note(action)));
                 }
-                if notes.is_empty() {
-                    chat.push(ChatMessage::user(&message.content));
-                } else {
-                    chat.push(ChatMessage::user(format!(
-                        "[Since your last answer, the administrator did this through Kelpy:\n{}]\n\n{}",
-                        notes.join("\n"),
-                        message.content
-                    )));
-                }
+                let with_notes = |text: &str| {
+                    if notes.is_empty() {
+                        text.to_owned()
+                    } else {
+                        format!(
+                            "[Since your last answer, the administrator did this through Kelpy:\n{}]\n\n{text}",
+                            notes.join("\n"),
+                        )
+                    }
+                };
+                chat.push(ChatMessage::User {
+                    text: with_notes(&message.content),
+                    images: shown.get(&message.id).map(|images| Images {
+                        text: with_notes(&images.text),
+                        images: images.images.clone(),
+                    }),
+                });
             }
             Role::User => {}
             Role::Assistant => {
@@ -657,6 +674,7 @@ mod tests {
             phase: None,
             plan: None,
             plan_step: None,
+            risk: None,
             step,
             position,
             call_id: format!("call_{id}"),
@@ -706,7 +724,7 @@ mod tests {
         ];
         let thinking = serde_json::json!({ "type": "thinking" });
         let replays = HashMap::from([(1, vec![thinking.clone()])]);
-        let chat = chat_messages(&messages, 2, &replays, &[]);
+        let chat = chat_messages(&messages, 2, &replays, &[], &HashMap::new());
         assert_eq!(chat.len(), 7);
         assert_eq!(chat[0], ChatMessage::user("Disks?"));
         assert!(
@@ -724,8 +742,10 @@ mod tests {
         );
         assert_eq!(chat[6], ChatMessage::assistant("The disk is 40% full."));
         // Only the answer being written carries back its blocks.
-        assert!(matches!(&chat_messages(&messages, 9, &replays, &[])[4],
-            ChatMessage::Assistant { replay, .. } if replay.is_empty()));
+        assert!(
+            matches!(&chat_messages(&messages, 9, &replays, &[], &HashMap::new())[4],
+            ChatMessage::Assistant { replay, .. } if replay.is_empty())
+        );
 
         // An operation of the administrator after the answer comes with the next message.
         let mut later = messages.to_vec();
@@ -733,8 +753,8 @@ mod tests {
         let mut restore = action(9, 0, 0, ActionState::Done);
         (restore.message_id, restore.after_message) = (None, Some(2));
         restore.summary = "Put back /etc/hosts as it was before this change".into();
-        let chat = chat_messages(&later, 2, &replays, &[restore]);
-        let ChatMessage::User(text) = chat.last().unwrap() else {
+        let chat = chat_messages(&later, 2, &replays, &[restore], &HashMap::new());
+        let ChatMessage::User { text, .. } = chat.last().unwrap() else {
             panic!("{chat:?}");
         };
         assert!(

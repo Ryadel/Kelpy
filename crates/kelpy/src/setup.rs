@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use kelpy_core::VERSION;
 use kelpy_core::home::{self, Home, HomeSource, Lookup, LookupInput};
+use kelpy_core::server_folder::{self, ServerFolder};
 
 use crate::platform::{self, PathChange};
 use crate::{prompt, runtime};
@@ -114,7 +115,17 @@ fn first_run(executable: &Path, executable_dir: &Path, options: &Options<'_>) ->
                 true,
             )?);
 
+    let shared = if interactive {
+        ask_memory(&target)?
+    } else {
+        None
+    };
+
     let home = install(executable, &target, in_place, add_to_path)?;
+    if let Some(shared) = &shared {
+        kelpy_core::config::save_shared_memory(&home.config_path(), shared)?;
+        println!("✓ Shared memory, in {}", shared.display());
+    }
     if !in_place && !temporary_installer() {
         if interactive {
             offer_installer_removal(executable, &home)?;
@@ -130,7 +141,10 @@ fn first_run(executable: &Path, executable_dir: &Path, options: &Options<'_>) ->
 fn ask_home(default_home: &Path, executable: &Path, executable_dir: &Path) -> Result<PathBuf> {
     println!("Kelpy v{VERSION}: first run");
     println!();
-    println!("Where should Kelpy live? It keeps its data, memory and workspace there.");
+    println!(
+        "Where should Kelpy live? It keeps your settings, sign-ins, conversations and workspace there; only you can \
+         open them."
+    );
     println!("  1) {}   (recommended)", default_home.display());
     println!("  2) This folder: {}", executable_dir.display());
     println!("  3) Another folder...");
@@ -143,6 +157,53 @@ fn ask_home(default_home: &Path, executable: &Path, executable_dir: &Path) -> Re
         if accept_folder(&target, executable)? {
             return Ok(target);
         }
+    }
+}
+
+/// Asks which memory of the server Kelpy uses: private, in the home at `home`, or shared with the other
+/// administrators of this computer, in the server folder. Shared is for administrators only: Kelpy running without
+/// their rights shows it greyed and keeps the private one; running with them, it proposes it. Returns the server
+/// folder when shared.
+fn ask_memory(home: &Path) -> Result<Option<PathBuf>> {
+    let Some(shared) = ServerFolder::default_path() else {
+        return Ok(None);
+    };
+    let elevated = kelpy_core::Account::current().elevated;
+    println!();
+    println!("Kelpy's memory of this server, its notes and what it changed:");
+    println!(
+        "  1) Private: only for you, in {}",
+        home.join("memory").display()
+    );
+    let option = format!(
+        "  2) Shared: with the other administrators of this computer, in {}",
+        shared.display()
+    );
+    if elevated {
+        println!("{option}");
+    } else {
+        println!(
+            "{}",
+            greyed(&format!(
+                "{option}   (not available: Kelpy is not running as administrator)"
+            ))
+        );
+    }
+    println!("Shared is available to administrators only, for security reasons.");
+    println!("You can change it any time in the Memory menu, under the message box of the Web UI.");
+    if !elevated || server_folder::overlaps(&shared, home) {
+        println!("✓ Private memory");
+        return Ok(None);
+    }
+    Ok((prompt::choose(2, 2)? == 2).then_some(shared))
+}
+
+/// `text` greyed, where the terminal shows colours: an option that cannot be chosen.
+fn greyed(text: &str) -> String {
+    if platform::colors() {
+        format!("\x1b[90m{text}\x1b[0m")
+    } else {
+        text.to_owned()
     }
 }
 

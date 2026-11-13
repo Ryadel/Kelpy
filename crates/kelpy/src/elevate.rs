@@ -4,10 +4,15 @@
 use std::io;
 use std::path::Path;
 
-/// Starts `program` with `arguments` as administrator, without a window, once the user allows it in User Account
-/// Control's prompt. Returns its PID, or `None` when the prompt was refused or closed. Blocks until it is answered.
+/// Starts `program` with `arguments` as administrator, in a window of its own if `window` or else without one, once
+/// the user allows it in User Account Control's prompt. Returns its PID, or `None` when the prompt was refused or
+/// closed. Blocks until it is answered.
 #[cfg(windows)]
-pub fn through_prompt(program: &Path, arguments: &[String]) -> io::Result<Option<u32>> {
+pub fn through_prompt(
+    program: &Path,
+    arguments: &[String],
+    window: bool,
+) -> io::Result<Option<u32>> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, GetLastError};
@@ -15,7 +20,7 @@ pub fn through_prompt(program: &Path, arguments: &[String]) -> io::Result<Option
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
 
     let wide = |text: &std::ffi::OsStr| -> Vec<u16> { text.encode_wide().chain([0]).collect() };
     let verb = wide("runas".as_ref());
@@ -33,7 +38,7 @@ pub fn through_prompt(program: &Path, arguments: &[String]) -> io::Result<Option
     info.lpVerb = verb.as_ptr();
     info.lpFile = file.as_ptr();
     info.lpParameters = parameters.as_ptr();
-    info.nShow = SW_HIDE;
+    info.nShow = if window { SW_SHOWNORMAL } else { SW_HIDE };
     // SAFETY: `info` is initialised as the call requires; the strings it points to live until it returns.
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
         // SAFETY: no other call in between.

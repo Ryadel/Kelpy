@@ -13,7 +13,7 @@
   import Elapsed from './Elapsed.svelte';
   import NoteText from './NoteText.svelte';
   import { diffLine, diffLines as linesOf, duration, stateLabels } from './actions';
-  import type { Action, Approval } from './api';
+  import type { Access, Action, Approval } from './api';
   import { canRestart, elevation, restartAsAdministrator } from './elevation.svelte';
   import { failedForRights } from './rights';
   import { runtime } from './runtime.svelte';
@@ -22,13 +22,15 @@
     action: Action;
     /** The conversation's Approval mode: the card offers only the modes that would change it. */
     approval: Approval;
+    /** The conversation's System access: with Full, Auto runs the commands the model writes. */
+    access: Access;
     /** Whether this page can take the decision, or stop the action, now. */
     canDecide: boolean;
     onDecide: (decision: 'approve' | 'deny', switchTo?: Approval) => Promise<void>;
     onStop: () => Promise<void>;
   }
 
-  let { action, approval, canDecide, onDecide, onStop }: Props = $props();
+  let { action, approval, access, canDecide, onDecide, onStop }: Props = $props();
 
   let deciding = $state(false);
 
@@ -56,11 +58,14 @@
   let following = true;
 
   const waiting = $derived(action.state === 'waiting');
-  /** A command the model wrote: it always asks, whatever the Approval mode. */
+  /** A command the model wrote: it asks in every Approval mode but Auto with System access Full. */
   const written = $derived(action.tool === 'run_command');
-  /** Plan helps from Ask only; Auto from Ask or Plan. A command written or a change on the floor asks in every mode. */
+  /** Plan helps from Ask only; Auto from Ask or Plan. A change on the floor asks in every mode; a command written runs
+   * in Auto only with Full, and only if it does not look risky. */
   const toPlan = $derived(!written && !action.change?.floor && approval === 'ask');
-  const toAuto = $derived(!written && !action.change?.floor && approval !== 'auto');
+  const toAuto = $derived(
+    !action.change?.floor && approval !== 'auto' && (!written || (access === 'full' && !action.risk)),
+  );
   /** The diff's lines, without its two header lines: the path is in the heading. */
   const diffLines = $derived(linesOf(action.change?.diff ?? ''));
   /** A command that ran and reported a failure. */
@@ -202,6 +207,11 @@
     </div>
   {/if}
   {#if waiting && written}
+    {#if action.risk && access === 'full'}
+      <p class="mt-2 flex gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+        <ShieldAlertIcon class="mt-px size-3.5 shrink-0" />{action.risk} It asks in Auto too.
+      </p>
+    {/if}
     <p class="text-muted-foreground mt-2 text-xs">
       Written by the AI model: Kelpy cannot check what it does. Read it before approving.
     </p>

@@ -206,6 +206,7 @@ impl Server {
                     change: change.as_ref(),
                     plan: None,
                     plan_step: None,
+                    risk: None,
                     state: ActionState::Running,
                     error: None,
                 })?;

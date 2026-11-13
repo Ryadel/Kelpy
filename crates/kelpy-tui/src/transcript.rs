@@ -325,6 +325,15 @@ pub(crate) fn action_lines(
             );
         }
     }
+    if let Some(why) = &action.risk {
+        push(
+            &mut lines,
+            &format!("! Asks in Auto too: {why}"),
+            4,
+            width,
+            floor,
+        );
+    }
     if let Some(change) = &action.change {
         if let Some(why) = &change.floor {
             push(

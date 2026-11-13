@@ -19,7 +19,10 @@ mod stop;
 
 pub use activity::{Activity, Busy};
 pub use auth::{Auth, AuthState};
-pub use elevation::{Elevation, ElevationView, How, Step as ElevationStep};
+pub use elevation::{
+    Chosen as MemoryChosen, Elevation, ElevationView, How, MemoryView, Refused as MemoryRefused,
+    Restart, Step as ElevationStep,
+};
 pub use kelpy_core::agent::Agent;
 pub use stop::StopRequest;
 pub use tokio_util::sync::CancellationToken;

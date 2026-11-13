@@ -37,6 +37,9 @@ pub struct Handover {
     pub stops_at: Option<i64>,
     pub idle_limit: Option<u64>,
     pub ssh: Option<crate::runtime::Ssh>,
+    /// The memory of the server chosen for the new Kelpy, which records it in the configuration once it runs.
+    #[serde(default)]
+    pub memory: Option<kelpy_core::config::MemoryUse>,
 }
 
 /// One message of the exchange.

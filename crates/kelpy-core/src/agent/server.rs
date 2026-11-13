@@ -46,8 +46,6 @@ pub(super) struct Server {
     checked: Mutex<Option<Instant>>,
     /// One check at a time.
     checking: tokio::sync::Mutex<()>,
-    /// One writing of `server.md` at a time.
-    writing: tokio::sync::Mutex<()>,
 }
 
 impl Server {
@@ -72,7 +70,6 @@ impl Server {
             memory,
             checked: Mutex::new(None),
             checking: tokio::sync::Mutex::new(()),
-            writing: tokio::sync::Mutex::new(()),
         }
     }
 

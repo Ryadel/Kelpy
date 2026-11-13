@@ -72,6 +72,20 @@ impl Provider {
         }
     }
 
+    /// Whether the model `settings` name can see images: ChatGPT's, OpenAI's and Anthropic's models do, an Ollama
+    /// model when its capabilities list `vision`. `None` when unknown, for an OpenAI-compatible service: one that
+    /// refuses images is then told apart by [`Outcome::images_refused`](crate::Outcome::images_refused).
+    pub async fn sees_images(&self, settings: &Settings) -> Result<Option<bool>, ProviderError> {
+        match settings.kind {
+            Kind::Ollama => {
+                self.ollama_vision(settings.base_url()?, &settings.model)
+                    .await
+            }
+            Kind::OpenAiCompatible => Ok(None),
+            Kind::ChatGpt | Kind::OpenAi | Kind::Anthropic => Ok(Some(true)),
+        }
+    }
+
     /// The models of the `kind` service at `base_url`. Anthropic's list comes in pages: the first one, of the
     /// largest size, holds them all.
     async fn list(

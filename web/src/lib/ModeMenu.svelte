@@ -48,7 +48,7 @@
       </button>
     {/snippet}
   </DropdownMenu.Trigger>
-  <DropdownMenu.Content align="end" class="w-80 p-1.5">
+  <DropdownMenu.Content align="end" class="w-80 max-w-[calc(100vw-1rem)] p-1.5">
     <DropdownMenu.Label class="text-muted-foreground px-2.5 text-xs font-normal">{label}</DropdownMenu.Label>
     <DropdownMenu.RadioGroup {value} onValueChange={(chosen) => onChange(chosen as T)}>
       {#each options as option (option.value)}

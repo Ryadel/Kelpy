@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import BotIcon from '@lucide/svelte/icons/bot';
+  import CheckIcon from '@lucide/svelte/icons/check';
+  import CopyIcon from '@lucide/svelte/icons/copy';
   import TerminalIcon from '@lucide/svelte/icons/terminal';
   import UploadIcon from '@lucide/svelte/icons/upload';
   import { Button } from '$lib/components/ui/button';
@@ -22,6 +24,7 @@
     type ChatGptStatus,
     type SignInMethod,
   } from './api';
+  import { copyText } from './clipboard';
 
   interface Props {
     /** The ways to sign in, in the order shown. */
@@ -43,6 +46,16 @@
   let registrationInput = $state<HTMLInputElement | null>(null);
   /** The code being approved, while a sign-in as the Codex CLI waits for it. */
   let code = $state<{ url: string; userCode: string; qr: string } | null>(null);
+  /** Whether the code was just copied: the button says so for a moment. */
+  let codeCopied = $state(false);
+
+  /** Copies the code to paste on ChatGPT's page. */
+  async function copyCode(userCode: string) {
+    if (await copyText(userCode)) {
+      codeCopied = true;
+      setTimeout(() => (codeCopied = false), 2000);
+    }
+  }
   let waiting: AbortController | null = null;
   /**
    * The next sign-in stays across restarts. Turning it on opens `confirming`: the sign-in then stays on disk, usable by
@@ -250,7 +263,18 @@
                 Open <a class="underline" href={code.url} target="_blank" rel="noreferrer">{code.url}</a> on any device,
                 sign in to ChatGPT and enter:
               </p>
-              <p class="font-mono text-lg tracking-widest">{code.userCode}</p>
+              <div class="flex items-center gap-1">
+                <p class="font-mono text-lg tracking-widest">{code.userCode}</p>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  aria-label="Copy the code"
+                  onclick={() => copyCode(code?.userCode ?? '')}
+                >
+                  {#if codeCopied}<CheckIcon class="size-4" />Copied{:else}<CopyIcon class="size-4" />Copy{/if}
+                </Button>
+              </div>
               <p class="text-muted-foreground text-xs">The code expires in 15 minutes. This page continues by itself.</p>
               <Button type="button" variant="outline" size="sm" onclick={cancelCode}>Cancel</Button>
             </div>

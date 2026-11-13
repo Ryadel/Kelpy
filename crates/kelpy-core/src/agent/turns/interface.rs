@@ -51,7 +51,10 @@ const APPROVAL: [Choice<Approval>; 3] = [
         name: "Auto",
         means: "looking, and the changes Kelpy checks and puts back (files, services, package installations, \
                 databases), need no approval; removing packages, stopping SSH, remote management or the network, and \
-                changes to the SSH, sudo, login, firewall, network or boot configuration still wait for it",
+                changes to the SSH, sudo, login, firewall, network or boot configuration still wait for it. With \
+                System access Full, the commands you write run too, unless they look like they delete files or \
+                databases, format disks, restart the computer, remove packages, run code that cannot be read first, \
+                or change the firewall, network, SSH, sudo, logins, accounts or boot: those wait",
     },
 ];
 
@@ -80,10 +83,11 @@ of the command's code block it follows, or else as a callout with its own Copy t
 closes; off, you stay concise and write none.
 - System access, now {access}. {access_choices}
 - Approval mode, now {approval}.{approval_note} {approval_choices} The commands you write with `run_command` \
-always wait for approval, in every mode.
+wait for approval in every mode, but Auto with System access Full as said.
 Each action you take shows in your answer as a card with Approve and Deny; on a card that is neither a command nor \
 a change that always asks, Switch to Plan (from Ask) and Switch to Auto (from Ask or Plan) approve it and change \
-the Approval mode. While an action runs, its card shows the time it has taken and Stop, which ends that action \
+the Approval mode; on a command, with System access Full, Switch to Auto does too, unless the command would wait in \
+Auto as well, and the card then says why. While an action runs, its card shows the time it has taken and Stop, which ends that action \
 only: you are told, and your answer goes on. A plan shows as one card \
 with its steps, each marked as it is carried out. The terminal button in the top bar opens the Command log: what \
 you ran in this conversation. There, Restore puts a file back as it was before one of your changes, from its \

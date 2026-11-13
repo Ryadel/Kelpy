@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
@@ -8,10 +8,14 @@ use axum::body::Body;
 use axum::http::request::Builder;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::response::Response;
+use kelpy_core::config::MemoryUse;
 use kelpy_core::home::Home;
 use kelpy_core::providers::chatgpt::Endpoints;
 use kelpy_core::storage::Store;
-use kelpy_gateway::{Activity, Agent, Auth, Elevation, How, RuntimeStatus, StopRequest, bind};
+use kelpy_gateway::{
+    Activity, Agent, Auth, Elevation, How, MemoryChosen, MemoryRefused, MemoryView, RuntimeStatus,
+    StopRequest, bind,
+};
 use kelpy_test_support::{FakeServer, chat_completions, id_token};
 use tower::ServiceExt;
 
@@ -390,9 +394,10 @@ async fn a_restart_as_administrator_is_asked_once_and_can_be_cancelled_while_the
     let ask = || authorized(Request::post("/api/elevation"), &auth);
     let asked = call(&app, ask(), Body::empty()).await;
     assert_eq!(asked.status(), StatusCode::ACCEPTED);
-    let cancel = tokio::time::timeout(Duration::from_secs(1), elevation.requested())
+    let restart = tokio::time::timeout(Duration::from_secs(1), elevation.requested())
         .await
         .unwrap();
+    assert!(restart.elevate && restart.memory.is_none());
     assert_eq!(read().await["step"], "prompt");
     // One at a time.
     let again = call(&app, ask(), Body::empty()).await;
@@ -404,7 +409,7 @@ async fn a_restart_as_administrator_is_asked_once_and_can_be_cancelled_while_the
     )
     .await;
     assert_eq!(cancelled.status(), StatusCode::ACCEPTED);
-    assert!(cancel.is_cancelled());
+    assert!(restart.cancel.is_cancelled());
 
     // Where the system has no prompt to show, an interface cannot ask.
     let by_hand = Arc::new(Elevation::new(false, Some(How::Command), agent()));
@@ -412,6 +417,139 @@ async fn a_restart_as_administrator_is_asked_once_and_can_be_cancelled_while_the
     // Already elevated: nothing to offer.
     let elevated = Elevation::new(true, Some(How::Prompt), agent());
     assert_eq!(elevated.view().how, None);
+}
+
+#[tokio::test]
+async fn choosing_the_other_memory_restarts_kelpy_as_administrator_only_for_the_shared_one() {
+    let auth = auth();
+    let kelpy = agent();
+    let memory = MemoryView {
+        using: MemoryUse::Private,
+        chosen: MemoryUse::Shared,
+        shared: Some("/var/lib/kelpy".into()),
+        problem: Some("only administrators can open it".into()),
+    };
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let elevation = Arc::new(
+        Elevation::new(false, Some(How::Prompt), Arc::clone(&kelpy)).with_memory(memory, {
+            let recorded = Arc::clone(&recorded);
+            move |using| {
+                recorded.lock().unwrap().push(using);
+                Ok(())
+            }
+        }),
+    );
+    let app = kelpy_gateway::router(
+        status(),
+        PORT,
+        Arc::new(Activity::new()),
+        Arc::clone(&auth),
+        kelpy,
+        Arc::new(StopRequest::new()),
+        Arc::clone(&elevation),
+    );
+    let response = call(
+        &app,
+        authorized(Request::get("/api/memory"), &auth),
+        Body::empty(),
+    )
+    .await;
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        (view["use"].as_str(), view["chosen"].as_str()),
+        (Some("private"), Some("shared"))
+    );
+    let choose = |using: &str| {
+        let request = authorized(Request::post("/api/memory"), &auth)
+            .header("content-type", "application/json");
+        (request, Body::from(format!("{{\"use\":\"{using}\"}}")))
+    };
+
+    // The private memory, used while the shared one chosen cannot be opened: recorded as the one chosen from now
+    // on, without a restart.
+    let (request, body) = choose("private");
+    let response = call(&app, request, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        (view["use"].as_str(), view["chosen"].as_str()),
+        (Some("private"), Some("private"))
+    );
+    assert!(view["problem"].is_null());
+    assert_eq!(*recorded.lock().unwrap(), [MemoryUse::Private]);
+    // Then it is in use and chosen: nothing to do.
+    let (request, body) = choose("private");
+    assert_eq!(
+        call(&app, request, body).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+    // The shared one, not as administrator: through the system's prompt.
+    let (request, body) = choose("shared");
+    assert_eq!(
+        call(&app, request, body).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let restart = tokio::time::timeout(Duration::from_secs(1), elevation.requested())
+        .await
+        .unwrap();
+    assert!(restart.elevate);
+    assert_eq!(restart.memory, Some(MemoryUse::Shared));
+
+    // As administrator already, either memory restarts without the prompt.
+    let elevated = Elevation::new(true, Some(How::Prompt), agent()).with_memory(
+        MemoryView {
+            using: MemoryUse::Shared,
+            chosen: MemoryUse::Shared,
+            shared: None,
+            problem: None,
+        },
+        |_| Ok(()),
+    );
+    assert_eq!(
+        elevated.request_memory(MemoryUse::Private),
+        Ok(MemoryChosen::Restarts)
+    );
+    let restart = elevated.requested().await;
+    assert!(!restart.elevate);
+    // While a restart with the shared memory is under way, from another page, the private one in use cannot be
+    // recorded meanwhile: the restart would record the shared one again.
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let pending = Elevation::new(false, Some(How::Prompt), agent()).with_memory(
+        MemoryView {
+            using: MemoryUse::Private,
+            chosen: MemoryUse::Shared,
+            shared: None,
+            problem: None,
+        },
+        {
+            let recorded = Arc::clone(&recorded);
+            move |using| {
+                recorded.lock().unwrap().push(using);
+                Ok(())
+            }
+        },
+    );
+    assert_eq!(
+        pending.request_memory(MemoryUse::Shared),
+        Ok(MemoryChosen::Restarts)
+    );
+    assert!(matches!(
+        pending.request_memory(MemoryUse::Private),
+        Err(MemoryRefused::Conflict(_))
+    ));
+    assert!(recorded.lock().unwrap().is_empty());
+    assert_eq!(pending.memory().chosen, MemoryUse::Shared);
+    assert_eq!(pending.requested().await.memory, Some(MemoryUse::Shared));
+    // Where no prompt can be shown, the shared memory cannot be chosen from an interface.
+    let by_hand = Elevation::new(false, Some(How::Command), agent());
+    assert!(by_hand.request_memory(MemoryUse::Shared).is_err());
 }
 
 #[tokio::test]

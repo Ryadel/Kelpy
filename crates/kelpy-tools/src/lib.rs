@@ -262,9 +262,19 @@ pub struct Prepared {
 
 impl Prepared {
     /// Whether it waits for the administrator's approval in every Approval mode, outside a plan: a command the
-    /// model wrote may do anything, and a floor change could lock the administrator out.
+    /// model wrote may do anything, and a floor change could lock the administrator out. With System access Full
+    /// and Approval mode Auto, a command the model wrote runs without asking unless it has a [`Prepared::risk`].
     pub fn always_asks(&self) -> bool {
         matches!(self.work, Work::Script { .. }) || self.floor().is_some()
+    }
+
+    /// For a command the model wrote, why it asks even in Auto, if it looks like it could lose data, lock the
+    /// administrator out or stop the system: found by patterns on its text, no guarantee.
+    pub fn risk(&self) -> Option<&'static str> {
+        match &self.work {
+            Work::Script { shells, .. } => script::risk(&shells.first()?.display),
+            _ => None,
+        }
     }
 
     /// Whether it runs without approval in every Approval mode: it neither looks at nor changes the system.

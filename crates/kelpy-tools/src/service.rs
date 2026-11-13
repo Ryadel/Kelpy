@@ -134,7 +134,7 @@ impl ServiceChange {
 
 /// The services through which the administrator reaches the server: stopping, restarting or disabling them could
 /// lock them out.
-const ACCESS: &[&str] = &[
+pub(crate) const ACCESS: &[&str] = &[
     "ssh",
     "sshd",
     "networking",

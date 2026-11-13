@@ -59,11 +59,15 @@ fn input(messages: &[ChatMessage]) -> Vec<Value> {
     let mut items = Vec::with_capacity(messages.len());
     for message in messages {
         match message {
-            ChatMessage::User(text) => items.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": [{ "type": "input_text", "text": text }],
-            })),
+            ChatMessage::User { text, images } => {
+                let (text, images) = ChatMessage::user_parts(text, images.as_ref());
+                let mut content: Vec<Value> = images
+                    .iter()
+                    .map(|image| json!({ "type": "input_image", "image_url": image.data_url() }))
+                    .collect();
+                content.push(json!({ "type": "input_text", "text": text }));
+                items.push(json!({ "type": "message", "role": "user", "content": content }));
+            }
             ChatMessage::Assistant {
                 text,
                 calls,

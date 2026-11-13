@@ -260,6 +260,9 @@ async fn messages(State(state): State<ChatState>, Path(id): Path<i64>) -> Respon
 #[derive(Deserialize)]
 struct Send {
     content: String,
+    /// Uploaded images shown with the message, by name.
+    #[serde(default)]
+    images: Vec<String>,
 }
 
 /// Starts the answer and streams its events. Closing the stream does not stop the answer: it is saved anyway.
@@ -270,7 +273,7 @@ async fn send_message(
 ) -> Response {
     match state
         .agent
-        .send(id, &request.content, state.activity.busy())
+        .send_with_images(id, &request.content, &request.images, state.activity.busy())
         .await
     {
         Ok(answer) => stream_answer(answer),
@@ -475,6 +478,7 @@ fn failure(failure: &AgentError) -> Response {
             (StatusCode::BAD_REQUEST, "missing_base_url")
         }
         AgentError::Busy => (StatusCode::CONFLICT, "busy"),
+        AgentError::Stopped => (StatusCode::CONFLICT, "stopped"),
         AgentError::Stopping => (StatusCode::SERVICE_UNAVAILABLE, "stopping"),
         AgentError::Deleting => (StatusCode::CONFLICT, "deleting"),
         AgentError::NotWaiting => (StatusCode::CONFLICT, "not_waiting"),

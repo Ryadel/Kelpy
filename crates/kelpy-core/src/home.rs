@@ -33,11 +33,11 @@ const MARKER_NOTE: &str = "Kelpy created this folder's config.toml, data/, memor
 ";
 pub const LOCAL_POINTER_FILE: &str = "kelpy-installed.txt";
 const DEFAULT_HOME_DIR: &str = "Kelpy";
-const MEMORY_INDEX_FILE: &str = "MEMORY.md";
+pub(crate) const MEMORY_INDEX_FILE: &str = "MEMORY.md";
 /// The folders Kelpy creates in a home and owns entirely.
 const OWN_DIRS: [&str; 4] = ["data", "memory", "workspace", "logs"];
 
-const MEMORY_INDEX: &str = "# Memory
+pub(crate) const MEMORY_INDEX: &str = "# Memory
 
 Kelpy's persistent memory: one Markdown file per topic, listed in this index.
 You can read and edit these files.
@@ -50,6 +50,8 @@ _None yet._
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Home {
     root: PathBuf,
+    /// The server's memory, when it is not the home's own: the shared server folder's.
+    memory: Option<PathBuf>,
 }
 
 impl Home {
@@ -57,7 +59,7 @@ impl Home {
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
         if is_home(&root) {
-            Ok(Self { root })
+            Ok(Self { root, memory: None })
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -69,7 +71,10 @@ impl Home {
     /// Creates the home layout under `root`, or completes it. An existing home keeps all its files. A folder that is
     /// not a home yet must not hold any of Kelpy's names already: Kelpy would take over files that are not its own.
     pub fn init(root: impl Into<PathBuf>) -> io::Result<Self> {
-        let home = Self { root: root.into() };
+        let home = Self {
+            root: root.into(),
+            memory: None,
+        };
         let taken = conflicts(&home.root);
         if !taken.is_empty() {
             return Err(io::Error::new(
@@ -119,8 +124,22 @@ impl Home {
         self.root.join(OWN_DIRS[0])
     }
 
+    /// The server's memory: the home's own folder, or the one [`Home::with_memory`] gave.
+    /// Whether the server's memory is shared with the other administrators, in a server folder, not the home's own.
+    pub fn shares_memory(&self) -> bool {
+        self.memory.is_some()
+    }
+
     pub fn memory_dir(&self) -> PathBuf {
-        self.root.join(OWN_DIRS[1])
+        self.memory
+            .clone()
+            .unwrap_or_else(|| self.root.join(OWN_DIRS[1]))
+    }
+
+    /// This home, with the server's memory in `memory` instead of its own folder.
+    pub fn with_memory(mut self, memory: PathBuf) -> Self {
+        self.memory = Some(memory);
+        self
     }
 
     pub fn workspace_dir(&self) -> PathBuf {

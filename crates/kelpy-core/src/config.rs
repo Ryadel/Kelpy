@@ -37,6 +37,48 @@ pub struct Config {
     pub server: ServerConfig,
     pub provider: Option<ProviderConfig>,
     pub updates: UpdatesConfig,
+    pub memory: MemoryConfig,
+}
+
+/// The `[memory]` section: which memory of the server Kelpy uses. Without it, the home's own.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// The memory chosen. Unset, the shared one if `shared` is set, as before the choice could be changed.
+    #[serde(rename = "use")]
+    pub using: Option<MemoryUse>,
+    /// The server folder shared with the other administrators of this computer
+    /// ([`crate::server_folder::ServerFolder`]); unset, the usual place.
+    pub shared: Option<PathBuf>,
+}
+
+/// Which memory of the server Kelpy uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryUse {
+    /// The home's own, for this administrator only. Read as `local` too.
+    #[serde(alias = "local")]
+    Private,
+    /// The server folder's, shared with the other administrators: only administrators can open it.
+    Shared,
+}
+
+impl MemoryConfig {
+    /// The memory chosen.
+    pub fn chosen(&self) -> MemoryUse {
+        match (self.using, &self.shared) {
+            (Some(using), _) => using,
+            (None, Some(_)) => MemoryUse::Shared,
+            (None, None) => MemoryUse::Private,
+        }
+    }
+
+    /// The server folder: where it was set, or else the usual place.
+    pub fn shared_folder(&self) -> Option<PathBuf> {
+        self.shared
+            .clone()
+            .or_else(crate::server_folder::ServerFolder::default_path)
+    }
 }
 
 /// The `[updates]` section. Homes created before it existed have no such section, and check.
@@ -136,7 +178,56 @@ pub fn save_provider(path: &Path, provider: &ProviderConfig) -> Result<(), Confi
         table["service"] = toml_edit::value(service.as_str());
     }
     document["provider"] = toml_edit::Item::Table(table);
-    // Written beside the original and renamed over it, so a crash never leaves half a file.
+    write_document(path, &document)
+}
+
+/// Keeps the server's memory in the server folder `shared` from now on, writing the `[memory]` section.
+pub fn save_shared_memory(path: &Path, shared: &Path) -> Result<(), ConfigError> {
+    save_memory(path, MemoryUse::Shared, Some(shared))
+}
+
+/// Records in the configuration at `path` the memory chosen, `using`, and the server folder `shared` if given,
+/// keeping the rest of the file.
+pub fn save_memory(
+    path: &Path,
+    using: MemoryUse,
+    shared: Option<&Path>,
+) -> Result<(), ConfigError> {
+    let text = fs::read_to_string(path).map_err(|error| ConfigError::Write {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let mut document: toml_edit::DocumentMut =
+        text.parse()
+            .map_err(|error: toml_edit::TomlError| ConfigError::Write {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+    if !document.contains_table("memory") {
+        let mut table = toml_edit::Table::new();
+        table.decor_mut().set_prefix(
+            "\n# Which memory of the server Kelpy uses: \"private\", only for you, or \"shared\" with the other \
+             administrators\n# of this computer, in the folder `shared`, which only they can open.\n",
+        );
+        document["memory"] = toml_edit::Item::Table(table);
+    }
+    let using = match using {
+        MemoryUse::Private => "private",
+        MemoryUse::Shared => "shared",
+    };
+    document["memory"]["use"] = toml_edit::value(using);
+    if let Some(shared) = shared {
+        document["memory"]["shared"] = toml_edit::value(shared.to_string_lossy().as_ref());
+    }
+    write_document(path, &document)
+}
+
+/// Writes `document` to `path` beside the original and renames it over it, so a crash never leaves half a file.
+fn write_document(path: &Path, document: &toml_edit::DocumentMut) -> Result<(), ConfigError> {
+    let failed = |message: String| ConfigError::Write {
+        path: path.to_path_buf(),
+        message,
+    };
     let staged = path.with_extension("toml.new");
     fs::write(&staged, document.to_string()).map_err(|error| failed(error.to_string()))?;
     fs::rename(&staged, path).map_err(|error| failed(error.to_string()))
@@ -145,6 +236,36 @@ pub fn save_provider(path: &Path, provider: &ProviderConfig) -> Result<(), Confi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shared_memory_is_recorded_keeping_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, DEFAULT_CONFIG).unwrap();
+        assert!(Config::load(&path).unwrap().memory.shared.is_none());
+        let shared = Path::new(r"C:\ProgramData\Kelpy");
+        save_shared_memory(&path, shared).unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.memory.shared.as_deref(), Some(shared));
+        assert!(config.updates.check);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# At start, ask GitHub"), "{text}");
+        assert!(text.contains("which only they can open"), "{text}");
+        assert_eq!(config.memory.chosen(), MemoryUse::Shared);
+
+        // Chosen again: the folder stays, for when it is chosen once more.
+        save_memory(&path, MemoryUse::Private, None).unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.memory.chosen(), MemoryUse::Private);
+        assert_eq!(config.memory.shared.as_deref(), Some(shared));
+        // Written before the choice could change: the folder alone means shared.
+        let before = Config::parse("[memory]\nshared = 'C:\\ProgramData\\Kelpy'\n").unwrap();
+        assert_eq!(before.memory.chosen(), MemoryUse::Shared);
+        assert_eq!(
+            Config::parse("").unwrap().memory.chosen(),
+            MemoryUse::Private
+        );
+    }
 
     #[test]
     fn default_file_matches_default_values() {

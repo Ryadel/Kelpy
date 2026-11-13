@@ -646,16 +646,21 @@ impl Inner {
         let _change = self.changes.lock().await;
         let in_vault =
             matches!(&self.guarded().state, State::Open { kept, .. } if kept.contains(name));
-        if in_vault {
+        let removed = if in_vault {
             let mut open = self.snapshot()?;
             open.secrets.remove(name);
             let written = self.persist(open.sealed, open.key, open.secrets).await?;
-            drop(self.settle(written, |kept| {
+            // It leaves the kept names and the registry together, under the state: a copy for the next Kelpy in
+            // between would hand it over as a secret not kept. Locked meanwhile, it left the registry already.
+            let (guarded, _) = self.settle(written, |kept| {
                 kept.remove(name);
-            }));
-        }
-        // Locked meanwhile, a secret kept in the vault left the registry already.
-        let removed = self.registry.remove(name) || in_vault;
+            });
+            self.registry.remove(name);
+            drop(guarded);
+            true
+        } else {
+            self.registry.remove(name)
+        };
         if !removed {
             return Err(VaultError::Invalid(format!(
                 "there is no secret named `{name}`"
@@ -1117,6 +1122,44 @@ mod tests {
                 });
                 std::thread::yield_now();
                 vault.lock();
+                copying.join().unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn a_kept_secret_being_removed_is_never_handed_over_as_one_not_kept() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let (vault, _) = runtime.block_on(async {
+            let (vault, registry) = vault(&folder);
+            vault
+                .create(passphrase("correct horse battery"))
+                .await
+                .unwrap();
+            (vault, registry)
+        });
+        for _ in 0..300 {
+            runtime
+                .block_on(vault.add("smtp", Zeroizing::new("smtp-password".into()), true))
+                .unwrap();
+            let removed = std::sync::atomic::AtomicBool::new(false);
+            // Copies taken on another thread while the secret is removed: each one has it kept, or not at all.
+            std::thread::scope(|threads| {
+                let copying = threads.spawn(|| {
+                    while !removed.load(std::sync::atomic::Ordering::SeqCst) {
+                        let copy = vault.handed_over();
+                        assert!(
+                            !copy.shared.contains_key("smtp"),
+                            "a kept secret handed over as not kept"
+                        );
+                    }
+                });
+                runtime.block_on(vault.remove("smtp")).unwrap();
+                removed.store(true, std::sync::atomic::Ordering::SeqCst);
                 copying.join().unwrap();
             });
         }

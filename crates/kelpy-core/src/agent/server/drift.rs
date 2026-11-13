@@ -77,8 +77,13 @@ impl Server {
 
     /// Writes the records as the memory page `server.md`, unless it was edited outside Kelpy: that is noted as a
     /// difference, to settle first. Best effort: the records stay in the database whatever happens to the page.
+    ///
+    /// The memory is held for writing throughout, against the other Kelpys sharing it too: the records are read
+    /// once it is held, and what the page holds is recorded before it is let go.
     async fn write_page(&self) {
-        let _writing = self.writing.lock().await;
+        let Ok(writing) = kelpy_tools::memory::writing(&self.memory).await else {
+            return;
+        };
         let path = self
             .memory
             .join(format!("{}.md", kelpy_tools::memory::SERVER_PAGE));
@@ -123,7 +128,7 @@ impl Server {
         if now.as_ref().and_then(|now| now.content.as_deref()) == Some(page.as_str()) {
             return;
         }
-        if kelpy_tools::memory::write_server_page(&self.memory, &page)
+        if kelpy_tools::memory::write_server_page(&self.memory, &page, &writing)
             .await
             .is_err()
         {
@@ -251,11 +256,24 @@ fn page(records: &[&Record], differences: &[Difference]) -> String {
         let lines: Vec<String> = records
             .iter()
             .filter(|record| record.kind == kind)
-            .map(|record| match kind {
-                RecordKind::File => {
-                    format!("- {} (since {})", record.subject, utc(record.recorded_at))
+            .map(|record| {
+                // With the memory shared, which administrator's Kelpy made the change.
+                let by = record
+                    .recorded_by
+                    .as_ref()
+                    .map(|name| format!(", by {name}"))
+                    .unwrap_or_default();
+                match kind {
+                    RecordKind::File => {
+                        format!(
+                            "- {} (since {}{by})",
+                            record.subject,
+                            utc(record.recorded_at)
+                        )
+                    }
+                    _ if by.is_empty() => format!("- {}: {}", record.subject, record.expected),
+                    _ => format!("- {}: {} ({})", record.subject, record.expected, &by[2..]),
                 }
-                _ => format!("- {}: {}", record.subject, record.expected),
             })
             .collect();
         if !lines.is_empty() {
@@ -352,4 +370,114 @@ fn cut(text: &str, limit: usize) -> &str {
         .find(|&index| text.is_char_boundary(index))
         .unwrap_or(0);
     &text[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_server_page_says_whose_kelpy_made_each_change_when_known() {
+        let record = |id, kind, subject: &str, expected: &str, by: Option<&str>| Record {
+            id,
+            kind,
+            subject: subject.into(),
+            expected: expected.into(),
+            content: None,
+            action_id: None,
+            recorded_at: 0,
+            secret: false,
+            recorded_by: by.map(Into::into),
+        };
+        let file = record(
+            1,
+            RecordKind::File,
+            "/etc/nginx/nginx.conf",
+            "sha256:a",
+            Some("alice"),
+        );
+        let service = record(
+            2,
+            RecordKind::Service,
+            "nginx",
+            "active, enabled",
+            Some("bob"),
+        );
+        let package = record(3, RecordKind::Package, "curl", "8.5.0", None);
+        let text = page(&[&file, &service, &package], &[]);
+        assert!(text.contains("- /etc/nginx/nginx.conf (since "), "{text}");
+        assert!(text.contains(", by alice)"), "{text}");
+        assert!(text.contains("- nginx: active, enabled (by bob)"), "{text}");
+        assert!(text.contains("- curl: 8.5.0\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_page_waiting_for_another_kelpy_is_written_from_the_records_as_they_are_then() {
+        use crate::agent::{Agent, Endpoints};
+        use crate::home::Home;
+        use kelpy_storage::Store;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let memory = dir.path().join("memory");
+        fs::create_dir(&memory).unwrap();
+        let home = Home::init(dir.path().join("home"))
+            .unwrap()
+            .with_memory(memory.clone());
+        let path = memory.join("server.md");
+        let subject = path.to_string_lossy().into_owned();
+        let shared = dir.path().join("server.db");
+        let mut store = Store::in_memory().unwrap();
+        store.share_records(&shared).unwrap();
+        let mut other = Store::in_memory().unwrap();
+        other.share_records(&shared).unwrap();
+        other.set_recorder("other-admin");
+        let agent = Agent::new(&home, store, None, Endpoints::default()).unwrap();
+
+        // Another Kelpy is writing the memory: this one's page waits for it.
+        let held = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(memory.join(".kelpy-writing"))
+            .unwrap();
+        held.lock().unwrap();
+        let server = std::sync::Arc::clone(&agent.server);
+        let waiting = tokio::spawn(async move { server.write_page().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Meanwhile the other records a change and writes the page with it.
+        other
+            .record(
+                RecordKind::Service,
+                "nginx",
+                "active, enabled",
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        let records = other.records().unwrap();
+        let newer = page(&records.iter().collect::<Vec<_>>(), &[]);
+        fs::write(&path, &newer).unwrap();
+        other
+            .record(
+                RecordKind::File,
+                &subject,
+                &kelpy_tools::change::digest(&newer),
+                Some(&newer),
+                false,
+                None,
+            )
+            .unwrap();
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("- nginx: active, enabled"), "{written}");
+        assert!(other.differences().unwrap().is_empty());
+    }
 }

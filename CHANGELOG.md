@@ -5,6 +5,29 @@ the install scripts and the signed checksums. Versions follow [Semantic Versioni
 
 ## Unreleased
 
+- **Auto runs commands**: with System access Full and Approval mode Auto, the commands Kelpy writes run without
+  asking. Those that look like they could lose data, lock you out or stop the system still ask, and their card says
+  why: deleting files or databases, formatting disks, restarting, removing packages, code downloaded or decoded,
+  changes to the firewall, network, SSH, sudo, logins, accounts or boot. Kelpy recognizes them by the command's
+  text, which is no guarantee. With Read-only, and in Ask and Plan, every command still asks.
+- **Shared memory**: the administrators of a server can share Kelpy's memory of it, each with their own Kelpy,
+  sign-ins and conversations. The first run asks which memory to use: *Private*, only for you, in your home, or
+  *Shared*, in `%ProgramData%\Kelpy` (or `/var/lib/kelpy`), which is available to administrators only, for security
+  reasons: Kelpy run without their rights shows it greyed and uses the private one. Shared, it holds the memory's
+  pages and the records `server.md` is written from; each change and each note says whose Kelpy made it, and Kelpy
+  tells you who did what. The **Memory** menu, under the message box, shows which memory is in use and switches
+  between *Private* and *Shared*, for every conversation: Kelpy restarts in a few seconds with your conversations
+  and sign-ins, as administrator for the shared memory; answers being written are stopped, and notes are not copied
+  from one memory to the other. Started without those rights, Kelpy uses your private memory meanwhile and says why;
+  on Windows, in a terminal, it offers to start again as administrator, and the menu can keep the private memory
+  from then on.
+- **Images and screenshots**: a screenshot pasted in the message box (Ctrl+V), or an image attached with the
+  paperclip or dropped on it, goes with the message and shows above it. The model sees it, when it can see images,
+  and Kelpy reads its text by OCR: with Windows' own text recognition, offline, or with Tesseract on Linux and macOS
+  when installed. The text read shows under the image, and stands in for it for a model that cannot see images. The
+  conversation keeps the text, not the image, which Kelpy keeps for the model while it runs. The message waits for
+  its uploads, and Stop works while its images are read. Several files can be chosen at once.
+- **Web UI**: the code to enter on ChatGPT's page, under the QR code, has a Copy button.
 - **Terminal UI**: a message sent without a usable AI provider is no longer lost in a conversation that showed
   *Loading…* forever. Kelpy keeps it in the box and says what is missing, such as "No AI provider configured yet:
   choose one in the Web UI or run 'kelpy provider'". A message Kelpy refuses for another reason comes back to the

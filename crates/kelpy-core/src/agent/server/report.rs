@@ -379,6 +379,7 @@ mod tests {
             phase: None,
             plan: None,
             plan_step: None,
+            risk: None,
         }
     }
 
@@ -443,6 +444,7 @@ mod tests {
                 action_id: None,
                 recorded_at: 0,
                 secret: false,
+                recorded_by: None,
             },
             found: "inactive, enabled".into(),
             content: None,

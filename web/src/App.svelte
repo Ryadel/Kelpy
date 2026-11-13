@@ -41,6 +41,7 @@
   import ConnectionDialog from './lib/ConnectionDialog.svelte';
   import FilesDialog from './lib/FilesDialog.svelte';
   import NewConversation from './lib/NewConversation.svelte';
+  import type { Outgoing } from './lib/Composer.svelte';
   import ProviderDialog from './lib/ProviderDialog.svelte';
   import RestartDialog from './lib/RestartDialog.svelte';
   import SecretsDialog from './lib/SecretsDialog.svelte';
@@ -68,7 +69,7 @@
   /** The open conversation; none means a new one, created with its first message. */
   let selected = $state<number | null>(null);
   /** The first message of a conversation just created, for its `Chat` to send. */
-  let start = $state<{ id: number; message: string } | null>(null);
+  let start = $state<{ id: number; message: Outgoing } | null>(null);
   let providerOpen = $state(false);
   /** The outcome of a return from OpenAI's sign-in page, shown by the provider dialog. */
   let afterChatGpt = $state<{ error: string | null } | null>(null);
@@ -275,7 +276,7 @@
     sessionsOpen = false;
   }
 
-  function started(session: Session, message: string) {
+  function started(session: Session, message: Outgoing) {
     keep(session);
     start = { id: session.id, message };
     select(session.id);

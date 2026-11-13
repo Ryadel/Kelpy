@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kelpy_providers::chatgpt::Endpoints;
-use kelpy_providers::{Provider, ProviderError};
+use kelpy_providers::{Images, Provider, ProviderError};
 pub use kelpy_storage::{Access, Action, ActionState, Approval, Modes, UNTITLED};
 use kelpy_storage::{Message, Session, Storage, Store, StoreError};
 use kelpy_tools::Executor;
@@ -34,6 +34,7 @@ use crate::connections::Connections;
 use crate::events::{Event, Events, Subscription};
 use crate::files::Files;
 use crate::home::Home;
+use crate::images;
 use crate::ollama::Ollama;
 use crate::ssh_agent::SshAgent;
 use crate::vault::{Unlock, Vault, VaultError};
@@ -67,6 +68,9 @@ pub enum AgentError {
     Deleting,
     #[error("the message is empty")]
     EmptyMessage,
+    /// Stopped while the message was being prepared, such as its images read: it was not sent.
+    #[error("the message was stopped before it was sent")]
+    Stopped,
     #[error("this action is not waiting for a decision")]
     NotWaiting,
     #[error("this action is not running")]
@@ -115,8 +119,12 @@ impl Agent {
         let store = Storage::start(store)?;
         let backups = home.data_dir().join("backups");
         // Kelpy's own data holds credentials and every conversation: never read or changed for the model.
-        let executor =
+        let mut executor =
             Executor::local(vec![home.data_dir()], backups.clone()).with_memory(home.memory_dir());
+        // Shared with the other administrators, the memory says whose Kelpy noted each fact.
+        if home.shares_memory() {
+            executor = executor.sharing_memory();
+        }
         let providers = Providers::new(
             client.clone(),
             ChatGpt::new(home, client.clone(), chatgpt, events.clone()),
@@ -542,9 +550,67 @@ impl Agent {
         text: &str,
         guard: impl Send + 'static,
     ) -> Result<AnswerEvents, AgentError> {
-        let text = turns::message(text)?;
+        self.send_with_images(session_id, text, &[], guard).await
+    }
+
+    /// As [`Agent::send`], with the uploaded images `images`, by name: shown to a model that sees images, and read
+    /// by OCR. The conversation stores the message's text alone, each image's line with the text read from it;
+    /// the images are kept for the model while Kelpy runs. The text may be empty when there are images.
+    ///
+    /// The images are read once the conversation is busy with the answer, so stopping it, or deleting the
+    /// conversation, stops the reading too: the message is then not sent, [`AgentError::Stopped`].
+    pub async fn send_with_images(
+        &self,
+        session_id: i64,
+        text: &str,
+        images: &[String],
+        guard: impl Send + 'static,
+    ) -> Result<AnswerEvents, AgentError> {
+        let typed = if images.is_empty() {
+            turns::message(text)?
+        } else {
+            text.trim()
+        }
+        .to_owned();
         let settings = self.providers.ready().await?;
-        self.turns.start(session_id, text, settings, guard).await
+        let uploads = self.files.dir().to_path_buf();
+        let images = images.to_vec();
+        let outgoing = async move {
+            let attached = images::attach(&uploads, &images)
+                .await
+                .map_err(AgentError::Invalid)?;
+            Self::outgoing(&typed, &attached)
+        };
+        self.turns
+            .start(session_id, outgoing, settings, guard)
+            .await
+    }
+
+    /// The message of the administrator, `typed`, with the images `attached`.
+    fn outgoing(typed: &str, attached: &[images::Attached]) -> Result<turns::Outgoing, AgentError> {
+        let first = attached.first().map(|image| image.name.as_str());
+        let title = match (typed.is_empty(), first) {
+            (true, Some(name)) => turns::title_from(&format!("Image: {name}")),
+            _ => turns::title_from(typed),
+        };
+        let text = turns::message(&images::text_alone(typed, attached))?.to_owned();
+        let shown: Vec<_> = attached
+            .iter()
+            .filter_map(|image| image.shown.as_ref().ok())
+            .collect();
+        // Each image not shown is in the text seen by the text read from it.
+        let images = (!shown.is_empty()).then(|| {
+            let seen = Images {
+                text: images::text_seen(typed, attached),
+                images: shown.iter().map(|(image, _)| Arc::clone(image)).collect(),
+            };
+            (seen, shown.iter().map(|(_, tokens)| tokens).sum())
+        });
+        Ok(turns::Outgoing {
+            text,
+            title,
+            images,
+        })
     }
 }
 
@@ -1320,38 +1386,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_command_the_model_wrote_waits_for_approval_even_in_auto() {
+    async fn in_auto_with_full_a_command_the_model_wrote_runs_unless_it_looks_risky() {
         let dir = tempfile::tempdir().unwrap();
         let server = model("It printed hello.").await;
-        let command = json!({ "reason": "To check the shell", "command": "echo hello", "directory": dir.path() });
-        server.respond_once(CHAT, "200 OK", calling("run_command", &command));
         let agent = agent(&dir, format!("{}/v1", server.url));
-        let modes = Modes {
-            access: Access::Full,
-            approval: Approval::Auto,
-            ..Modes::default()
+        let call = |text: &str| {
+            let command =
+                json!({ "reason": "To check the shell", "command": text, "directory": dir.path() });
+            server.respond_once(CHAT, "200 OK", calling("run_command", &command));
         };
-        let session = agent.create_session(None, modes).await.unwrap();
+        let session = |access| {
+            agent.create_session(
+                None,
+                Modes {
+                    access,
+                    approval: Approval::Auto,
+                    ..Modes::default()
+                },
+            )
+        };
 
-        let mut answer = agent.send(session.id, "Say hello", ()).await.unwrap();
-        let waiting = until(&mut answer, ActionState::Waiting).await;
+        // Full and Auto: an ordinary command runs without asking.
+        let full = session(Access::Full).await.unwrap();
+        call("echo hello");
+        let mut answer = agent.send(full.id, "Say hello", ()).await.unwrap();
+        let done = until(&mut answer, ActionState::Done).await;
         assert_eq!(
-            (waiting.summary, waiting.command.as_deref()),
+            (done.summary, done.command.as_deref()),
             (
                 format!("Run a command in {}", dir.path().display()),
                 Some("echo hello")
             )
         );
-        agent
-            .decide(session.id, waiting.id, true, None)
-            .await
-            .unwrap();
-        let done = until(&mut answer, ActionState::Done).await;
         assert_eq!((done.exit_code, done.output.as_str()), (Some(0), "hello"));
+        assert_eq!(done.risk, None);
         collect(answer).await;
         let requests = chat_requests(&server);
         assert!(requests[0].contains(CHANGING.split(". ").next().unwrap()));
         assert!(requests[1].contains("hello"));
+
+        // One that looks like it deletes files asks, saying why.
+        call("rm -rf old-site");
+        let mut answer = agent
+            .send(full.id, "Remove the old site", ())
+            .await
+            .unwrap();
+        let waiting = until(&mut answer, ActionState::Waiting).await;
+        assert!(
+            waiting
+                .risk
+                .as_deref()
+                .unwrap()
+                .starts_with("It deletes files")
+        );
+        agent
+            .decide(full.id, waiting.id, false, None)
+            .await
+            .unwrap();
+        until(&mut answer, ActionState::Denied).await;
+        collect(answer).await;
+
+        // Read-only and Auto: a command asks, whatever it looks like.
+        let read_only = session(Access::ReadOnly).await.unwrap();
+        call("echo hello");
+        let mut answer = agent.send(read_only.id, "Say hello", ()).await.unwrap();
+        let waiting = until(&mut answer, ActionState::Waiting).await;
+        agent
+            .decide(read_only.id, waiting.id, false, None)
+            .await
+            .unwrap();
+        until(&mut answer, ActionState::Denied).await;
+        collect(answer).await;
     }
 
     #[tokio::test]
@@ -1668,6 +1773,192 @@ mod tests {
             .map(|(question, answer)| (question.as_str(), answer.as_str()))
             .collect();
         seed(agent, session_id, &turns).await;
+    }
+
+    /// Uploads a small screenshot, `shot.png`, to `agent`'s files.
+    fn upload_screenshot(agent: &Agent) {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 48))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        fs::create_dir_all(agent.files().dir()).unwrap();
+        fs::write(agent.files().dir().join("shot.png"), png).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_screenshot_is_shown_to_a_model_that_sees_and_its_text_stored_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = ollama(32_768).await;
+        let vision = serde_json::json!({ "capabilities": ["completion", "vision"] });
+        server.respond("POST /api/show", "200 OK", vision.to_string());
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        upload_screenshot(&agent);
+        let session = agent.create_session(None, Modes::default()).await.unwrap();
+        let images = ["shot.png".to_owned()];
+
+        collect(
+            agent
+                .send_with_images(session.id, "", &images, ())
+                .await
+                .unwrap(),
+        )
+        .await;
+        // The conversation stores the text alone, the image's line first, and is named after the image.
+        let stored = &agent.messages(session.id).await.unwrap()[0];
+        assert!(
+            stored
+                .content
+                .starts_with("[Image: shot.png, uploaded to `"),
+            "{}",
+            stored.content
+        );
+        assert!(
+            ["from it by OCR.", "from it by OCR:", "could not be read:"]
+                .iter()
+                .any(|read| stored.content.contains(read))
+        );
+        assert_eq!(agent.sessions().await.unwrap()[0].title, "Image: shot.png");
+        // The model sees the image, with the image's line and not the text read from it; and again later, while
+        // Kelpy runs.
+        collect(agent.send(session.id, "And now?", ()).await.unwrap()).await;
+        for request in chat_requests(&server) {
+            assert_eq!(
+                request.matches("data:image/png;base64,").count(),
+                1,
+                "{request}"
+            );
+            assert!(
+                !["from it by OCR.", "from it by OCR:", "could not be read:"]
+                    .iter()
+                    .any(|read| request.contains(read))
+            );
+        }
+
+        // A model that does not see images reads the text alone.
+        let dir = tempfile::tempdir().unwrap();
+        let server = ollama(32_768).await;
+        let text = serde_json::json!({ "capabilities": ["completion"] });
+        server.respond("POST /api/show", "200 OK", text.to_string());
+        let agent = super::tests::agent(&dir, format!("{}/v1", server.url));
+        upload_screenshot(&agent);
+        let session = agent.create_session(None, Modes::default()).await.unwrap();
+        collect(
+            agent
+                .send_with_images(session.id, "Why?", &images, ())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let request = &chat_requests(&server)[0];
+        assert!(!request.contains("image_url"));
+        assert!(request.contains("Why?\\n\\n[Image: shot.png"));
+        // Only uploaded images.
+        let refused = agent
+            .send_with_images(session.id, "Why?", &["../config.toml".to_owned()], ())
+            .await;
+        assert!(matches!(refused, Err(AgentError::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn an_image_that_cannot_be_shown_goes_by_its_text_with_one_that_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = ollama(32_768).await;
+        let vision = serde_json::json!({ "capabilities": ["completion", "vision"] });
+        server.respond("POST /api/show", "200 OK", vision.to_string());
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        upload_screenshot(&agent);
+        // A GIF of 8000 by 8000 pixels: more than Kelpy shows to a model.
+        let mut huge = b"GIF89a\x40\x1f\x40\x1f\x80\x00\x00\x00\x00\x00\xff\xff\xff".to_vec();
+        huge.extend_from_slice(b",\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;");
+        fs::write(agent.files().dir().join("huge.gif"), huge).unwrap();
+        let session = agent.create_session(None, Modes::default()).await.unwrap();
+        let images = ["shot.png".to_owned(), "huge.gif".to_owned()];
+
+        collect(
+            agent
+                .send_with_images(session.id, "Why?", &images, ())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let request = &chat_requests(&server)[0];
+        assert_eq!(request.matches("data:image/").count(), 1, "{request}");
+        let huge = &request[request.find("[Image: huge.gif").unwrap()..];
+        assert!(
+            huge.contains("It cannot be shown to you: 8000×8000 pixels"),
+            "{huge}"
+        );
+        assert!(
+            ["from it by OCR.", "from it by OCR:", "could not be read:"]
+                .iter()
+                .any(|read| huge.contains(read)),
+            "{huge}"
+        );
+        // The image shown goes by its line alone.
+        let shot = &request
+            [request.find("[Image: shot.png").unwrap()..request.find("[Image: huge.gif").unwrap()];
+        assert!(
+            !shot.contains("OCR") && !shot.contains("could not be read"),
+            "{shot}"
+        );
+    }
+
+    /// The conversation is busy while its message is prepared, and stopping it then, or deleting it, stops the
+    /// preparation and sends nothing.
+    #[tokio::test]
+    async fn a_message_being_prepared_is_stopped_with_its_answer() {
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let server = FakeServer::start(vec![(CHAT, "200 OK", stream("Answered", None))]).await;
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let session = agent.create_session(None, Modes::default()).await.unwrap();
+
+        let preparing = |agent: &Arc<Agent>| {
+            let (dropped, ended) = tokio::sync::oneshot::channel();
+            let agent = Arc::clone(agent);
+            let sending = tokio::spawn(async move {
+                let settings = agent.providers.ready().await.unwrap();
+                let never = async move {
+                    let _dropped = Dropped(Some(dropped));
+                    std::future::pending::<Result<turns::Outgoing, AgentError>>().await
+                };
+                agent.turns.start(session.id, never, settings, ()).await
+            });
+            (sending, ended)
+        };
+        let busy = |agent: Arc<Agent>| async move {
+            for _ in 0..500 {
+                if agent.is_running(session.id) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the message was never being prepared");
+        };
+
+        let (sending, ended) = preparing(&agent);
+        busy(Arc::clone(&agent)).await;
+        assert!(matches!(
+            agent.send(session.id, "Again", ()).await,
+            Err(AgentError::Busy)
+        ));
+        assert!(agent.cancel(session.id));
+        assert!(matches!(sending.await.unwrap(), Err(AgentError::Stopped)));
+        ended.await.unwrap();
+        assert!(!agent.is_running(session.id));
+        assert!(agent.messages(session.id).await.unwrap().is_empty());
+
+        let (sending, ended) = preparing(&agent);
+        busy(Arc::clone(&agent)).await;
+        agent.delete_session(session.id).await.unwrap();
+        assert!(matches!(sending.await.unwrap(), Err(AgentError::Deleting)));
+        ended.await.unwrap();
+        assert!(chat_requests(&server).is_empty());
     }
 
     #[tokio::test]

@@ -74,6 +74,8 @@ export interface Action {
   plan: Plan | null;
   /** The plan, and the step of it, this action carries out. */
   plan_step: { plan_id: number; step: number } | null;
+  /** Why a command the model wrote asks even in Auto, if it does. */
+  risk?: string;
 }
 
 /** A change to the system, as its card shows it before it runs. */
@@ -473,6 +475,35 @@ export const cancelElevation = async () => {
   await request('/api/elevation', { method: 'DELETE' });
 };
 
+/** Which memory of the server Kelpy uses: its own, or shared with the other administrators of the computer. */
+export type MemoryUse = 'private' | 'shared';
+
+export interface MemoryView {
+  /** The memory used now. */
+  use: MemoryUse;
+  /** The memory chosen, as recorded: the shared one, when Kelpy could not open it, differs from the one used. */
+  chosen: MemoryUse;
+  /** Where the shared memory is. */
+  shared: string | null;
+  /** Why the memory used is not the one asked for: the rights the shared one needs, or a choice not recorded. */
+  problem: string | null;
+}
+
+export const fetchMemory = () => json<MemoryView>('/api/memory');
+
+/**
+ * Asks Kelpy to restart with the memory `use`, as administrator for the shared one when it is not. Kelpy using it
+ * already only records it as the one chosen, if it was not: then the memory as it is now comes back. `restarts` says
+ * whether Kelpy restarts.
+ */
+export const chooseMemory = async (use: MemoryUse): Promise<{ restarts: boolean; memory: MemoryView | null }> => {
+  const response = await request('/api/memory', { method: 'POST', body: JSON.stringify({ use }) });
+  return {
+    restarts: response.status === 202,
+    memory: response.status === 200 ? ((await response.json()) as MemoryView) : null,
+  };
+};
+
 export const fetchProvider = () => json<ProviderInfo>('/api/provider');
 
 export const saveProvider = (update: ProviderUpdate) =>
@@ -719,18 +750,20 @@ export async function cancelAnswer(id: number): Promise<void> {
 }
 
 /**
- * Sends a message and calls `onEvent` for each event of the answer, as it is written. Resolves when the stream
- * ends. Aborting `signal` only stops listening: the answer goes on and is saved on the server.
+ * Sends a message, with the uploaded `images` by name, and calls `onEvent` for each event of the answer, as it is
+ * written. Resolves when the stream ends. Aborting `signal` only stops listening: the answer goes on and is saved on
+ * the server.
  */
 export async function sendMessage(
   id: number,
   content: string,
+  images: string[],
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   const response = await request(`/api/sessions/${id}/messages`, {
     method: 'POST',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, images }),
     headers: { Accept: 'text/event-stream' },
     signal,
   });

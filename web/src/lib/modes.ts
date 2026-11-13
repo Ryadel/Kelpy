@@ -15,7 +15,7 @@ export const ACCESS_OPTIONS: { value: Access; name: string; description: string;
     value: 'full',
     name: 'Full',
     description:
-      'Kelpy may also change the system, with commands that each wait for your approval. They run as the account that started Kelpy.',
+      'Kelpy may also change the system. Its commands wait for your approval, but in Auto. They run as the account that started Kelpy.',
   },
 ];
 
@@ -31,6 +31,6 @@ export const APPROVAL_OPTIONS: { value: Approval; name: string; description: str
     value: 'auto',
     name: 'Auto',
     description:
-      'Looking, and the changes Kelpy checks and can put back, need no approval. Commands Kelpy writes, and changes that could lock you out or lose data, still wait for it.',
+      'Looking, and the changes Kelpy checks and can put back, need no approval. With Full access, so do the commands Kelpy writes, but those that look like they could lose data, lock you out or stop the system: recognized by their text, which is no guarantee. Those, and changes that could lock you out or lose data, still wait for it.',
   },
 ];

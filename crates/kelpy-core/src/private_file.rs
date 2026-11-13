@@ -129,6 +129,57 @@ pub fn restrict_dir(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Creates the directory `path` reachable by administrators only, and theirs, from the start, so that there is no
+/// moment when another account could put something inside: on Windows owned by Administrators, with access for
+/// SYSTEM and Administrators alone (inherited); elsewhere 0700, owned by root, whom Kelpy runs as to make it. Its
+/// parent must exist. Needs administrator rights.
+pub fn create_dir_for_administrators(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+        let descriptor = windows::Descriptor::parse("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.as_ptr(),
+            bInheritHandle: 0,
+        };
+        let path = wide(path.as_os_str());
+        // SAFETY: `path` is NUL-terminated and `attributes` valid for the call.
+        if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// Whether only administrators could have made and changed the directory `path`: on Windows owned by Administrators
+/// or SYSTEM and open to them alone; elsewhere owned by root and open to it alone. A folder another account made in
+/// its place fails this, whatever it holds.
+pub fn administrators_only(path: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(metadata.is_dir() && metadata.uid() == 0 && metadata.permissions().mode() & 0o077 == 0)
+    }
+    #[cfg(windows)]
+    {
+        if !fs::symlink_metadata(path)?.is_dir() {
+            return Ok(false);
+        }
+        windows::administrators_only(path)
+    }
+}
+
 #[cfg(windows)]
 fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
@@ -186,6 +237,125 @@ mod windows {
             // SAFETY: allocated by `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
             unsafe { LocalFree(self.0) };
         }
+    }
+
+    /// A security descriptor from its SDDL text.
+    pub struct Descriptor(PSECURITY_DESCRIPTOR);
+
+    impl Descriptor {
+        pub fn parse(sddl: &str) -> io::Result<Self> {
+            let sddl = super::wide(sddl.as_ref());
+            let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+            // SAFETY: `sddl` is NUL-terminated; on success `descriptor` is allocated by the system, freed in `drop`.
+            let converted = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            };
+            if converted == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self(descriptor))
+        }
+
+        pub fn as_ptr(&self) -> PSECURITY_DESCRIPTOR {
+            self.0
+        }
+    }
+
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            // SAFETY: allocated by the system, to be freed with `LocalFree`.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+
+    /// Whether the folder at `path` is owned by Administrators or SYSTEM, and its access list allows no one else.
+    pub fn administrators_only(path: &std::path::Path) -> io::Result<bool> {
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+            DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, IsWellKnownSid,
+            OWNER_SECURITY_INFORMATION, PSID, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        };
+
+        let administrators = |sid: PSID| {
+            // SAFETY: `sid` points to a valid SID inside the descriptor read below.
+            unsafe {
+                IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+                    || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+            }
+        };
+        let path = super::wide(path.as_os_str());
+        let mut owner: PSID = ptr::null_mut();
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `path` is NUL-terminated; `owner` and `dacl` point into `descriptor`, freed below.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let descriptor = Descriptor(descriptor);
+        // No access list at all means access for everyone.
+        let mut only = !owner.is_null() && administrators(owner) && !dacl.is_null();
+        if only {
+            let mut size = ACL_SIZE_INFORMATION {
+                AceCount: 0,
+                AclBytesInUse: 0,
+                AclBytesFree: 0,
+            };
+            // SAFETY: `dacl` is a valid ACL; `size` is the structure the class names, with its size.
+            let read = unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&raw mut size).cast(),
+                    size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            };
+            if read == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for index in 0..size.AceCount {
+                let mut ace: *mut core::ffi::c_void = ptr::null_mut();
+                // SAFETY: `index` is within the ACL's entries; `ace` points into it.
+                if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: every entry starts with its header.
+                let kind = unsafe { (*ace.cast::<ACE_HEADER>()).AceType };
+                // Denying (type 1) takes nothing away from being administrators-only; any kind of entry other
+                // than allowing (type 0) might grant.
+                if kind == 1 {
+                    continue;
+                }
+                // SAFETY: an allowing entry holds its SID from `SidStart`.
+                let allowed = kind == 0
+                    && administrators(unsafe {
+                        (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast()
+                    });
+                if !allowed {
+                    only = false;
+                    break;
+                }
+            }
+        }
+        drop(descriptor);
+        Ok(only)
     }
 
     /// The security identifier of the user running this process, as a string such as `S-1-5-21-…`.

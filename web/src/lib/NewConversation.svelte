@@ -1,6 +1,6 @@
 <script lang="ts">
   import * as Alert from '$lib/components/ui/alert';
-  import Composer from './Composer.svelte';
+  import Composer, { type ComposerImage, type Outgoing } from './Composer.svelte';
   import Welcome from './Welcome.svelte';
   import { createSession, describe, Unreachable, type Modes, type Session } from './api';
   import { loadDraft, saveDraft } from './drafts';
@@ -8,13 +8,14 @@
 
   interface Props {
     /** The conversation exists, with the modes chosen here: `message` is its first message, still to send. */
-    onCreated: (session: Session, message: string) => void;
+    onCreated: (session: Session, message: Outgoing) => void;
   }
 
   let { onCreated }: Props = $props();
 
   // The conversation is created with the first message, so starting one and leaving leaves nothing behind.
   let draft = $state(loadDraft('new'));
+  let images = $state<ComposerImage[]>([]);
   let modes = $state<Modes>({ ...DEFAULT_MODES });
   let creating = false;
   let error = $state<string | null>(null);
@@ -23,8 +24,8 @@
   $effect(() => saveDraft('new', draft));
 
   async function send() {
-    const message = draft.trim();
-    if (!message || creating) {
+    const message = { text: draft.trim(), images };
+    if ((!message.text && images.length === 0) || creating) {
       return;
     }
     creating = true;
@@ -57,6 +58,7 @@
   <Composer
     bind:this={composer}
     bind:value={draft}
+    bind:images
     explanations={modes.explanations}
     onExplanations={(on) => (modes.explanations = on)}
     access={modes.access}

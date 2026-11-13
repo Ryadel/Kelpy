@@ -8,14 +8,72 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 
 use crate::{ToolError, invalid};
 
-/// Serialises Kelpy's writes to its memory: a note reads its page and the index, adds to them and writes them back,
-/// so two notes at once would otherwise keep one. Process-wide, as one Kelpy runs for a home (the runtime lock).
+/// Serialises this process's writes to its memory: a note reads its page and the index, adds to them and writes
+/// them back, so two notes at once would otherwise keep one. Other processes (the Kelpys of other administrators,
+/// with the memory shared) are kept out by [`LOCK_FILE`].
 static WRITER: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
+/// The file in the memory's folder locked while a Kelpy writes there.
+const LOCK_FILE: &str = ".kelpy-writing";
+/// The longest a write waits for another to end, in this Kelpy or another.
+const WRITING_WAIT: Duration = Duration::from_secs(10);
+/// How often a lock held by another Kelpy is tried again.
+const RETRY: Duration = Duration::from_millis(20);
+
+/// The memory in a folder held for writing, against this process and the others, until dropped.
+pub struct Writing {
+    _process: tokio::sync::MutexGuard<'static, ()>,
+    _file: std::fs::File,
+}
+
+/// Holds the memory in `folder` for writing, waiting up to [`WRITING_WAIT`] for a write under way. The wait never
+/// blocks a thread: dropped, it ends at once, so it cannot keep Kelpy from stopping.
+pub async fn writing(folder: &Path) -> std::io::Result<Writing> {
+    writing_within(folder, WRITING_WAIT).await
+}
+
+async fn writing_within(folder: &Path, wait: Duration) -> std::io::Result<Writing> {
+    let path = folder.join(LOCK_FILE);
+    let held = async {
+        let process = WRITER.lock().await;
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .await?
+            .into_std()
+            .await;
+        loop {
+            // Released when the file is closed, by this process ending too.
+            match file.try_lock() {
+                Ok(()) => {
+                    return Ok(Writing {
+                        _process: process,
+                        _file: file,
+                    });
+                }
+                Err(std::fs::TryLockError::WouldBlock) => tokio::time::sleep(RETRY).await,
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+    };
+    tokio::time::timeout(wait, held).await.map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "another Kelpy has been writing the memory in {} for over {} s",
+                folder.display(),
+                wait.as_secs()
+            ),
+        )
+    })?
+}
 
 /// The index of the pages.
 pub const INDEX: &str = "MEMORY.md";
@@ -75,20 +133,25 @@ pub(crate) async fn read(folder: &Path, name: &str) -> Result<String, ToolError>
     tokio::fs::read_to_string(&path).await.map_err(unreadable)
 }
 
-/// Adds `note`, dated `today`, to the page `name`, creating it and listing it in the index if needed. Says where.
+/// Adds `note`, dated `today` and, with the memory shared, saying whose Kelpy made it (`by`), to the page `name`,
+/// creating it and listing it in the index if needed. Says where.
 pub(crate) async fn remember(
     folder: &Path,
     name: &str,
     note: &str,
     today: &str,
+    by: Option<&str>,
 ) -> Result<String, ToolError> {
     if name == SERVER_PAGE {
         return Err(invalid(
             "server.md is written by Kelpy from what it changed: note facts on another page",
         ));
     }
-    let _writing = WRITER.lock().await;
     let path = folder.join(format!("{name}.md"));
+    let _writing = writing(folder).await.map_err(|source| ToolError::Write {
+        path: path.clone(),
+        source,
+    })?;
     let written = |source| ToolError::Write {
         path: path.clone(),
         source,
@@ -105,7 +168,11 @@ pub(crate) async fn remember(
     if !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str(&format!("- {today}: {note}\n"));
+    // With the memory shared, whose Kelpy noted it: the others can tell who did what.
+    match by {
+        Some(by) => content.push_str(&format!("- {today}, by {by}: {note}\n")),
+        None => content.push_str(&format!("- {today}: {note}\n")),
+    }
     replace(&path, &content).await.map_err(written)?;
     list(folder, name).await?;
     Ok(format!("Remembered on memory/{name}.md."))
@@ -192,9 +259,13 @@ async fn replace(path: &Path, content: &str) -> std::io::Result<()> {
     made
 }
 
-/// Writes Kelpy's own page, `server.md`.
-pub async fn write_server_page(folder: &Path, content: &str) -> std::io::Result<PathBuf> {
-    let _writing = WRITER.lock().await;
+/// Writes Kelpy's own page, `server.md`, with the memory held for writing: from reading what the page is written
+/// from to recording what it now holds, so that a page written from older records cannot replace a newer one.
+pub async fn write_server_page(
+    folder: &Path,
+    content: &str,
+    _held: &Writing,
+) -> std::io::Result<PathBuf> {
     let path = folder.join(format!("{SERVER_PAGE}.md"));
     let untrusted = |why: String| std::io::Error::new(std::io::ErrorKind::PermissionDenied, why);
     trusted(&path)
@@ -228,32 +299,46 @@ mod tests {
             "nginx-sites",
             "The blog is in /var/www/blog.",
             "2026-11-03",
+            None,
         )
         .await
         .unwrap();
         assert_eq!(said, "Remembered on memory/nginx-sites.md.");
-        remember(folder.path(), "nginx-sites", "Port 8080.", "2026-11-04")
-            .await
-            .unwrap();
+        // With the memory shared, a note says whose Kelpy made it.
+        remember(
+            folder.path(),
+            "nginx-sites",
+            "Port 8080.",
+            "2026-11-04",
+            Some("alice"),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             read(folder.path(), "nginx-sites").await.unwrap(),
-            "# Nginx sites\n\n- 2026-11-03: The blog is in /var/www/blog.\n- 2026-11-04: Port 8080.\n"
+            "# Nginx sites\n\n- 2026-11-03: The blog is in /var/www/blog.\n- 2026-11-04, by alice: Port 8080.\n"
         );
         let index = fs::read_to_string(folder.path().join(INDEX)).unwrap();
         assert_eq!(
             index,
             "# Memory\n\n## Topics\n\n- [Nginx sites](nginx-sites.md)\n"
         );
-        remember(folder.path(), "backups", "Nightly at 2:00.", "2026-11-03")
-            .await
-            .unwrap();
+        remember(
+            folder.path(),
+            "backups",
+            "Nightly at 2:00.",
+            "2026-11-03",
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             fs::read_to_string(folder.path().join(INDEX))
                 .unwrap()
                 .ends_with("(nginx-sites.md)\n- [Backups](backups.md)\n")
         );
         assert!(
-            remember(folder.path(), SERVER_PAGE, "x", "2026-11-03")
+            remember(folder.path(), SERVER_PAGE, "x", "2026-11-03", None)
                 .await
                 .is_err()
         );
@@ -261,6 +346,42 @@ mod tests {
         assert!(page("../etc/passwd").is_err() && page("Nginx").is_err());
         assert_eq!(page("nginx.md").unwrap(), "nginx");
         assert_eq!(note("  two\n lines ").unwrap(), "two lines");
+    }
+
+    #[test]
+    fn waiting_for_another_kelpy_s_write_ends_when_given_up_and_at_its_deadline() {
+        let folder = tempfile::tempdir().unwrap();
+        // Another Kelpy is writing the memory, and does not finish.
+        let held = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(folder.path().join(LOCK_FILE))
+            .unwrap();
+        held.lock().unwrap();
+
+        // A write given up leaves nothing waiting: the runtime stops at once.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let given_up = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(100), writing(folder.path())).await
+        });
+        assert!(given_up.is_err());
+        let stopping = std::time::Instant::now();
+        drop(runtime);
+        assert!(stopping.elapsed() < Duration::from_secs(2));
+
+        // A write that waits too long says why, and the memory is free again for the next.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let error = writing_within(folder.path(), Duration::from_millis(200))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(error.to_string().contains("another Kelpy"), "{error}");
+            drop(held);
+            writing(folder.path()).await.unwrap();
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -271,7 +392,14 @@ mod tests {
             let folder = folder.path().to_owned();
             tokio::spawn(async move {
                 let page = if number % 2 == 0 { "nginx" } else { "backups" };
-                remember(&folder, page, &format!("Fact {number}."), "2026-11-04").await
+                remember(
+                    &folder,
+                    page,
+                    &format!("Fact {number}."),
+                    "2026-11-04",
+                    None,
+                )
+                .await
             })
         });
         for note in notes.collect::<Vec<_>>() {

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
 use kelpy_common::{lock, unix_now};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
@@ -171,14 +171,52 @@ const MIGRATIONS: &[&str] = &[
         settled_at INTEGER
     );
 ",
+    // 10: who made each change, by the name of their account: with the server's memory shared, it can be another
+    // administrator.
+    "ALTER TABLE records ADD COLUMN recorded_by TEXT;",
+    // 11: why a command the model wrote asks even in Auto.
+    "ALTER TABLE actions ADD COLUMN risk TEXT;",
 ];
+
+/// The schema of the server's records in a database of their own, shared by the administrators of a computer: the
+/// same tables as in a conversations' database, without the link to its actions. Upgraded by its own
+/// `user_version`.
+const SERVER_MIGRATIONS: &[&str] = &["
+    CREATE TABLE server.records (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind        TEXT    NOT NULL,
+        subject     TEXT    NOT NULL,
+        expected    TEXT    NOT NULL,
+        content     TEXT,
+        secret      INTEGER NOT NULL DEFAULT 0,
+        action_id   INTEGER,
+        recorded_at INTEGER NOT NULL,
+        recorded_by TEXT,
+        UNIQUE (kind, subject)
+    );
+    CREATE TABLE server.differences (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        record_id  INTEGER NOT NULL REFERENCES records (id) ON DELETE CASCADE,
+        found      TEXT    NOT NULL,
+        content    TEXT,
+        found_at   INTEGER NOT NULL,
+        settled    TEXT,
+        settled_at INTEGER
+    );
+"];
+
+/// The attached database of the server's records, once shared.
+const SERVER: &str = "server";
+/// How long a write waits for another Kelpy's on a shared database before it fails.
+const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 const SESSION_COLUMNS: &str =
     "id, title, explanations, created_at, updated_at, access, approval, revision";
 const ACTION_COLUMNS: &str = "id, message_id, step, position, call_id, tool, input, reason, summary, command, state, \
      exit_code, output, error, created_at, duration_ms, started_at, change, session_id, after_message, phase, plan, \
-     plan_id, plan_step";
-const RECORD_COLUMNS: &str = "id, kind, subject, expected, content, action_id, recorded_at, secret";
+     plan_id, plan_step, risk";
+const RECORD_COLUMNS: &str =
+    "id, kind, subject, expected, content, action_id, recorded_at, secret, recorded_by";
 const MESSAGE_COLUMNS: &str =
     "id, session_id, role, content, status, model, created_at, context_estimate, input_tokens";
 
@@ -200,6 +238,11 @@ pub enum StoreError {
     DifferenceNotFound(i64),
     #[error("the database was created by a newer version of Kelpy (schema {0})")]
     TooNew(i64),
+    #[error(
+        "the server's shared memory was upgraded by a newer version of Kelpy (schema {0}): update this one with \
+         `kelpy update`"
+    )]
+    SharedTooNew(i64),
     #[error("cannot start the database thread: {0}")]
     Start(#[from] io::Error),
     /// The database thread is gone, or a call failed unexpectedly on it.
@@ -334,6 +377,9 @@ pub struct Action {
     pub plan: Option<Plan>,
     /// The plan, and the step of it, this action carries out.
     pub plan_step: Option<PlanStepRef>,
+    /// Why a command the model wrote asks even in Auto, if it does: what it looks like it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
 }
 
 /// A change to the system an action makes, as its card shows it before it runs.
@@ -398,6 +444,7 @@ pub struct NewAction<'a> {
     pub change: Option<&'a Change>,
     pub plan: Option<&'a Plan>,
     pub plan_step: Option<PlanStepRef>,
+    pub risk: Option<&'a str>,
     pub state: ActionState,
     pub error: Option<&'a str>,
 }
@@ -421,6 +468,8 @@ pub struct Record {
     pub recorded_at: i64,
     /// Whether the file holds a secret Kelpy wrote: never read for the model nor shown.
     pub secret: bool,
+    /// The account that made the change, when known.
+    pub recorded_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -509,6 +558,10 @@ pub struct Summary {
 
 pub struct Store {
     connection: Connection,
+    /// The database of the server's records: `main`, or `server` once shared.
+    records: &'static str,
+    /// The account recorded as making the changes.
+    recorder: Option<String>,
 }
 
 impl Store {
@@ -526,6 +579,7 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.busy_timeout(BUSY_WAIT)?;
         migrate(&mut connection)?;
         // Answers that were being written when the previous runtime stopped will never be completed.
         connection.execute(
@@ -544,7 +598,32 @@ impl Store {
              WHERE state IN ('waiting', 'running')",
             [],
         )?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            records: "main",
+            recorder: None,
+        })
+    }
+
+    /// Keeps the server's records in the database at `path` from now on, shared with the other administrators'
+    /// Kelpys, creating or upgrading it as needed. Those in this database stay where they are, unused.
+    pub fn share_records(&mut self, path: &Path) -> Result<()> {
+        self.connection
+            .execute("ATTACH DATABASE ?1 AS server", [path.to_string_lossy()])?;
+        into_wal(&self.connection, SERVER)?;
+        upgrade(
+            &mut self.connection,
+            SERVER,
+            SERVER_MIGRATIONS,
+            StoreError::SharedTooNew,
+        )?;
+        self.records = "server";
+        Ok(())
+    }
+
+    /// Records `name`, the account Kelpy runs as, as making the changes recorded from now on.
+    pub fn set_recorder(&mut self, name: &str) {
+        self.recorder = Some(name.to_owned());
     }
 
     /// Creates a conversation with the `modes` chosen before its first message.
@@ -646,8 +725,8 @@ impl Store {
         let inserted = self.connection.execute(
             "INSERT INTO actions (session_id, message_id, step, position, call_id, tool, input, reason, summary,
                                   command, state, error, created_at, started_at, change, after_message, plan, plan_id,
-                                  plan_step)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                                  plan_step, risk)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 action.session_id,
                 action.message_id,
@@ -667,7 +746,8 @@ impl Store {
                 after_message,
                 plan,
                 action.plan_step.map(|step| step.plan_id),
-                action.plan_step.map(|step| step.step)
+                action.plan_step.map(|step| step.step),
+                action.risk
             ],
         );
         match inserted {
@@ -706,6 +786,7 @@ impl Store {
             phase: None,
             plan: action.plan.cloned(),
             plan_step: action.plan_step,
+            risk: action.risk.map(str::to_owned),
         })
     }
 
@@ -803,23 +884,32 @@ impl Store {
         action_id: Option<i64>,
     ) -> Result<Record> {
         let now = unix_now();
+        let at = self.records;
+        let recorder = self.recorder.clone();
         let transaction = self.connection.transaction()?;
         // Once a file held a secret, it is kept from the model: a later change does not make it safe.
         transaction.execute(
-            "INSERT INTO records (kind, subject, expected, content, secret, action_id, recorded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT (kind, subject) DO UPDATE SET
-                 expected = excluded.expected, content = excluded.content, secret = secret OR excluded.secret,
-                 action_id = excluded.action_id, recorded_at = excluded.recorded_at",
-            params![kind.as_str(), subject, expected, content, secret, action_id, now],
+            &format!(
+                "INSERT INTO {at}.records
+                     (kind, subject, expected, content, secret, action_id, recorded_at, recorded_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (kind, subject) DO UPDATE SET
+                     expected = excluded.expected, content = excluded.content, secret = secret OR excluded.secret,
+                     action_id = excluded.action_id, recorded_at = excluded.recorded_at,
+                     recorded_by = excluded.recorded_by"
+            ),
+            params![kind.as_str(), subject, expected, content, secret, action_id, now, recorder],
         )?;
         let record = transaction.query_row(
-            &format!("SELECT {RECORD_COLUMNS} FROM records WHERE kind = ?1 AND subject = ?2"),
+            &format!("SELECT {RECORD_COLUMNS} FROM {at}.records WHERE kind = ?1 AND subject = ?2"),
             params![kind.as_str(), subject],
             record_from_row,
         )?;
         transaction.execute(
-            "UPDATE differences SET settled = 'replaced', settled_at = ?2 WHERE record_id = ?1 AND settled IS NULL",
+            &format!(
+                "UPDATE {at}.differences SET settled = 'replaced', settled_at = ?2
+                 WHERE record_id = ?1 AND settled IS NULL"
+            ),
             params![record.id, now],
         )?;
         transaction.commit()?;
@@ -828,9 +918,10 @@ impl Store {
 
     /// Everything Kelpy expects to find on the server, oldest first.
     pub fn records(&self) -> Result<Vec<Record>> {
-        let mut statement = self
-            .connection
-            .prepare(&format!("SELECT {RECORD_COLUMNS} FROM records ORDER BY id"))?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM {}.records ORDER BY id",
+            self.records
+        ))?;
         let records = statement
             .query_map([], record_from_row)?
             .collect::<rusqlite::Result<_>>()?;
@@ -845,10 +936,13 @@ impl Store {
         found: &str,
         content: Option<&str>,
     ) -> Result<bool> {
+        let at = self.records;
         let transaction = self.connection.transaction()?;
         let open: Option<String> = transaction
             .query_row(
-                "SELECT found FROM differences WHERE record_id = ?1 AND settled IS NULL",
+                &format!(
+                    "SELECT found FROM {at}.differences WHERE record_id = ?1 AND settled IS NULL"
+                ),
                 [record_id],
                 |row| row.get(0),
             )
@@ -857,11 +951,13 @@ impl Store {
             return Ok(false);
         }
         transaction.execute(
-            "DELETE FROM differences WHERE record_id = ?1 AND settled IS NULL",
+            &format!("DELETE FROM {at}.differences WHERE record_id = ?1 AND settled IS NULL"),
             [record_id],
         )?;
         transaction.execute(
-            "INSERT INTO differences (record_id, found, content, found_at) VALUES (?1, ?2, ?3, ?4)",
+            &format!(
+                "INSERT INTO {at}.differences (record_id, found, content, found_at) VALUES (?1, ?2, ?3, ?4)"
+            ),
             params![record_id, found, content, unix_now()],
         )?;
         transaction.commit()?;
@@ -871,7 +967,10 @@ impl Store {
     /// Notes that a record's subject is again as expected: its open difference is gone with it.
     pub fn found_as_expected(&self, record_id: i64) -> Result<bool> {
         let removed = self.connection.execute(
-            "DELETE FROM differences WHERE record_id = ?1 AND settled IS NULL",
+            &format!(
+                "DELETE FROM {}.differences WHERE record_id = ?1 AND settled IS NULL",
+                self.records
+            ),
             [record_id],
         )?;
         Ok(removed > 0)
@@ -879,9 +978,10 @@ impl Store {
 
     /// The differences not settled yet, oldest first.
     pub fn differences(&self) -> Result<Vec<Difference>> {
+        let at = self.records;
         let mut statement = self.connection.prepare(&format!(
-            "SELECT differences.id, found, differences.content, found_at, {} FROM differences
-             JOIN records ON records.id = differences.record_id
+            "SELECT differences.id, found, differences.content, found_at, {} FROM {at}.differences AS differences
+             JOIN {at}.records AS records ON records.id = differences.record_id
              WHERE settled IS NULL ORDER BY differences.id",
             RECORD_COLUMNS
                 .split(", ")
@@ -906,9 +1006,12 @@ impl Store {
     /// Settles an open difference. Accepted, the record expects what was found from then on.
     pub fn settle_difference(&mut self, id: i64, settled: Settled) -> Result<()> {
         let now = unix_now();
+        let at = self.records;
         let transaction = self.connection.transaction()?;
         let changed = transaction.execute(
-            "UPDATE differences SET settled = ?2, settled_at = ?3 WHERE id = ?1 AND settled IS NULL",
+            &format!(
+                "UPDATE {at}.differences SET settled = ?2, settled_at = ?3 WHERE id = ?1 AND settled IS NULL"
+            ),
             params![id, settled.as_str(), now],
         )?;
         if changed == 0 {
@@ -916,9 +1019,11 @@ impl Store {
         }
         if settled == Settled::Accepted {
             transaction.execute(
-                "UPDATE records SET (expected, content, recorded_at) =
-                     (SELECT found, content, ?2 FROM differences WHERE id = ?1)
-                 WHERE id = (SELECT record_id FROM differences WHERE id = ?1)",
+                &format!(
+                    "UPDATE {at}.records SET (expected, content, recorded_at) =
+                         (SELECT found, content, ?2 FROM {at}.differences WHERE id = ?1)
+                     WHERE id = (SELECT record_id FROM {at}.differences WHERE id = ?1)"
+                ),
                 params![id, now],
             )?;
         }
@@ -1303,18 +1408,62 @@ fn query_summary(connection: &Connection, session_id: i64) -> Result<Option<Summ
     Ok(summary)
 }
 
+/// Puts the database `schema` in WAL mode. Changing the mode of a new database takes it whole, without SQLite's
+/// busy wait: another Kelpy opening it at the same moment is waited for here, up to [`BUSY_WAIT`].
+fn into_wal(connection: &Connection, schema: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + BUSY_WAIT;
+    loop {
+        let busy =
+            match connection.pragma_update_and_check(Some(schema), "journal_mode", "WAL", |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
+                // The mode could not be changed: another connection is using the database.
+                Ok(_) => rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                ),
+                Err(rusqlite::Error::SqliteFailure(error, message))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy =>
+                {
+                    rusqlite::Error::SqliteFailure(error, message)
+                }
+                Err(error) => return Err(error.into()),
+            };
+        if std::time::Instant::now() >= deadline {
+            return Err(busy.into());
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn migrate(connection: &mut Connection) -> Result<()> {
-    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let latest = MIGRATIONS.len() as i64;
-    if version > latest {
-        return Err(StoreError::TooNew(version));
+    upgrade(connection, "main", MIGRATIONS, StoreError::TooNew)
+}
+
+/// Brings the database `schema` up to the latest of `migrations`. The version is read, and the migrations it
+/// needs applied, in one transaction holding the write lock from its start: another Kelpy opening the same
+/// database at once waits, then finds it upgraded, instead of applying the same migrations again.
+fn upgrade(
+    connection: &mut Connection,
+    schema: &str,
+    migrations: &[&str],
+    too_new: fn(i64) -> StoreError,
+) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 =
+        transaction.pragma_query_value(Some(schema), "user_version", |row| row.get(0))?;
+    if version > migrations.len() as i64 {
+        return Err(too_new(version));
     }
-    for (index, migration) in MIGRATIONS.iter().enumerate().skip(version as usize) {
-        let transaction = connection.transaction()?;
+    if version == migrations.len() as i64 {
+        return Ok(());
+    }
+    for migration in &migrations[version as usize..] {
         transaction.execute_batch(migration)?;
-        transaction.pragma_update(None, "user_version", index as i64 + 1)?;
-        transaction.commit()?;
     }
+    transaction.pragma_update(Some(schema), "user_version", migrations.len() as i64)?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1364,6 +1513,7 @@ fn action_from_row(row: &Row<'_>) -> rusqlite::Result<Action> {
             (Some(plan_id), Some(step)) => Some(PlanStepRef { plan_id, step }),
             _ => None,
         },
+        risk: row.get(24)?,
     })
 }
 
@@ -1383,6 +1533,7 @@ fn record_at(row: &Row<'_>, offset: usize) -> rusqlite::Result<Record> {
         action_id: row.get(offset + 5)?,
         recorded_at: row.get(offset + 6)?,
         secret: row.get(offset + 7)?,
+        recorded_by: row.get(offset + 8)?,
     })
 }
 
@@ -1577,6 +1728,7 @@ mod tests {
             change: Some(&change),
             plan: None,
             plan_step: None,
+            risk: None,
             state,
             error: None,
         };
@@ -1682,6 +1834,7 @@ mod tests {
             change: None,
             plan: None,
             plan_step: None,
+            risk: None,
             state: ActionState::Done,
             error: None,
         }
@@ -1748,6 +1901,80 @@ mod tests {
         newer.state = ActionState::Denied;
         store.insert_action(&newer).unwrap();
         assert_eq!(store.approved_plan(session.id).unwrap(), None);
+    }
+
+    #[test]
+    fn kelpys_opening_a_new_shared_database_at_once_upgrade_it_once() {
+        let folder = tempfile::tempdir().unwrap();
+        for round in 0..20 {
+            let shared = folder.path().join(format!("server-{round}.db"));
+            let stores: Vec<_> = (0..8).map(|_| Store::in_memory().unwrap()).collect();
+            let start = std::sync::Barrier::new(stores.len());
+            let opened: Vec<_> = std::thread::scope(|threads| {
+                let opening: Vec<_> = stores
+                    .into_iter()
+                    .map(|mut store| {
+                        let (start, shared) = (&start, &shared);
+                        threads.spawn(move || {
+                            start.wait();
+                            store.share_records(shared).map(|()| store)
+                        })
+                    })
+                    .collect();
+                opening.into_iter().map(|one| one.join().unwrap()).collect()
+            });
+            for store in opened {
+                let store = store.unwrap_or_else(|error| panic!("round {round}: {error}"));
+                assert!(store.records().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn the_server_s_records_are_shared_by_the_administrators_each_change_saying_by_whom() {
+        let folder = tempfile::tempdir().unwrap();
+        let shared = folder.path().join("server.db");
+        let open = |name: &str, own: &str| {
+            let mut store = Store::open(&folder.path().join(own)).unwrap();
+            store.share_records(&shared).unwrap();
+            store.set_recorder(name);
+            store
+        };
+        let mut alice = open("alice", "alice.db");
+        let mut bob = open("bob", "bob.db");
+        let path = "/etc/nginx/nginx.conf";
+        let record = alice
+            .record(RecordKind::File, path, "a1", None, false, Some(7))
+            .unwrap();
+        assert_eq!(record.recorded_by.as_deref(), Some("alice"));
+
+        // Bob's Kelpy finds it, notes a difference Alice's then sees, and its own change replaces it.
+        let seen = bob.records().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].subject, path);
+        assert!(bob.found_different(seen[0].id, "b2", None).unwrap());
+        assert_eq!(alice.differences().unwrap().len(), 1);
+        let changed = bob
+            .record(RecordKind::File, path, "c3", None, false, None)
+            .unwrap();
+        assert_eq!(changed.recorded_by.as_deref(), Some("bob"));
+        assert!(alice.differences().unwrap().is_empty());
+        assert_eq!(alice.records().unwrap()[0].expected, "c3");
+
+        // Their own databases keep none of it.
+        let own = Store::open(&folder.path().join("alice.db")).unwrap();
+        assert!(own.records().unwrap().is_empty());
+
+        // A shared database upgraded by a newer Kelpy is not opened.
+        drop((alice, bob));
+        let newer = Connection::open(&shared).unwrap();
+        newer.pragma_update(None, "user_version", 99).unwrap();
+        drop(newer);
+        let mut store = Store::in_memory().unwrap();
+        assert!(matches!(
+            store.share_records(&shared),
+            Err(StoreError::SharedTooNew(99))
+        ));
     }
 
     #[test]

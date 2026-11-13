@@ -55,6 +55,8 @@ pub enum Executor {
         backups: PathBuf,
         /// Kelpy's memory of the server, if it has one.
         memory: Option<PathBuf>,
+        /// Whether that memory is shared with the other administrators: each note then says whose Kelpy made it.
+        memory_shared: bool,
         /// Files Kelpy wrote a generated secret into: like secret files, never read for the model nor shown.
         held: Arc<Mutex<Vec<PathBuf>>>,
         account: Account,
@@ -74,6 +76,7 @@ impl Executor {
             protected,
             backups,
             memory: None,
+            memory_shared: false,
             held: Arc::default(),
             account: Account::current(),
         }
@@ -106,14 +109,36 @@ impl Executor {
                 backups,
                 held,
                 account,
+                memory_shared,
                 ..
             } => Self::Local {
                 protected,
                 backups,
                 memory: Some(folder),
+                memory_shared,
                 held,
                 account,
             },
+        }
+    }
+
+    /// The same, its memory shared with the other administrators: each note says whose Kelpy made it, by the name of
+    /// the account it runs as.
+    pub fn sharing_memory(mut self) -> Self {
+        let Self::Local { memory_shared, .. } = &mut self;
+        *memory_shared = true;
+        self
+    }
+
+    /// Who the notes are by, with the memory shared.
+    fn author(&self) -> Option<&str> {
+        match self {
+            Self::Local {
+                memory_shared: true,
+                account,
+                ..
+            } => Some(&account.name),
+            Self::Local { .. } => None,
         }
     }
 
@@ -329,7 +354,8 @@ impl Executor {
                 let today = today.split(' ').next().unwrap_or_default();
                 // A secret the model saw by mistake is not kept.
                 let note = secrets.redact(note);
-                output.line(&within(memory::remember(memory()?, page, &note, today)).await?);
+                let by = self.author();
+                output.line(&within(memory::remember(memory()?, page, &note, today, by)).await?);
                 None
             }
             Work::Plan(_) => {

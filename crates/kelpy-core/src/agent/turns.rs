@@ -11,6 +11,7 @@
 mod actions;
 mod fitting;
 mod interface;
+mod seen;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -19,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kelpy_common::lock;
-use kelpy_providers::{ChatRequest, Outcome, Provider, Settings, StopReason, ToolSpec};
+use kelpy_providers::{ChatRequest, Images, Outcome, Provider, Settings, StopReason, ToolSpec};
 use kelpy_storage::{
     Access, Action, Approval, Message, Modes, PartialSave, Session, Status, Storage, Summary,
 };
@@ -38,6 +39,7 @@ use crate::events::{Event, Events};
 use crate::home::Home;
 use actions::{Question, chat_messages};
 use fitting::{WindowKey, window_key};
+use seen::Seen;
 
 pub(super) const TITLE_LENGTH: usize = 60;
 /// Partial answers are saved this often, so little is lost if the process dies.
@@ -274,6 +276,8 @@ pub(super) struct Turns {
     /// Where answers starting and ending are published.
     events: Events,
     pub(super) memory_index: PathBuf,
+    /// Whether the memory is shared with the other administrators of this computer.
+    memory_shared: bool,
     /// Where the files the administrator uploads are.
     uploads: PathBuf,
     /// The tools the model may call, and where they run.
@@ -287,6 +291,19 @@ pub(super) struct Turns {
     windows: Mutex<HashMap<WindowKey, u64>>,
     /// Whether each model can call tools, as learned while Kelpy runs.
     tool_support: Mutex<HashMap<WindowKey, bool>>,
+    /// Whether each model can see images, as learned while Kelpy runs.
+    vision: Mutex<HashMap<WindowKey, bool>>,
+    /// The images of the administrator's messages, for the model.
+    seen: Mutex<Seen>,
+}
+
+/// A message of the administrator, as it is sent.
+pub(super) struct Outgoing {
+    /// Its text alone, as stored.
+    pub(super) text: String,
+    pub(super) title: String,
+    /// Its images for a model that sees them, and the tokens they take.
+    pub(super) images: Option<(Images, u64)>,
 }
 
 #[derive(Default)]
@@ -388,6 +405,7 @@ impl Turns {
             tasks,
             events,
             memory_index: home.memory_dir().join("MEMORY.md"),
+            memory_shared: home.shares_memory(),
             uploads: home.uploads_dir(),
             tools: Tools::new(executor.os()),
             executor,
@@ -395,6 +413,8 @@ impl Turns {
             answers: Mutex::new(Answers::default()),
             windows: Mutex::new(HashMap::new()),
             tool_support: Mutex::new(HashMap::new()),
+            vision: Mutex::new(HashMap::new()),
+            seen: Mutex::new(Seen::default()),
         }
     }
 
@@ -455,6 +475,7 @@ impl Turns {
         if !answers.deleting.insert(session_id) {
             return Err(AgentError::Deleting);
         }
+        lock(&self.seen).forget(session_id);
         let operations: Vec<CancellationToken> = answers
             .operations
             .values()
@@ -498,12 +519,13 @@ impl Turns {
         })
     }
 
-    /// Stores `text`, a [`message`], and starts its answer with `settings`. `guard` is kept alive until the answer
-    /// ends.
+    /// Prepares the message, `outgoing`, stores it and starts its answer with `settings`, keeping its images for the
+    /// model. The conversation is busy from the start of the preparation, which stops as the answer does: then
+    /// nothing is stored. `guard` is kept alive until the answer ends.
     pub(super) async fn start(
         self: &Arc<Self>,
         session_id: i64,
-        text: &str,
+        outgoing: impl Future<Output = Result<Outgoing, AgentError>> + Send + 'static,
         settings: Settings,
         guard: impl Send + 'static,
     ) -> Result<AnswerEvents, AgentError> {
@@ -513,10 +535,26 @@ impl Turns {
         // turn is stored and answered all the same, and the conversation is freed however the task ends.
         let (started, start) = oneshot::channel();
         let turns = Arc::clone(self);
-        let text = text.to_owned();
         self.tasks.spawn(async move {
             let _guard = guard;
-            let (title, model) = (title_from(&text), settings.model.clone());
+            let prepared = tokio::select! {
+                biased;
+                () = stop.cancelled() => Err(turns.why_stopped(session_id)),
+                prepared = outgoing => prepared,
+            };
+            let outgoing = match prepared {
+                Ok(outgoing) => outgoing,
+                Err(error) => {
+                    let _ = started.send(Err(error));
+                    return;
+                }
+            };
+            let Outgoing {
+                text,
+                title,
+                images,
+            } = outgoing;
+            let model = settings.model.clone();
             let turn = match turns
                 .store
                 .call(move |store| store.start_turn(session_id, &text, &title, &model))
@@ -528,6 +566,9 @@ impl Turns {
                     return;
                 }
             };
+            if let Some((images, tokens)) = images {
+                lock(&turns.seen).keep(session_id, turn.user.id, images, tokens);
+            }
             let (answer, follower) = watch::channel(AnswerState {
                 message: turn.answer,
                 error: None,
@@ -570,6 +611,19 @@ impl Turns {
             });
         });
         start.await.unwrap_or(Err(AgentError::NotStarted))
+    }
+
+    /// Why an answer was stopped before its message was stored: Kelpy stopping, the conversation deleted, or the
+    /// administrator.
+    fn why_stopped(&self, session_id: i64) -> AgentError {
+        let answers = lock(&self.answers);
+        if answers.stopping {
+            AgentError::Stopping
+        } else if answers.deleting.contains(&session_id) {
+            AgentError::Deleting
+        } else {
+            AgentError::Stopped
+        }
     }
 
     /// Registers a new answer for a conversation, unless Kelpy is stopping, the conversation is being deleted or an
@@ -622,10 +676,18 @@ impl Turns {
         let mut saved_at = Instant::now();
         // Cancelled by the first piece that would take the answer past its limit; that piece is left out.
         let full = CancellationToken::new();
+        // Whether the model sees images is asked only when there are images to show it.
+        let with_images = lock(&self.seen).has(session.id);
         // Stopped meanwhile, neither matters: the loop below ends at once.
-        let (window, mut tools_supported) = tokio::select! {
-            known = async { tokio::join!(self.window(&settings), self.supports_tools(&settings)) } => known,
-            () = stop.cancelled() => (0, false),
+        let (window, mut tools_supported, mut sees_images) = tokio::select! {
+            known = async {
+                tokio::join!(
+                    self.window(&settings),
+                    self.supports_tools(&settings),
+                    async { with_images && self.sees_images(&settings).await },
+                )
+            } => known,
+            () = stop.cancelled() => (0, false, false),
         };
         let mut budget = Budget::new(window, context::correction(&history, &settings.model));
         let asked = history.len();
@@ -708,7 +770,11 @@ impl Turns {
             instructions.push_str(&format!(
                 "\n\n## Files\n\nThe files the administrator uploads are in {}, readable by Kelpy's account only: \
                  their paths appear in the administrator's messages, and Files in the top bar lists them. Read them \
-                 where they are; copy one where a service needs it.",
+                 where they are; copy one where a service needs it. An image the administrator attaches shows in \
+                 the message with its line, \"[Image: …]\": you see it, unless this model cannot see images; then \
+                 the message holds the text read from it by OCR, which may misread some characters, such as 0 \
+                 for o. That is all there is of it for you: the tools cannot read images, so do not open its \
+                 file.",
                 self.uploads.display()
             ));
             if let Some(differences) = differences.as_deref() {
@@ -720,14 +786,20 @@ impl Turns {
             if !current.content.is_empty() || !current.actions.is_empty() {
                 history.push(current);
             }
-            // The tools offered, and what goes back with the calls of this answer, beside its messages.
-            let reserved = size(offered) + replays_size;
+            // The images kept for the model, if it sees them: the latest, within half its window.
+            let (shown, images_size) = if sees_images {
+                lock(&self.seen).of(session.id, budget.window / 2)
+            } else {
+                (HashMap::new(), 0)
+            };
+            // The tools offered, what goes back with the calls of this answer and the images, beside its messages.
+            let reserved = size(offered) + replays_size + images_size;
             let fitted = tokio::select! {
                 biased;
                 () = stop.cancelled() => break (End::Stopped, 0),
                 fitted = self.fit(&settings, &instructions, reserved, &mut summary, &history, budget) => fitted,
             };
-            let messages = chat_messages(fitted.messages, id, &replays, &administrator);
+            let messages = chat_messages(fitted.messages, id, &replays, &administrator, &shown);
             let request = ChatRequest {
                 system: &fitted.system,
                 messages: &messages,
@@ -778,6 +850,10 @@ impl Turns {
                     if outcome.tools_refused {
                         tools_supported = false;
                         lock(&self.tool_support).insert(window_key(&settings), false);
+                    }
+                    if outcome.images_refused {
+                        sees_images = false;
+                        lock(&self.vision).insert(window_key(&settings), false);
                     }
                     if outcome.calls.is_empty() || offered.is_empty() {
                         break (End::Answered(outcome), fitted.estimate);
@@ -887,7 +963,22 @@ impl Turns {
             _ => bytes.len(),
         };
         let memory = String::from_utf8_lossy(&bytes[..end]).trim().to_owned();
-        (!memory.is_empty()).then_some(memory)
+        if memory.is_empty() {
+            return None;
+        }
+        Some(if self.memory_shared {
+            format!(
+                "(This memory is shared with the other administrators of this server: their Kelpys read these pages \
+                 and note on them too. Each note says who made it (\"- 2026-11-12, by alice: …\"), and server.md \
+                 says whose Kelpy made each change: notes you add are signed with the name of the account you run \
+                 as. When you tell the administrator what was done on this server, always say who did it, as the \
+                 memory says, such as \"alice changed the nginx site on 2026-11-12, bob restarted it\"; a note or \
+                 change without a name was made before the memory was shared, by an administrator not known.)\
+                 \n\n{memory}"
+            )
+        } else {
+            memory
+        })
     }
 }
 

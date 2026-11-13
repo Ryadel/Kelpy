@@ -67,7 +67,21 @@ fn messages(messages: &[ChatMessage]) -> Vec<Value> {
     let mut joined: Vec<Value> = Vec::with_capacity(messages.len());
     for message in messages {
         let (role, blocks) = match message {
-            ChatMessage::User(text) => ("user", vec![json!({ "type": "text", "text": text })]),
+            ChatMessage::User { text, images } => {
+                let (text, images) = ChatMessage::user_parts(text, images.as_ref());
+                // Images first, as Anthropic advises.
+                let mut blocks: Vec<Value> = images
+                    .iter()
+                    .map(|image| {
+                        json!({
+                            "type": "image",
+                            "source": { "type": "base64", "media_type": image.media_type, "data": image.data },
+                        })
+                    })
+                    .collect();
+                blocks.push(json!({ "type": "text", "text": text }));
+                ("user", blocks)
+            }
             ChatMessage::Assistant {
                 text,
                 calls,

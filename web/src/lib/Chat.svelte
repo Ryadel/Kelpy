@@ -11,6 +11,7 @@
   import Composer from './Composer.svelte';
   import Differences from './Differences.svelte';
   import Markdown from './Markdown.svelte';
+  import MessageImages from './MessageImages.svelte';
   import PlanCard from './PlanCard.svelte';
   import Waiting from './Waiting.svelte';
   import Welcome from './Welcome.svelte';
@@ -20,6 +21,8 @@
   import { copyText } from './clipboard';
   import { hasCallouts } from './explanations';
   import { sentMessages } from './history';
+  import { splitImages } from './images';
+  import type { ComposerImage, Outgoing } from './Composer.svelte';
   import { advance, settled } from './reveal';
   import {
     ApiError,
@@ -46,7 +49,7 @@
   interface Props {
     session: Session;
     /** A first message, written before the conversation existed: it is sent as soon as the conversation opens. */
-    start: string | null;
+    start: Outgoing | null;
     onStarted: () => void;
     /** Called with the conversation as changed here, such as its explanations. */
     onChanged: (session: Session) => void;
@@ -98,8 +101,13 @@
   /** Counts the loads, so that only the latest one shows. */
   let loads = 0;
 
-  /** What Up and Down bring back in the message box: this conversation's messages. */
-  const sent = $derived(sentMessages(messages));
+  /** The images to show with the next message, uploaded already. */
+  let images = $state<ComposerImage[]>([]);
+
+  /** What Up and Down bring back in the message box: this conversation's messages, as written. */
+  const sent = $derived(
+    sentMessages(messages.map((message) => ({ role: message.role, content: splitImages(message.content).text }))),
+  );
 
   /** Before its first message a conversation shows the welcome, with the message box in the middle. */
   const empty = $derived(loaded && messages.length === 0 && !running);
@@ -136,6 +144,7 @@
     loaded = false;
     stopRevealing();
     draft = untrack(() => loadDraft(id));
+    images = [];
     void load(id);
     return () => {
       listening?.abort();
@@ -174,7 +183,8 @@
       void refreshDifferences();
       if (start !== null && messages.length === 0 && !running) {
         // Sent in the same step as `loaded`, so the welcome never shows in between.
-        draft = start;
+        draft = start.text;
+        images = start.images;
         onStarted();
         await send();
         return;
@@ -340,11 +350,13 @@
 
   async function send() {
     const content = draft.trim();
-    if (!content || running) {
+    const shown = images;
+    if ((!content && shown.length === 0) || running) {
       return;
     }
     error = null;
     draft = '';
+    images = [];
     const id = session.id;
     // Once Kelpy has stored the message, it is in the conversation: giving it back to the box would send it twice.
     let stored = false;
@@ -353,6 +365,7 @@
         sendMessage(
           id,
           content,
+          shown.map((image) => image.name),
           (event) => {
             stored ||= event.type === 'user';
             apply(event);
@@ -361,8 +374,15 @@
         ),
       );
     } catch (reason: unknown) {
-      if (!stored) {
+      if (!stored && id === session.id) {
         draft = content;
+        images = shown;
+      } else if (!stored) {
+        saveDraft(id, content);
+      }
+      // Stopped before it was sent, such as while its images were read: back in the box, nothing to report.
+      if (reason instanceof ApiError && reason.code === 'stopped') {
+        return;
       }
       report(reason, reason instanceof ApiError && ['not_configured', 'missing_key', 'not_signed_in'].includes(reason.code));
     }
@@ -527,7 +547,9 @@
   {/if}
   <Composer
     bind:this={composer}
+    conversation={session.id}
     bind:value={draft}
+    bind:images
     {explanations}
     onExplanations={changeExplanations}
     {access}
@@ -564,10 +586,16 @@
               </div>
             {/if}
             {#if message.role === 'user'}
+              {@const written = splitImages(message.content)}
               <div class="group ml-auto flex max-w-[78%] flex-col items-end gap-1">
-                <div class="bg-bubble rounded-3xl px-5 py-2.5 whitespace-pre-wrap [overflow-wrap:anywhere]">
-                  {message.content}
-                </div>
+                {#if written.images.length > 0}
+                  <MessageImages images={written.images} />
+                {/if}
+                {#if written.text !== ''}
+                  <div class="bg-bubble rounded-3xl px-5 py-2.5 whitespace-pre-wrap [overflow-wrap:anywhere]">
+                    {written.text}
+                  </div>
+                {/if}
                 {@render copyButton(message, 'Copies your message', 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100')}
               </div>
             {:else}
@@ -588,6 +616,7 @@
                         <ActionCard
                           {action}
                           {approval}
+                          {access}
                           canDecide={usable() && message.status === 'streaming'}
                           onDecide={(decision, switchTo) => decide(action, decision, switchTo)}
                           onStop={() => stopOne(action)}

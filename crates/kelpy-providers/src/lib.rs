@@ -18,6 +18,7 @@ mod responses;
 mod sse;
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -316,10 +317,38 @@ impl Settings {
     }
 }
 
+/// An image a message shows the model.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Image {
+    /// `image/png` or `image/jpeg`.
+    pub media_type: &'static str,
+    /// The image, in Base64.
+    pub data: String,
+}
+
+impl Image {
+    /// The image as a `data:` URL, as OpenAI's APIs take it.
+    fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data)
+    }
+}
+
+/// The images of a user's message, for a model that sees them, and the message's text that goes with them: without
+/// what stands in for them in its text alone, such as the text read from them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Images {
+    pub text: String,
+    pub images: Vec<Arc<Image>>,
+}
+
 /// A message of the conversation, as the model reads it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatMessage {
-    User(String),
+    /// The user's message: its text alone, and its images with their own text when the model sees them.
+    User {
+        text: String,
+        images: Option<Images>,
+    },
     Assistant {
         text: String,
         /// The tools the model called after the text.
@@ -333,7 +362,30 @@ pub enum ChatMessage {
 
 impl ChatMessage {
     pub fn user(text: impl Into<String>) -> Self {
-        Self::User(text.into())
+        Self::User {
+            text: text.into(),
+            images: None,
+        }
+    }
+
+    /// A user's message as sent: its text, and the images it shows, if any.
+    fn user_parts<'m>(text: &'m str, images: Option<&'m Images>) -> (&'m str, &'m [Arc<Image>]) {
+        match images {
+            Some(images) => (&images.text, &images.images),
+            None => (text, &[]),
+        }
+    }
+
+    /// The message without images: its text alone.
+    fn without_images(&self) -> Self {
+        match self {
+            Self::User { text, .. } => Self::user(text.clone()),
+            other => other.clone(),
+        }
+    }
+
+    fn has_images(&self) -> bool {
+        matches!(self, Self::User { images: Some(images), .. } if !images.images.is_empty())
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
@@ -392,6 +444,9 @@ pub struct Outcome {
     pub replay: Vec<Value>,
     /// The service refused the tools, so the request was sent again without them: this model cannot use tools.
     pub tools_refused: bool,
+    /// The service refused the images, so the request was sent again with the messages' text alone: this model
+    /// cannot see images.
+    pub images_refused: bool,
 }
 
 /// Why the model stopped writing.
@@ -469,6 +524,22 @@ impl ProviderError {
                 .any(|sign| message.contains(sign))
     }
 
+    /// Whether the service refused the request for showing images, which the model or the server does not take.
+    /// Servers for text alone also refuse a message's content given as parts.
+    fn refuses_images(&self) -> bool {
+        let Self::Api {
+            status: Some(400..500),
+            message,
+        } = self
+        else {
+            return false;
+        };
+        let message = message.to_lowercase();
+        ["image", "vision", "multimodal", "must be a string"]
+            .iter()
+            .any(|sign| message.contains(sign))
+    }
+
     /// Whether a Chat Completions server refused the request for asking it to report usage, which strict servers
     /// do not know.
     fn refuses_usage(&self) -> bool {
@@ -535,16 +606,34 @@ impl Provider {
         mut on_text: impl FnMut(&str) + Send,
     ) -> Result<Outcome, ProviderError> {
         let protocol = settings.kind.protocol();
-        let (response, tools_refused) = match self.send_reporting(settings, chat).await {
-            Err(error) if !chat.tools.is_empty() && error.refuses_tools() => {
-                let without = ChatRequest {
-                    tools: &[],
-                    ..*chat
-                };
-                (self.send_reporting(settings, &without).await?, true)
+        // A service that refuses the tools or the images is asked again without them.
+        let mut tools = chat.tools;
+        let mut text_alone: Option<Vec<ChatMessage>> = None;
+        let response = loop {
+            let request = ChatRequest {
+                messages: text_alone.as_deref().unwrap_or(chat.messages),
+                tools,
+                ..*chat
+            };
+            match self.send_reporting(settings, &request).await {
+                Err(error) if !tools.is_empty() && error.refuses_tools() => tools = &[],
+                Err(error)
+                    if text_alone.is_none()
+                        && chat.messages.iter().any(ChatMessage::has_images)
+                        && error.refuses_images() =>
+                {
+                    text_alone = Some(
+                        chat.messages
+                            .iter()
+                            .map(ChatMessage::without_images)
+                            .collect(),
+                    );
+                }
+                response => break response?,
             }
-            response => (response?, false),
         };
+        let tools_refused = tools.is_empty() && !chat.tools.is_empty();
+        let images_refused = text_alone.is_some();
 
         let mut parser = sse::Parser::default();
         let mut bytes = response.bytes_stream();
@@ -584,6 +673,7 @@ impl Provider {
             calls,
             replay,
             tools_refused,
+            images_refused,
         })
     }
 
@@ -979,6 +1069,105 @@ mod tests {
         let requests = server.requests();
         assert_eq!(requests.len(), 3);
         assert!(!requests[2].contains("\"tools\""));
+    }
+
+    /// A message with a screenshot: its text alone holds the text read from it, which the model seeing it does not
+    /// get.
+    fn pictured() -> Vec<ChatMessage> {
+        vec![ChatMessage::User {
+            text: "Why?\n\n[Image: error.png]\nText read from it: Access denied".into(),
+            images: Some(Images {
+                text: "Why?\n\n[Image: error.png]".into(),
+                images: vec![Arc::new(Image {
+                    media_type: "image/png",
+                    data: "iVBORw0K".into(),
+                })],
+            }),
+        }]
+    }
+
+    #[test]
+    fn each_protocol_shows_the_images_before_the_text_that_goes_with_them() {
+        let messages = pictured();
+        let chat = ChatRequest {
+            system: "",
+            messages: &messages,
+            tools: &[],
+        };
+        let client = Provider::new().unwrap().client;
+        let body = |kind: Kind| -> Value {
+            let built = kind
+                .protocol()
+                .request(
+                    kind,
+                    &client,
+                    kind.default_base_url().unwrap_or("http://127.0.0.1:1/v1"),
+                    Some("key"),
+                    "model",
+                    &chat,
+                    false,
+                )
+                .build()
+                .unwrap();
+            serde_json::from_slice(built.body().unwrap().as_bytes().unwrap()).unwrap()
+        };
+        let url = "data:image/png;base64,iVBORw0K";
+
+        let anthropic = &body(Kind::Anthropic)["messages"][0]["content"];
+        assert_eq!(anthropic[0]["type"], "image");
+        assert_eq!(anthropic[0]["source"]["media_type"], "image/png");
+        assert_eq!(anthropic[0]["source"]["data"], "iVBORw0K");
+        assert_eq!(anthropic[1]["text"], "Why?\n\n[Image: error.png]");
+
+        let responses = body(Kind::OpenAi);
+        let content = &responses["input"][0]["content"];
+        assert_eq!(content[0]["type"], "input_image");
+        assert_eq!(content[0]["image_url"], url);
+        assert_eq!(content[1]["text"], "Why?\n\n[Image: error.png]");
+
+        let completions = &body(Kind::Ollama)["messages"][0]["content"];
+        assert_eq!(completions[0]["image_url"]["url"], url);
+        assert_eq!(completions[1]["text"], "Why?\n\n[Image: error.png]");
+    }
+
+    #[tokio::test]
+    async fn a_service_refusing_images_is_asked_again_with_the_text_alone() {
+        let server = kelpy_test_support::FakeServer::start(vec![(
+            "POST /v1/chat/completions",
+            "200 OK",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n"
+                .to_owned(),
+        )])
+        .await;
+        server.respond_once(
+            "POST /v1/chat/completions",
+            "400 Bad Request",
+            r#"{"error":{"message":"image input is not supported - hint: you may need to provide the mmproj"}}"#
+                .to_owned(),
+        );
+        let messages = pictured();
+        let request = ChatRequest {
+            system: "",
+            messages: &messages,
+            tools: &[],
+        };
+        let base = format!("{}/v1", server.url);
+        let outcome = Provider::new()
+            .unwrap()
+            .stream(&settings(Kind::OpenAiCompatible, base), &request, |_| {})
+            .await
+            .unwrap();
+        assert!(outcome.images_refused);
+        assert!(!outcome.tools_refused);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("image_url"));
+        assert!(!requests[1].contains("image_url"));
+        // As a string, with the text read from the image.
+        assert!(requests[1].contains(
+            r#""content":"Why?\n\n[Image: error.png]\nText read from it: Access denied""#
+        ));
     }
 
     #[test]

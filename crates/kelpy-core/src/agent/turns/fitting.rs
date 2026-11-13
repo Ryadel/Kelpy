@@ -36,6 +36,25 @@ impl Turns {
         }
     }
 
+    /// Whether the model `settings` name can see images: as its service says, else assumed, until a service
+    /// refuses them. Remembered while Kelpy runs once the service says.
+    pub(super) async fn sees_images(&self, settings: &Settings) -> bool {
+        let key = window_key(settings);
+        if let Some(&known) = lock(&self.vision).get(&key) {
+            return known;
+        }
+        match tokio::time::timeout(WINDOW_TIME, self.client.sees_images(settings)).await {
+            Ok(Ok(Some(said))) => {
+                lock(&self.vision).insert(key, said);
+                said
+            }
+            // Unknown: shown, and remembered as not seen if the service refuses them.
+            Ok(Ok(None)) => true,
+            // Asked again with the next answer; meanwhile the text read from the images stands in for them.
+            _ => false,
+        }
+    }
+
     /// The context window of the model `settings` name: as its service declares it, else assumed. A declared window
     /// is remembered while Kelpy runs; Ollama is asked again until it tells, which it does once the model is loaded.
     pub(in crate::agent) async fn window(&self, settings: &Settings) -> u64 {

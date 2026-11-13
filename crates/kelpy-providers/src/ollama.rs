@@ -190,6 +190,25 @@ impl Provider {
         base_url: &str,
         model: &str,
     ) -> Result<Option<bool>, ProviderError> {
+        self.ollama_capability(base_url, model, "tools").await
+    }
+
+    /// Whether the Ollama at `base_url` lets `model` see images, as [`Provider::ollama_tools`].
+    pub async fn ollama_vision(
+        &self,
+        base_url: &str,
+        model: &str,
+    ) -> Result<Option<bool>, ProviderError> {
+        self.ollama_capability(base_url, model, "vision").await
+    }
+
+    /// Whether `model` has `capability` among those the Ollama at `base_url` lists.
+    async fn ollama_capability(
+        &self,
+        base_url: &str,
+        model: &str,
+        capability: &str,
+    ) -> Result<Option<bool>, ProviderError> {
         let shown = self
             .ollama_json(
                 self.client
@@ -199,7 +218,7 @@ impl Provider {
             .await?;
         Ok(shown["capabilities"]
             .as_array()
-            .map(|capabilities| capabilities.iter().any(|capability| capability == "tools")))
+            .map(|listed| listed.iter().any(|listed| listed == capability)))
     }
 
     /// The JSON answer to an Ollama API request.
@@ -264,13 +283,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_capabilities_tell_whether_a_model_calls_tools() {
+    async fn the_capabilities_tell_whether_a_model_calls_tools_and_sees_images() {
         let shown = json!({ "capabilities": ["completion", "tools"] });
         let server = FakeServer::start(vec![("POST /api/show", "200 OK", shown.to_string())]).await;
         let provider = Provider::new().unwrap();
         let base = format!("{}/v1", server.url);
         assert_eq!(
             provider.ollama_tools(&base, "qwen3").await.unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            provider.ollama_vision(&base, "qwen3").await.unwrap(),
+            Some(false)
+        );
+        server.respond(
+            "POST /api/show",
+            "200 OK",
+            json!({ "capabilities": ["completion", "vision", "tools"] }).to_string(),
+        );
+        assert_eq!(
+            provider.ollama_vision(&base, "qwen3.5").await.unwrap(),
             Some(true)
         );
         server.respond(
