@@ -299,8 +299,7 @@ pub async fn take_over(home: &Home, channel: &str, from: u32) -> Result<ExitCode
                 Err(error) => format!("{error:#}"),
             };
             let _ = channel.send(&Message::Failed(reason)).await;
-            served?;
-            return Ok(ExitCode::FAILURE);
+            return served.map(|_| ExitCode::FAILURE);
         }
         () = tokio::time::sleep_until(starting) => {
             let reason = format!("it did not start within {}", duration::format(TAKING_OVER_WAIT));
@@ -308,8 +307,7 @@ pub async fn take_over(home: &Home, channel: &str, from: u32) -> Result<ExitCode
             return Ok(ExitCode::FAILURE);
         }
     }
-    serving.await?;
-    Ok(ExitCode::SUCCESS)
+    serving.await
 }
 
 /// How a runtime starts.

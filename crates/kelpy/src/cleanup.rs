@@ -347,7 +347,7 @@ mod tests {
         fs::write(root.join("holiday.jpg"), b"not Kelpy's").unwrap();
         fs::write(home.memory_dir().join("notes.md"), b"memory").unwrap();
 
-        run(&home, true).unwrap();
+        assert_eq!(run(&home, true).unwrap(), ExitCode::SUCCESS);
         assert!(root.join("holiday.jpg").is_file());
         assert!(!home.config_path().exists());
         assert!(!home.memory_dir().exists());
@@ -366,7 +366,7 @@ mod tests {
         fs::write(home.workspace_dir().join("draft.txt"), b"mine").unwrap();
         kelpy_core::config::save_shared_memory(&home.config_path(), &shared).unwrap();
 
-        run(&home, true).unwrap();
+        assert_eq!(run(&home, true).unwrap(), ExitCode::SUCCESS);
         assert!(shared.join("server.db").is_file());
         assert!(shared.join("memory").is_dir());
         assert!(!home.workspace_dir().join("draft.txt").exists());
@@ -506,7 +506,7 @@ mod tests {
         fs::write(root.join("kelpy.old"), b"someone else's").unwrap();
         let home = Home::init(&root).unwrap();
 
-        run(&home, true).unwrap();
+        assert_eq!(run(&home, true).unwrap(), ExitCode::SUCCESS);
         assert!(root.join("kelpy.4242-0.new").is_file());
         assert!(root.join("kelpy.4242-1.new").is_dir());
         assert!(root.join("kelpy.old").is_file());
@@ -546,7 +546,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("Kelpy");
         let home = Home::init(&root).unwrap();
-        run(&home, true).unwrap();
+        assert_eq!(run(&home, true).unwrap(), ExitCode::SUCCESS);
         assert!(!root.exists());
     }
 }
