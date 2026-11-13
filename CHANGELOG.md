@@ -3,7 +3,10 @@
 Each release is on the [releases page](https://github.com/Ryadel/Kelpy/releases), with one executable per platform,
 the install scripts and the signed checksums. Versions follow [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## 0.5.0 (2026-11-13)
+
+Kelpy can now share its memory of a server among its administrators, see images and screenshots, run commands in
+Auto, and restart itself as administrator.
 
 - **Auto runs commands**: with System access Full and Approval mode Auto, the commands Kelpy writes run without
   asking. Those that look like they could lose data, lock you out or stop the system still ask, and their card says
@@ -52,6 +55,9 @@ the install scripts and the signed checksums. Versions follow [Semantic Versioni
   process and version, and its home, then offers to open the terminal UI, open the Web UI, stop Kelpy, or leave it
   running. Stopping asks first when an answer is being written. Without a terminal it prints the same facts and
   `kelpy stop`. While Kelpy is starting or being updated, it waits up to half a minute.
+
+Updating from 0.4: Kelpy offers the update at its next start, or run `kelpy update`. The memory stays private;
+choose *Shared* in the Memory menu to share it.
 
 ## 0.4.1 (2026-11-09)
 

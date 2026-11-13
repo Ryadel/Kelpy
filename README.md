@@ -82,7 +82,7 @@ account Kelpy runs as. In an interactive terminal they head the terminal UI, whi
 the Web UI; without a terminal Kelpy prints them:
 
 ```text
-Kelpy v0.4.1
+Kelpy v0.5.0
 
 Agent runtime started.
 Web UI:   http://127.0.0.1:54321/#code=K7QM-4ZP2
