@@ -3,6 +3,23 @@
 Each release is on the [releases page](https://github.com/Ryadel/Kelpy/releases), with one executable per platform,
 the install scripts and the signed checksums. Versions follow [Semantic Versioning](https://semver.org).
 
+## 0.5.1 (2026-11-14)
+
+Fixes to the commands Auto runs without asking, to the shared memory and to the terminal UI over SSH.
+
+- **Auto asks again for commands run through another program**: a command that deletes files, stops SSH or restarts
+  the system now asks even when another program runs it, as in `sudo -u root rm …`, `sudo -H rm …`,
+  `xargs -i rm …`, `cmd /c del …`, `powershell -Command "Remove-Item …"`, `bash -c '…'` or `su -c '…'`. In 0.5.0
+  they ran without asking.
+- **Shared memory**: when several administrators' Kelpys check the server at once, one that finishes later no
+  longer notes an unexpected change that is not there, or clears one another Kelpy has just found.
+- **Terminal UI over SSH**: a terminal that does not tell in time where its cursor is now gets the terminal UI on the
+  whole screen. In 0.5.0 Kelpy stopped with "The cursor position could not be read within a normal duration".
+
+Updating from 0.5.0: Kelpy offers the update at its next start, or run `kelpy update`. With the memory shared, update
+every administrator's Kelpy: 0.5.1 upgrades the shared records, and a 0.5.0 that finds them upgraded stops and asks
+to be updated.
+
 ## 0.5.0 (2026-11-13)
 
 Kelpy can now share its memory of a server among its administrators, see images and screenshots, run commands in
