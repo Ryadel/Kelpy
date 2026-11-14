@@ -102,6 +102,10 @@ impl Server {
             return;
         }
         let own = records.iter().find(|record| record.subject == subject);
+        let turn = match own {
+            Some(own) => self.turn(own.id).await,
+            None => None,
+        };
         let now = self
             .executor
             .observe(RecordedKind::File, &subject)
@@ -112,12 +116,15 @@ impl Server {
             && now.state != "missing"
         {
             // Edited since Kelpy wrote it.
-            let (id, state, content) = (own.id, now.state.clone(), now.content.clone());
-            let _ = self
-                .store
-                .call(move |store| store.found_different(id, &state, content.as_deref()))
-                .await;
-            self.events.publish(Event::DifferencesChanged);
+            let (own, state, content) = (own.clone(), now.state.clone(), now.content.clone());
+            if let Some(turn) = turn
+                && let Ok(true) = self
+                    .store
+                    .call(move |store| store.found(&own, turn, &state, content.as_deref()))
+                    .await
+            {
+                self.events.publish(Event::DifferencesChanged);
+            }
             return;
         }
         let others: Vec<&Record> = records
@@ -144,7 +151,9 @@ impl Server {
     }
 
     /// Checks every record against the server, unless it was checked less than a minute ago and not `now`. A
-    /// difference is noted once; one gone is forgotten. The interfaces are told when they changed.
+    /// difference is noted once; one gone is forgotten. The interfaces are told when they changed. What is found is
+    /// noted only if the record is still the one read here and no observation of it started later was noted: other
+    /// Kelpys sharing the records may be checking at once.
     pub(in crate::agent) async fn check(&self, now: bool) -> Result<(), AgentError> {
         let _checking = self.checking.lock().await;
         if !now && lock(&self.checked).is_some_and(|checked| checked.elapsed() < CHECK_EVERY) {
@@ -157,6 +166,9 @@ impl Server {
             self.executor.hold(PathBuf::from(&record.subject));
         }
         for record in records {
+            let Some(turn) = self.turn(record.id).await else {
+                continue;
+            };
             let observed = self
                 .executor
                 .observe(recorded_kind(record.kind), &record.subject)
@@ -166,20 +178,12 @@ impl Server {
                 // A service removed, a file grown past the limit: what is found is that it cannot be read.
                 Err(error) => (format!("unreadable: {error}"), None),
             };
-            let id = record.id;
-            if state == record.expected {
-                changed |= self
-                    .store
-                    .call(move |store| store.found_as_expected(id))
-                    .await?;
-            } else {
-                // A content is kept only where the record's may be shown.
-                let content = content.filter(|_| record.content.is_some());
-                changed |= self
-                    .store
-                    .call(move |store| store.found_different(id, &state, content.as_deref()))
-                    .await?;
-            }
+            // A content is kept only where the record's may be shown.
+            let content = content.filter(|_| record.content.is_some());
+            changed |= self
+                .store
+                .call(move |store| store.found(&record, turn, &state, content.as_deref()))
+                .await?;
         }
         *lock(&self.checked) = Some(Instant::now());
         if changed {
@@ -187,6 +191,16 @@ impl Server {
         }
         self.write_page().await;
         Ok(())
+    }
+
+    /// The turn of an observation of the record `id` about to start; `None` if the record is gone or the turn could
+    /// not be taken: then nothing is noted of it this time.
+    async fn turn(&self, id: i64) -> Option<i64> {
+        self.store
+            .call(move |store| store.observing(id))
+            .await
+            .ok()
+            .flatten()
     }
 
     /// The differences not settled, as the administrator sees them.

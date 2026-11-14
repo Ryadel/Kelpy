@@ -176,12 +176,19 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE records ADD COLUMN recorded_by TEXT;",
     // 11: why a command the model wrote asks even in Auto.
     "ALTER TABLE actions ADD COLUMN risk TEXT;",
+    // 12: the order of the observations of each record: the turn last given to one, and that of the last noted (see
+    // `Store::observing`).
+    "
+    ALTER TABLE records ADD COLUMN observing INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE records ADD COLUMN observed  INTEGER NOT NULL DEFAULT 0;
+",
 ];
 
 /// The schema of the server's records in a database of their own, shared by the administrators of a computer: the
 /// same tables as in a conversations' database, without the link to its actions. Upgraded by its own
 /// `user_version`.
-const SERVER_MIGRATIONS: &[&str] = &["
+const SERVER_MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE server.records (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         kind        TEXT    NOT NULL,
@@ -203,7 +210,13 @@ const SERVER_MIGRATIONS: &[&str] = &["
         settled    TEXT,
         settled_at INTEGER
     );
-"];
+",
+    // 2: the order of the observations of each record.
+    "
+    ALTER TABLE server.records ADD COLUMN observing INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE server.records ADD COLUMN observed  INTEGER NOT NULL DEFAULT 0;
+",
+];
 
 /// The attached database of the server's records, once shared.
 const SERVER: &str = "server";
@@ -928,52 +941,91 @@ impl Store {
         Ok(records)
     }
 
-    /// Notes that a record's subject was `found` different, unless that difference is already open: the earlier
-    /// note keeps its time. A difference found otherwise replaces the open one. Returns whether it is new.
-    pub fn found_different(
-        &mut self,
-        record_id: i64,
-        found: &str,
-        content: Option<&str>,
-    ) -> Result<bool> {
-        let at = self.records;
-        let transaction = self.connection.transaction()?;
-        let open: Option<String> = transaction
+    /// The turn of an observation of the record `record_id` about to start, taken before it starts; `None` if the
+    /// record is gone. Of the observations of a record by the Kelpys sharing the records, one is noted only if it
+    /// started after the last one noted (see [`Store::found`]): one that took longer cannot undo with what it saw
+    /// before what another saw since.
+    pub fn observing(&self, record_id: i64) -> Result<Option<i64>> {
+        let turn = self
+            .connection
             .query_row(
                 &format!(
-                    "SELECT found FROM {at}.differences WHERE record_id = ?1 AND settled IS NULL"
+                    "UPDATE {}.records SET observing = observing + 1 WHERE id = ?1 RETURNING observing",
+                    self.records
                 ),
                 [record_id],
                 |row| row.get(0),
             )
             .optional()?;
-        if open.as_deref() == Some(found) {
+        Ok(turn)
+    }
+
+    /// Notes what a record's subject was `found` to be by the observation of `turn` (see [`Store::observing`]), made
+    /// against `seen`, the record as it was read before. As expected, its open difference is gone. Different, a
+    /// difference is noted, unless that one is already open: the earlier note keeps its time, and one found otherwise
+    /// replaces it. Nothing is noted when an observation started later was noted already, or when the record is no
+    /// longer `seen`, changed meanwhile by another Kelpy sharing the records or by a change of this one: what was
+    /// found may be that change itself, and the next check compares it with the new record. Returns whether the
+    /// differences changed.
+    pub fn found(
+        &mut self,
+        seen: &Record,
+        turn: i64,
+        found: &str,
+        content: Option<&str>,
+    ) -> Result<bool> {
+        let at = self.records;
+        // Held for writing from the start, so that no other Kelpy notes anything between reading and noting.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(String, i64, i64)> = transaction
+            .query_row(
+                &format!("SELECT expected, recorded_at, observed FROM {at}.records WHERE id = ?1"),
+                [seen.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((expected, recorded_at, observed)) = current else {
+            return Ok(false);
+        };
+        if (expected.as_str(), recorded_at) != (seen.expected.as_str(), seen.recorded_at)
+            || turn <= observed
+        {
             return Ok(false);
         }
         transaction.execute(
-            &format!("DELETE FROM {at}.differences WHERE record_id = ?1 AND settled IS NULL"),
-            [record_id],
+            &format!("UPDATE {at}.records SET observed = ?2 WHERE id = ?1"),
+            params![seen.id, turn],
         )?;
-        transaction.execute(
-            &format!(
-                "INSERT INTO {at}.differences (record_id, found, content, found_at) VALUES (?1, ?2, ?3, ?4)"
-            ),
-            params![record_id, found, content, unix_now()],
-        )?;
+        let open: Option<String> = transaction
+            .query_row(
+                &format!(
+                    "SELECT found FROM {at}.differences WHERE record_id = ?1 AND settled IS NULL"
+                ),
+                [seen.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let changed = if open.as_deref() == Some(found) {
+            false
+        } else {
+            let removed = transaction.execute(
+                &format!("DELETE FROM {at}.differences WHERE record_id = ?1 AND settled IS NULL"),
+                [seen.id],
+            )?;
+            if found != seen.expected {
+                transaction.execute(
+                    &format!(
+                        "INSERT INTO {at}.differences (record_id, found, content, found_at) VALUES (?1, ?2, ?3, ?4)"
+                    ),
+                    params![seen.id, found, content, unix_now()],
+                )?;
+            }
+            found != seen.expected || removed > 0
+        };
         transaction.commit()?;
-        Ok(true)
-    }
-
-    /// Notes that a record's subject is again as expected: its open difference is gone with it.
-    pub fn found_as_expected(&self, record_id: i64) -> Result<bool> {
-        let removed = self.connection.execute(
-            &format!(
-                "DELETE FROM {}.differences WHERE record_id = ?1 AND settled IS NULL",
-                self.records
-            ),
-            [record_id],
-        )?;
-        Ok(removed > 0)
+        Ok(changed)
     }
 
     /// The differences not settled yet, oldest first.
@@ -1952,7 +2004,7 @@ mod tests {
         let seen = bob.records().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].subject, path);
-        assert!(bob.found_different(seen[0].id, "b2", None).unwrap());
+        assert!(look(&mut bob, &seen[0], "b2", None));
         assert_eq!(alice.differences().unwrap().len(), 1);
         let changed = bob
             .record(RecordKind::File, path, "c3", None, false, None)
@@ -1960,6 +2012,30 @@ mod tests {
         assert_eq!(changed.recorded_by.as_deref(), Some("bob"));
         assert!(alice.differences().unwrap().is_empty());
         assert_eq!(alice.records().unwrap()[0].expected, "c3");
+
+        // Alice's Kelpy found the file as Bob's changes it again: compared with the record it read before, the
+        // new content would be a difference, though it is what is expected now.
+        let before = alice.records().unwrap().remove(0);
+        bob.record(RecordKind::File, path, "d4", None, false, None)
+            .unwrap();
+        assert!(!look(&mut alice, &before, "d4", None));
+        assert!(!look(&mut alice, &before, "e5", None));
+        assert!(alice.differences().unwrap().is_empty());
+        let now = alice.records().unwrap().remove(0);
+        assert!(!look(&mut alice, &now, "d4", None));
+
+        // Two checks at once: Bob's starts after Alice's, finds the file changed and notes it; Alice's, ending last
+        // with what it found before, does not undo it, nor does a check of hers ending later still.
+        let slow = alice.observing(now.id).unwrap().unwrap();
+        let quick = bob.observing(now.id).unwrap().unwrap();
+        assert!(bob.found(&now, quick, "e5", None).unwrap());
+        assert!(!alice.found(&now, slow, "d4", None).unwrap());
+        assert!(!alice.found(&now, slow, "f6", None).unwrap());
+        let open = alice.differences().unwrap();
+        assert_eq!((open.len(), open[0].found.as_str()), (1, "e5"));
+        // The next check notes what it finds.
+        assert!(look(&mut alice, &now, "d4", None));
+        assert!(alice.differences().unwrap().is_empty());
 
         // Their own databases keep none of it.
         let own = Store::open(&folder.path().join("alice.db")).unwrap();
@@ -1977,6 +2053,12 @@ mod tests {
         ));
     }
 
+    /// Observes `seen`'s subject found as `found`, in its turn, and notes it.
+    fn look(store: &mut Store, seen: &Record, found: &str, content: Option<&str>) -> bool {
+        let turn = store.observing(seen.id).unwrap().unwrap();
+        store.found(seen, turn, found, content).unwrap()
+    }
+
     #[test]
     fn differences_are_noted_once_settled_by_the_administrator_and_replaced_by_a_new_change() {
         let mut store = Store::in_memory().unwrap();
@@ -1991,17 +2073,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(
-            store
-                .found_different(record.id, "b2", Some("worker 4;\n"))
-                .unwrap()
-        );
+        assert!(look(&mut store, &record, "b2", Some("worker 4;\n")));
         // The same difference again: still the first note.
-        assert!(
-            !store
-                .found_different(record.id, "b2", Some("worker 4;\n"))
-                .unwrap()
-        );
+        assert!(!look(&mut store, &record, "b2", Some("worker 4;\n")));
         let open = store.differences().unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(
@@ -2025,11 +2099,13 @@ mod tests {
         ));
 
         // Changed by hand, then back as expected: nothing to settle.
-        store.found_different(record.id, "c3", None).unwrap();
-        assert!(store.found_as_expected(record.id).unwrap());
+        let accepted = records[0].clone();
+        assert!(look(&mut store, &accepted, "c3", None));
+        assert!(look(&mut store, &accepted, "b2", None));
+        assert!(!look(&mut store, &accepted, "b2", None));
         assert!(store.differences().unwrap().is_empty());
         // Changed by hand, then changed by Kelpy: the new record replaces the difference.
-        store.found_different(record.id, "c3", None).unwrap();
+        look(&mut store, &accepted, "c3", None);
         store
             .record(RecordKind::File, path, "d4", None, false, None)
             .unwrap();

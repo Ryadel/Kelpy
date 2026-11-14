@@ -137,15 +137,19 @@ pub async fn run_local(api: Api, options: Options) -> io::Result<Exit> {
         inline,
         shift_enter: false,
     };
-    let mut terminal = if inline {
-        enable_raw_mode()?;
-        let options = TerminalOptions {
-            viewport: Viewport::Inline(INLINE_HEIGHT),
-        };
-        Terminal::with_options(CrosstermBackend::new(io::stdout()), options)?
-    } else {
-        ratatui::init()
-    };
+    // Inline, the terminal is asked where its cursor is: one that does not answer in time gets the whole screen.
+    let inline_terminal = inline
+        .then(|| -> io::Result<_> {
+            enable_raw_mode()?;
+            let options = TerminalOptions {
+                viewport: Viewport::Inline(INLINE_HEIGHT),
+            };
+            Terminal::with_options(CrosstermBackend::new(io::stdout()), options)
+        })
+        .and_then(Result::ok);
+    local.inline = inline_terminal.is_some();
+    let inline = local.inline;
+    let mut terminal = inline_terminal.unwrap_or_else(ratatui::init);
     // Asked once the terminal is in raw mode, as it answers on its input.
     local.shift_enter = cfg!(windows) || supports_keyboard_enhancement().unwrap_or(false);
     crossterm::execute!(io::stdout(), EnableBracketedPaste)?;

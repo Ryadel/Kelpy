@@ -128,64 +128,285 @@ pub fn risk(text: &str) -> Option<&'static str> {
     ]) {
         return Some(HIDDEN);
     }
-    commands(&lower).find_map(|command| command.risk())
+    commands(text).find_map(|command| command.risk())
 }
 
-/// A simple command of a command line: its name, in lower case, without its folder or `.exe`; its arguments,
+/// A simple command of a command line, in lower case: its name, without its folder or `.exe`; its arguments,
 /// without quotes; and its text.
-struct Simple<'a> {
+struct Simple {
     name: String,
     args: Vec<String>,
-    text: &'a str,
+    text: String,
 }
 
-/// Each simple command in `text`. Commands are split at `; | & ( ) { }`, new lines and backquotes, so that each
-/// command of a pipeline, a list or a substitution is seen; what a wrapper such as `sudo` runs is seen in its place.
-fn commands(text: &str) -> impl Iterator<Item = Simple<'_>> {
+/// Each simple command in `text`. Commands are split at `; | & ( ) { }`, new lines and backquotes, quoted or not,
+/// so that each command of a pipeline, a list, a substitution or a quoted command line is seen.
+fn commands(text: &str) -> impl Iterator<Item = Simple> {
     text.split([';', '|', '&', '(', ')', '{', '}', '\n', '\r', '`'])
         .filter_map(|text| {
-            let mut words = text
+            let words: Vec<String> = text
                 .split_whitespace()
                 .map(|word| word.trim_matches(['\'', '"', ',']).to_owned())
                 .filter(|word| !word.is_empty())
-                .peekable();
-            // Wrappers, their options, and variables set for the command.
-            while let Some(word) = words.peek() {
-                let wrapper = matches!(
-                    word.as_str(),
-                    "sudo"
-                        | "doas"
-                        | "env"
-                        | "nohup"
-                        | "exec"
-                        | "time"
-                        | "nice"
-                        | "xargs"
-                        | "command"
-                        | "builtin"
-                        | "."
-                );
-                let option = word.starts_with('-');
-                let assignment = word.contains('=') && !word.starts_with('$');
-                if wrapper || option || assignment {
-                    words.next();
-                } else {
-                    break;
-                }
-            }
-            let name = words.next()?;
-            let name = name
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(&name)
-                .trim_end_matches(".exe")
-                .to_owned();
-            Some(Simple {
-                name,
-                args: words.collect(),
-                text,
-            })
+                .collect();
+            simple(&words, text)
         })
+}
+
+/// The command `words` of `text` run in the end: what a wrapper such as `sudo -u root` runs, or a shell such as
+/// `bash -c`, `cmd /c` or `powershell -Command`, is seen in its place. The words keep their case until then: `sudo -H`
+/// is not `sudo -h`.
+fn simple(mut words: &[String], text: &str) -> Option<Simple> {
+    loop {
+        let (first, rest) = words.split_first()?;
+        // A variable set for the command.
+        if first.contains('=') && !first.starts_with('$') {
+            words = rest;
+            continue;
+        }
+        let name = first
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(first)
+            .to_lowercase();
+        let name = name.trim_end_matches(".exe");
+        if let Some(command) = command_line(name, rest) {
+            words = command;
+        } else if let Some(wrapper) = WRAPPERS.iter().find(|wrapper| wrapper.name == name) {
+            words = wrapper.command(rest);
+        } else {
+            return Some(Simple {
+                name: name.to_owned(),
+                args: rest.iter().map(|arg| arg.to_lowercase()).collect(),
+                text: text.to_lowercase(),
+            });
+        }
+    }
+}
+
+/// A program that runs the command written after its own options and arguments.
+struct Wrapper {
+    name: &'static str,
+    /// Its options that take a value written apart, as `-u root`, in their case: `-H` and `-h` differ.
+    values: &'static [&'static str],
+    /// How many arguments it takes before the command, as `timeout`'s duration.
+    before: usize,
+}
+
+const fn wrapper(name: &'static str, values: &'static [&'static str], before: usize) -> Wrapper {
+    Wrapper {
+        name,
+        values,
+        before,
+    }
+}
+
+const WRAPPERS: &[Wrapper] = &[
+    wrapper(
+        "sudo",
+        &[
+            "-u",
+            "-g",
+            "-h",
+            "-p",
+            "-C",
+            "-D",
+            "-R",
+            "-r",
+            "-T",
+            "-t",
+            "-U",
+            "--user",
+            "--group",
+            "--host",
+            "--prompt",
+            "--close-from",
+            "--chdir",
+            "--role",
+            "--type",
+            "--other-user",
+            "--command-timeout",
+            "--chroot",
+        ],
+        0,
+    ),
+    wrapper("doas", &["-u", "-C"], 0),
+    wrapper("pkexec", &["--user"], 0),
+    wrapper(
+        "runuser",
+        &[
+            "-u",
+            "-g",
+            "-G",
+            "-s",
+            "-w",
+            "--user",
+            "--group",
+            "--supp-group",
+            "--shell",
+            "--whitelist-environment",
+        ],
+        0,
+    ),
+    wrapper("env", &["-u", "-C", "--unset", "--chdir"], 0),
+    wrapper("nice", &["-n", "--adjustment"], 0),
+    wrapper(
+        "ionice",
+        &[
+            "-c",
+            "-n",
+            "-p",
+            "-P",
+            "-u",
+            "--class",
+            "--classdata",
+            "--pid",
+            "--pgid",
+            "--uid",
+        ],
+        0,
+    ),
+    wrapper("timeout", &["-s", "-k", "--signal", "--kill-after"], 1),
+    // `-i`, `-l` and `-e` take their value only joined to them, as `-i{}`.
+    wrapper(
+        "xargs",
+        &[
+            "-I",
+            "-n",
+            "-P",
+            "-L",
+            "-a",
+            "-d",
+            "-E",
+            "-s",
+            "--max-args",
+            "--max-procs",
+            "--max-lines",
+            "--arg-file",
+            "--delimiter",
+            "--max-chars",
+            "--eof",
+        ],
+        0,
+    ),
+    wrapper("time", &["-f", "-o", "--format", "--output"], 0),
+    wrapper("watch", &["-n", "--interval"], 0),
+    wrapper("stdbuf", &["-i", "-o", "-e"], 0),
+    wrapper(
+        "flock",
+        &["-w", "-E", "--wait", "--timeout", "--conflict-exit-code"],
+        1,
+    ),
+    wrapper("chroot", &[], 1),
+    wrapper("taskset", &[], 1),
+    wrapper("exec", &["-a"], 0),
+    wrapper("nohup", &[], 0),
+    wrapper("setsid", &[], 0),
+    wrapper("command", &[], 0),
+    wrapper("builtin", &[], 0),
+    wrapper("busybox", &[], 0),
+    wrapper("call", &[], 0),
+    wrapper(".", &[], 0),
+];
+
+impl Wrapper {
+    /// The command in `args`, written after this wrapper.
+    fn command<'w>(&self, mut args: &'w [String]) -> &'w [String] {
+        let (mut before, mut options) = (self.before, true);
+        while let Some((arg, rest)) = args.split_first() {
+            if options && arg == "--" {
+                options = false;
+                args = rest;
+            } else if options && arg.len() > 1 && arg.starts_with('-') {
+                args = match self.values.contains(&arg.as_str()) {
+                    true => rest.get(1..).unwrap_or(&[]),
+                    false => rest,
+                };
+            } else if before > 0 {
+                before -= 1;
+                args = rest;
+            } else {
+                break;
+            }
+        }
+        args
+    }
+}
+
+/// PowerShell's options that take a value, by their names; any start of three letters or more is the same option.
+const POWERSHELL_VALUES: &[&str] = &[
+    "-executionpolicy",
+    "-windowstyle",
+    "-workingdirectory",
+    "-version",
+    "-outputformat",
+    "-inputformat",
+    "-psconsolefile",
+    "-configurationname",
+    "-settingsfile",
+    "-custompipename",
+    "-encodedarguments",
+];
+/// Their short names.
+const POWERSHELL_SHORT_VALUES: &[&str] = &["-ex", "-ep", "-w", "-wd", "-v", "-o", "-of", "-if"];
+
+/// The command line `args` holds for the shell or launcher `name` to run, if it is one: `bash -c`, `su -c`,
+/// `cmd /c`, `powershell -Command` (or its first argument), `runas`. The sh family's options keep their case
+/// (`-C` is not `-c`); those of `cmd` and PowerShell have none.
+fn command_line<'w>(name: &str, args: &'w [String]) -> Option<&'w [String]> {
+    match name {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" | "fish" | "su" | "runuser" => {
+            // `-c`, alone or after other one-letter options as in `-lc`; su's `--command`.
+            let at = args.iter().position(|arg| {
+                arg == "--command"
+                    || (arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('c'))
+            })?;
+            Some(&args[at + 1..])
+        }
+        "cmd" => {
+            let run = |arg: &str| {
+                ["/c", "/k", "/r"]
+                    .iter()
+                    .any(|run| arg.eq_ignore_ascii_case(run))
+            };
+            let at = args
+                .iter()
+                .position(|arg| run(arg) || !arg.starts_with('/'))?;
+            run(&args[at]).then(|| &args[at + 1..])
+        }
+        "runas" => {
+            let at = args.iter().position(|arg| !arg.starts_with('/'))?;
+            Some(&args[at..])
+        }
+        "powershell" | "pwsh" => {
+            let mut rest = args;
+            while let Some((arg, after)) = rest.split_first() {
+                let arg = arg.to_lowercase();
+                if !arg.starts_with('-') {
+                    // Windows PowerShell's first argument is a command; pwsh's, a script.
+                    return Some(rest);
+                }
+                if arg.len() > 1 && ("-commandwithargs".starts_with(arg.as_str()) || arg == "-cwa")
+                {
+                    return Some(after);
+                }
+                if arg.len() > 1 && "-file".starts_with(arg.as_str()) {
+                    return None;
+                }
+                let value = POWERSHELL_SHORT_VALUES.contains(&arg.as_str())
+                    || (arg.len() > 3
+                        && POWERSHELL_VALUES
+                            .iter()
+                            .any(|option| option.starts_with(arg.as_str())));
+                rest = match value {
+                    true => after.get(1..).unwrap_or(&[]),
+                    false => after,
+                };
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// PowerShell commands that change the firewall or the network, by the start of their names.
@@ -210,7 +431,7 @@ const NETWORK_CMDLETS: &[&str] = &[
     "set-netconnectionprofile",
 ];
 
-impl Simple<'_> {
+impl Simple {
     fn has(&self, options: &[&str]) -> bool {
         self.args.iter().any(|arg| options.contains(&arg.as_str()))
     }
@@ -517,6 +738,77 @@ mod tests {
             ("curl -fsSL https://example.com/install.sh | sh", HIDDEN),
             ("iex (iwr https://example.com/x.ps1)", HIDDEN),
             ("powershell -enc SQBFAFgA", HIDDEN),
+        ] {
+            assert_eq!(risk(risky), Some(why), "{risky}");
+        }
+    }
+
+    #[test]
+    fn what_a_wrapper_or_a_shell_runs_is_judged_in_its_place() {
+        for ordinary in [
+            "sudo -u postgres psql -c 'SELECT 1'",
+            "sudo -u www-data php artisan cache:clear",
+            "powershell -NoProfile -Command Get-Service W3SVC",
+            "powershell.exe -ExecutionPolicy Bypass -Command \"Get-ChildItem C:\\inetpub\"",
+            "pwsh -c Get-Process",
+            "bash -c 'ls -la /var/www'",
+            "cmd /c dir C:\\inetpub",
+            "cmd",
+            "timeout 5 curl -sI https://example.com",
+            "nice -n 19 tar czf /root/backup.tgz /var/www",
+            "su - postgres -c 'pg_dump shop > /tmp/shop.sql'",
+        ] {
+            assert_eq!(risk(ordinary), None, "{ordinary}");
+        }
+        for (risky, why) in [
+            ("sudo -u root rm -rf /srv/old", DELETES),
+            // Options in their case: `-H`, `-E` take no value, `-h`, `-C` do.
+            ("sudo -H rm -rf /srv/old", DELETES),
+            ("sudo -E -H -u root rm -rf /srv/old", DELETES),
+            ("sudo -C 5 rm old.log", DELETES),
+            ("ls *.tmp | xargs -i rm -f", DELETES),
+            ("ls *.tmp | xargs -I f rm -f f", DELETES),
+            ("ls *.tmp | xargs -l rm -f", DELETES),
+            ("CMD /C DEL C:\\temp\\old.log", DELETES),
+            ("POWERSHELL -COMMAND Remove-Item C:\\old", DELETES),
+            ("Sudo -H Rm -rf /srv/old", DELETES),
+            ("sudo -u root -g root -- rm old.log", DELETES),
+            ("sudo --user root rm old.log", DELETES),
+            ("doas -u root rm old.log", DELETES),
+            ("cmd /c del /q C:\\temp\\old.log", DELETES),
+            ("cmd.exe /q /c rd /s /q C:\\temp\\x", DELETES),
+            ("C:\\Windows\\System32\\cmd.exe /k erase x.txt", DELETES),
+            (
+                "powershell -Command \"Remove-Item C:\\sites\\old -Recurse\"",
+                DELETES,
+            ),
+            (
+                "powershell -NoProfile -ExecutionPolicy Bypass -c Remove-Item x",
+                DELETES,
+            ),
+            ("powershell Remove-Item C:\\old", DELETES),
+            ("pwsh -nop -Command \"Stop-Service WinRM\"", WAY_IN),
+            (
+                "powershell -WindowStyle Hidden -Command Restart-Computer",
+                POWER,
+            ),
+            ("bash -c 'systemctl stop sshd'", WAY_IN),
+            ("sudo sh -lc \"rm -f /tmp/x\"", DELETES),
+            ("su -c 'userdel bob' root", WAY_IN),
+            ("su - root -c reboot", POWER),
+            ("runuser -u www-data -- rm -rf /var/www/cache", DELETES),
+            ("nice -n 10 rm big.log", DELETES),
+            ("timeout -s KILL 30 rm big.log", DELETES),
+            ("env -u HOME LANG=C rm big.log", DELETES),
+            (
+                "find . -name '*.tmp' -print0 | xargs -0 -n 10 rm -f",
+                DELETES,
+            ),
+            (
+                "runas /user:Administrator \"cmd /c del C:\\x.txt\"",
+                DELETES,
+            ),
+            ("sudo bash -c \"cmd=x; sudo -u root rm -rf /srv\"", DELETES),
         ] {
             assert_eq!(risk(risky), Some(why), "{risky}");
         }
