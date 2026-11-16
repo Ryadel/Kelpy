@@ -900,7 +900,9 @@ impl Store {
         let at = self.records;
         let recorder = self.recorder.clone();
         let transaction = self.connection.transaction()?;
-        // Once a file held a secret, it is kept from the model: a later change does not make it safe.
+        // Once a file held a secret, it is kept from the model: a later change does not make it safe. The
+        // observations that took their turn before the change are not noted (`observed = observing`): what they
+        // found may be from before it, even when the change, in the same second, put back what was expected.
         transaction.execute(
             &format!(
                 "INSERT INTO {at}.records
@@ -909,7 +911,7 @@ impl Store {
                  ON CONFLICT (kind, subject) DO UPDATE SET
                      expected = excluded.expected, content = excluded.content, secret = secret OR excluded.secret,
                      action_id = excluded.action_id, recorded_at = excluded.recorded_at,
-                     recorded_by = excluded.recorded_by"
+                     recorded_by = excluded.recorded_by, observed = observing"
             ),
             params![kind.as_str(), subject, expected, content, secret, action_id, now, recorder],
         )?;
@@ -2036,6 +2038,23 @@ mod tests {
         // The next check notes what it finds.
         assert!(look(&mut alice, &now, "d4", None));
         assert!(alice.differences().unwrap().is_empty());
+
+        // Changed and changed back within the same second while a check of Alice's was under way: the record reads
+        // as before, value and time, but what that check found may be the change in between.
+        let slow = alice.observing(now.id).unwrap().unwrap();
+        bob.record(RecordKind::File, path, "x9", None, false, None)
+            .unwrap();
+        let back = bob
+            .record(RecordKind::File, path, "d4", None, false, None)
+            .unwrap();
+        if (back.expected.as_str(), back.recorded_at) == (now.expected.as_str(), now.recorded_at) {
+            assert!(!alice.found(&now, slow, "x9", None).unwrap());
+        }
+        assert!(!alice.found(&back, slow, "x9", None).unwrap());
+        assert!(alice.differences().unwrap().is_empty());
+        // A check started after the changes notes what it finds.
+        assert!(look(&mut alice, &back, "x9", None));
+        assert!(look(&mut alice, &back, "d4", None));
 
         // Their own databases keep none of it.
         let own = Store::open(&folder.path().join("alice.db")).unwrap();

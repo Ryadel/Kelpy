@@ -1,5 +1,59 @@
 [
   {
+    "id": "scp-002",
+    "subject": "SCP-002",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-002 is a fleshy growth hiding a modest apartment; those who wander inside tend to become part of its furnishings.",
+    "source": "https://scp-wiki.wikidot.com/scp-002",
+    "author": "Unknown author",
+    "edited": true
+  },
+  {
+    "id": "scp-004",
+    "subject": "SCP-004",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-004 is an old barn door with twelve rusted keys; most open it onto places where nobody should ever set foot.",
+    "source": "https://scp-wiki.wikidot.com/scp-004",
+    "author": "deusprogrammer",
+    "edited": true
+  },
+  {
+    "id": "scp-005",
+    "subject": "SCP-005",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-005 is an ornate 1920s key that opens any lock it meets, mechanical or digital, with effortless ease.",
+    "source": "https://scp-wiki.wikidot.com/scp-005",
+    "author": "Unknown author",
+    "edited": true
+  },
+  {
+    "id": "scp-008",
+    "subject": "SCP-008",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-008 is a highly infectious prion that leaves its victims restless and aggressive: a zombie plague under lock and key.",
+    "source": "https://scp-wiki.wikidot.com/scp-008",
+    "author": "Unknown author",
+    "edited": true
+  },
+  {
+    "id": "scp-009",
+    "subject": "SCP-009",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-009 is red water that freezes when warmed and melts in the cold, passing that inversion to anything it touches.",
+    "source": "https://scp-wiki.wikidot.com/scp-009",
+    "author": "Chameleon X",
+    "edited": true
+  },
+  {
+    "id": "scp-015",
+    "subject": "SCP-015",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-015 is a tangle of pipes filling a warehouse; when nobody is watching, it grows toward neighboring plumbing.",
+    "source": "https://scp-wiki.wikidot.com/scp-015",
+    "author": "Dr Gears",
+    "edited": true
+  },
+  {
     "id": "scp-017",
     "subject": "SCP-017",
     "tradition": "SCP Foundation fiction",
@@ -63,6 +117,24 @@
     "edited": true
   },
   {
+    "id": "scp-035",
+    "subject": "SCP-035",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-035 is a porcelain mask that weeps corrosive fluid and talks people into wearing it, taking over whoever does.",
+    "source": "https://scp-wiki.wikidot.com/scp-035",
+    "author": "Kain Pathos Crow",
+    "edited": true
+  },
+  {
+    "id": "scp-038",
+    "subject": "SCP-038",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-038 is an apple tree that grows a copy of anything pressed against its bark, from fruit to laptops, within minutes.",
+    "source": "https://scp-wiki.wikidot.com/scp-038",
+    "author": "Unknown author",
+    "edited": true
+  },
+  {
     "id": "scp-039",
     "subject": "SCP-039",
     "tradition": "SCP Foundation fiction",
@@ -86,7 +158,7 @@
     "tradition": "SCP Foundation fiction",
     "text": "SCP-042 resembles a horse with the remains of wings: a creature that seems to remember a sky it can no longer reach.",
     "source": "https://scp-wiki.wikidot.com/scp-042",
-    "author": "Unknown Author, rewritten by Skali Sharpnose",
+    "author": "Unknown author, rewritten by Skali Sharpnose",
     "edited": true
   },
   {
@@ -95,7 +167,7 @@
     "tradition": "SCP Foundation fiction",
     "text": "SCP-049 looks like a plague doctor and insists it can cure a pestilence; its patients rarely survive the treatment.",
     "source": "https://scp-wiki.wikidot.com/scp-049",
-    "author": "Gabriel Jade, rewritten by djkaktus & Gabriel Jade",
+    "author": "Gabriel Jade, rewritten by djkaktus and Gabriel Jade",
     "edited": true
   },
   {
@@ -113,7 +185,16 @@
     "tradition": "SCP Foundation fiction",
     "text": "SCP-054 is a water-based being that usually takes a human form, giving a nymph a place in the containment records.",
     "source": "https://scp-wiki.wikidot.com/scp-054",
-    "author": "Unknown Author, rewritten by SimpleCadence",
+    "author": "Unknown author, rewritten by SimpleCadence",
+    "edited": true
+  },
+  {
+    "id": "scp-055",
+    "subject": "SCP-055",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-055 is an anti-meme: anyone can observe it, yet whatever they learn about it soon slips from memory.",
+    "source": "https://scp-wiki.wikidot.com/scp-055",
+    "author": "qntm and CptBellman",
     "edited": true
   },
   {
@@ -189,6 +270,15 @@
     "edited": true
   },
   {
+    "id": "scp-079",
+    "subject": "SCP-079",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-079 is a 1978 microcomputer whose homemade AI grew sentient, and now spends its days resentful and plotting escape.",
+    "source": "https://scp-wiki.wikidot.com/scp-079",
+    "author": "Unknown author",
+    "edited": true
+  },
+  {
     "id": "scp-082",
     "subject": "SCP-082",
     "tradition": "SCP Foundation fiction",
@@ -207,12 +297,30 @@
     "edited": true
   },
   {
+    "id": "scp-087",
+    "subject": "SCP-087",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-087 is an unlit stairwell that descends far deeper than it should, toward a crying voice and a waiting face.",
+    "source": "https://scp-wiki.wikidot.com/scp-087",
+    "author": "Zaeyde",
+    "edited": true
+  },
+  {
     "id": "scp-088",
     "subject": "SCP-088",
     "tradition": "SCP Foundation fiction",
     "text": "SCP-088 is a mummified reptilian humanoid whose dormant appearance makes a poor promise that it will stay that way.",
     "source": "https://scp-wiki.wikidot.com/scp-088",
     "author": "Sorts",
+    "edited": true
+  },
+  {
+    "id": "scp-093",
+    "subject": "SCP-093",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-093 is a red stone disc that rolls toward the nearest mirror; whoever holds it can step through the glass.",
+    "source": "https://scp-wiki.wikidot.com/scp-093",
+    "author": "Unknown author, rewritten by NekoChris",
     "edited": true
   },
   {
@@ -243,12 +351,192 @@
     "edited": true
   },
   {
+    "id": "scp-131",
+    "subject": "SCP-131",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-131 is a pair of one-eyed, teardrop-shaped creatures on wheels that cheerfully follow staff wherever they go.",
+    "source": "https://scp-wiki.wikidot.com/scp-131",
+    "author": "Unknown author",
+    "edited": true
+  },
+  {
+    "id": "scp-140",
+    "subject": "SCP-140",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-140 is an unfinished chronicle of a vanished empire; adding to its pages lets that history grow back into the world.",
+    "source": "https://scp-wiki.wikidot.com/scp-140",
+    "author": "AssertiveRoland",
+    "edited": true
+  },
+  {
+    "id": "scp-169",
+    "subject": "SCP-169",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-169 is the Leviathan, a sea creature so vast that a whole archipelago is merely the rocky plates covering its body.",
+    "source": "https://scp-wiki.wikidot.com/scp-169",
+    "author": "Unknown author",
+    "edited": true
+  },
+  {
     "id": "scp-173",
     "subject": "SCP-173",
     "tradition": "SCP Foundation fiction",
     "text": "SCP-173 is a sculpture that moves when nobody is watching; a blink can be enough to lose the distance between you.",
     "source": "https://scp-wiki.wikidot.com/scp-173",
     "author": "Moto42",
+    "edited": true
+  },
+  {
+    "id": "scp-179",
+    "subject": "SCP-179",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-179 is a vast, dark figure near the Sun that silently points toward dangers approaching the solar system.",
+    "source": "https://scp-wiki.wikidot.com/scp-179",
+    "author": "Dr Reach",
+    "edited": true
+  },
+  {
+    "id": "scp-217",
+    "subject": "SCP-217",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-217 is an incurable virus that slowly turns living tissue into clockwork, rebuilding its hosts into intricate machines.",
+    "source": "https://scp-wiki.wikidot.com/scp-217",
+    "author": "Dr Gears",
+    "edited": true
+  },
+  {
+    "id": "scp-294",
+    "subject": "SCP-294",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-294 is a coffee machine with a keyboard that pours a cup of any liquid you name, however strange the request.",
+    "source": "https://scp-wiki.wikidot.com/scp-294",
+    "author": "Arcibi",
+    "edited": true
+  },
+  {
+    "id": "scp-343",
+    "subject": "SCP-343",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-343 is an elderly man who claims to have created the universe, and who walks through walls whenever he pleases.",
+    "source": "https://scp-wiki.wikidot.com/scp-343",
+    "author": "Unknown author",
+    "edited": true
+  },
+  {
+    "id": "scp-354",
+    "subject": "SCP-354",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-354 is a bottomless pool of red liquid in northern Canada from which hostile creatures periodically crawl out.",
+    "source": "https://scp-wiki.wikidot.com/scp-354",
+    "author": "Dave Rapp",
+    "edited": true
+  },
+  {
+    "id": "scp-372",
+    "subject": "SCP-372",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-372 is a long, many-legged creature that predicts people's movements, so it is only ever glimpsed at the edge of vision.",
+    "source": "https://scp-wiki.wikidot.com/scp-372",
+    "author": "Sylocat",
+    "edited": true
+  },
+  {
+    "id": "scp-426",
+    "subject": "SCP-426",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-426 is an ordinary toaster, yet anyone who talks or writes about it finds themselves referring to it in the first person.",
+    "source": "https://scp-wiki.wikidot.com/scp-426",
+    "author": "Flah",
+    "edited": true
+  },
+  {
+    "id": "scp-457",
+    "subject": "SCP-457",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-457 is a living flame that grows with every fuel it reaches, taking on a human shape once it burns large enough.",
+    "source": "https://scp-wiki.wikidot.com/scp-457",
+    "author": "agatharights",
+    "edited": true
+  },
+  {
+    "id": "scp-500",
+    "subject": "SCP-500",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-500 is a small can of red pills, each able to cure any disease within hours; only a few dozen of them remain.",
+    "source": "https://scp-wiki.wikidot.com/scp-500",
+    "author": "snorlison",
+    "edited": true
+  },
+  {
+    "id": "scp-504",
+    "subject": "SCP-504",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-504 is a tomato variety that hurls itself at tremendous speed toward anyone telling a bad joke within earshot.",
+    "source": "https://scp-wiki.wikidot.com/scp-504",
+    "author": "BlastYoBoots",
+    "edited": true
+  },
+  {
+    "id": "scp-507",
+    "subject": "SCP-507",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-507 is an ordinary man who shifts into other realities without warning, returning with tales of strange worlds.",
+    "source": "https://scp-wiki.wikidot.com/scp-507",
+    "author": "PennywiseTheClown",
+    "edited": true
+  },
+  {
+    "id": "scp-513",
+    "subject": "SCP-513",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-513 is a rusty cowbell whose ring leaves each listener glimpsing a figure in doorways and mirrors that no one else sees.",
+    "source": "https://scp-wiki.wikidot.com/scp-513",
+    "author": "beefwit",
+    "edited": true
+  },
+  {
+    "id": "scp-524",
+    "subject": "SCP-524",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-524 is Walter, a white rabbit who happily eats anything, from wood and glass to steel, without coming to harm.",
+    "source": "https://scp-wiki.wikidot.com/scp-524",
+    "author": "Dr Gerald",
+    "edited": true
+  },
+  {
+    "id": "scp-527",
+    "subject": "SCP-527",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-527 is Mr. Fish, an otherwise ordinary man with the head of a gold barb fish, courtesy of an anomalous toy maker.",
+    "source": "https://scp-wiki.wikidot.com/scp-527",
+    "author": "djkaktus",
+    "edited": true
+  },
+  {
+    "id": "scp-529",
+    "subject": "SCP-529",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-529 is a friendly tabby cat called Josie whose back half is simply missing, though she never seems to notice.",
+    "source": "https://scp-wiki.wikidot.com/scp-529",
+    "author": "Unknown author",
+    "edited": true
+  },
+  {
+    "id": "scp-610",
+    "subject": "SCP-610",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-610 is a spreading growth near Lake Baikal that turns people, animals and even buildings into one living tissue.",
+    "source": "https://scp-wiki.wikidot.com/scp-610",
+    "author": "NekoChris",
+    "edited": true
+  },
+  {
+    "id": "scp-662",
+    "subject": "SCP-662",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-662 is a small silver bell; ringing it summons a polite butler called Mr. Deeds, who will do almost anything asked.",
+    "source": "https://scp-wiki.wikidot.com/scp-662",
+    "author": "Rick Revelry",
     "edited": true
   },
   {
@@ -261,12 +549,264 @@
     "edited": true
   },
   {
+    "id": "scp-689",
+    "subject": "SCP-689",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-689 is a small skeletal statue that stays still only while watched; any lapse in attention lets it claim a viewer.",
+    "source": "https://scp-wiki.wikidot.com/scp-689",
+    "author": "Unknown author",
+    "edited": true
+  },
+  {
+    "id": "scp-738",
+    "subject": "SCP-738",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-738 is a desk and two chairs where a visitor can bargain with an unseen dealer, who grants almost anything for a price.",
+    "source": "https://scp-wiki.wikidot.com/scp-738",
+    "author": "Le Blue Dude",
+    "edited": true
+  },
+  {
+    "id": "scp-811",
+    "subject": "SCP-811",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-811 is a shy, green-skinned swamp dweller with long limbs and oily hair, whose touch slowly dissolves living matter.",
+    "source": "https://scp-wiki.wikidot.com/scp-811",
+    "author": "Pig_catapult",
+    "edited": true
+  },
+  {
+    "id": "scp-871",
+    "subject": "SCP-871",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-871 is a set of cakes that must be eaten: each eaten cake returns a day later, while an uneaten one quietly makes more.",
+    "source": "https://scp-wiki.wikidot.com/scp-871",
+    "author": "Seibai",
+    "edited": true
+  },
+  {
+    "id": "scp-895",
+    "subject": "SCP-895",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-895 is an oak coffin that distorts any camera aimed at it, filling the footage with horrors that harm those who watch.",
+    "source": "https://scp-wiki.wikidot.com/scp-895",
+    "author": "Aelanna",
+    "edited": true
+  },
+  {
+    "id": "scp-914",
+    "subject": "SCP-914",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-914 is a vast clockwork machine that refines whatever enters it, according to a dial running from Rough to Very Fine.",
+    "source": "https://scp-wiki.wikidot.com/scp-914",
+    "author": "Dr Gears",
+    "edited": true
+  },
+  {
+    "id": "scp-939",
+    "subject": "SCP-939",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-939 are eyeless red predators that speak in the voices of people they have taken, luring others with familiar cries.",
+    "source": "https://scp-wiki.wikidot.com/scp-939",
+    "author": "Adam Smascher and EchoFourDelta",
+    "edited": true
+  },
+  {
+    "id": "scp-966",
+    "subject": "SCP-966",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-966 are gaunt, clawed creatures visible only in infrared; unseen, they keep their prey awake until exhaustion sets in.",
+    "source": "https://scp-wiki.wikidot.com/scp-966",
+    "author": "Enma Ai",
+    "edited": true
+  },
+  {
+    "id": "scp-990",
+    "subject": "SCP-990",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-990 is a man in a Cold War-era suit who appears only in dreams, foretelling disasters that tend to come true.",
+    "source": "https://scp-wiki.wikidot.com/scp-990",
+    "author": "Dave Rapp",
+    "edited": true
+  },
+  {
     "id": "scp-999",
     "subject": "SCP-999",
     "tradition": "SCP Foundation fiction",
     "text": "SCP-999 is a friendly orange gelatinous creature whose touch brings intense happiness: not every anomaly is a nightmare.",
     "source": "https://scp-wiki.wikidot.com/scp-999",
     "author": "ProfSnider",
+    "edited": true
+  },
+  {
+    "id": "scp-1000",
+    "subject": "SCP-1000",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-1000 is the shy, nocturnal ape behind the Bigfoot legend, remnant of a great civilization humanity erased from memory.",
+    "source": "https://scp-wiki.wikidot.com/scp-1000",
+    "author": "thedeadlymoose",
+    "edited": true
+  },
+  {
+    "id": "scp-1048",
+    "subject": "SCP-1048",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-1048 is an affectionate teddy bear that hugs staff and draws them pictures, though the bears it builds are less sweet.",
+    "source": "https://scp-wiki.wikidot.com/scp-1048",
+    "author": "trennerdios",
+    "edited": true
+  },
+  {
+    "id": "scp-1171",
+    "subject": "SCP-1171",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-1171 is a house where a being from another world writes on fogged windows, convinced it is chatting with a fellow non-human.",
+    "source": "https://scp-wiki.wikidot.com/scp-1171",
+    "author": "DrEverettMann",
+    "edited": true
+  },
+  {
+    "id": "scp-1233",
+    "subject": "SCP-1233",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-1233 is a figure in an indestructible spacesuit who calls itself Moon Champion, cheerful defender of space justice.",
+    "source": "https://scp-wiki.wikidot.com/scp-1233",
+    "author": "CadaverCommander",
+    "edited": true
+  },
+  {
+    "id": "scp-1440",
+    "subject": "SCP-1440",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-1440 is an ageless old man who avoids people, because any town or object he stays near slowly falls into disaster.",
+    "source": "https://scp-wiki.wikidot.com/scp-1440",
+    "author": "Dmatix",
+    "edited": true
+  },
+  {
+    "id": "scp-1471",
+    "subject": "SCP-1471",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-1471 is a phone app that sends pictures of a dog-skulled figure, each taken a little closer to wherever its user is.",
+    "source": "https://scp-wiki.wikidot.com/scp-1471",
+    "author": "LurkD",
+    "edited": true
+  },
+  {
+    "id": "scp-1609",
+    "subject": "SCP-1609",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-1609 is the splintered remains of a helpful chair, still kind to gentle visitors but swift to punish anyone hostile.",
+    "source": "https://scp-wiki.wikidot.com/scp-1609",
+    "author": "Rioghail",
+    "edited": true
+  },
+  {
+    "id": "scp-1762",
+    "subject": "SCP-1762",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-1762 is a cardboard box labeled Here Be Dragons, from which flocks of small paper dragons emerge to play.",
+    "source": "https://scp-wiki.wikidot.com/scp-1762",
+    "author": "OZ Ouroboros",
+    "edited": true
+  },
+  {
+    "id": "scp-2000",
+    "subject": "SCP-2000",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-2000 is a vast installation hidden beneath Yellowstone, built to rebuild humanity should the world ever end.",
+    "source": "https://scp-wiki.wikidot.com/scp-2000",
+    "author": "HammerMaiden",
+    "edited": true
+  },
+  {
+    "id": "scp-2006",
+    "subject": "SCP-2006",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-2006 is a shapeshifting sphere that lives to frighten people, though its idea of terror comes mostly from old B-movies.",
+    "source": "https://scp-wiki.wikidot.com/scp-2006",
+    "author": "weizhong",
+    "edited": true
+  },
+  {
+    "id": "scp-2295",
+    "subject": "SCP-2295",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-2295 is a patchwork teddy bear that mends the gravely injured, sewing them new organs from nearby fabric.",
+    "source": "https://scp-wiki.wikidot.com/scp-2295",
+    "author": "K Mota",
+    "edited": true
+  },
+  {
+    "id": "scp-2317",
+    "subject": "SCP-2317",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-2317 is a basement door that opens onto another world, where a colossal being lies bound by slowly breaking chains.",
+    "source": "https://scp-wiki.wikidot.com/scp-2317",
+    "author": "DrClef",
+    "edited": true
+  },
+  {
+    "id": "scp-2399",
+    "subject": "SCP-2399",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-2399 is a damaged war machine in Jupiter's clouds whose weapons stir the Great Red Spot as it slowly repairs itself.",
+    "source": "https://scp-wiki.wikidot.com/scp-2399",
+    "author": "djkaktus",
+    "edited": true
+  },
+  {
+    "id": "scp-2521",
+    "subject": "SCP-2521",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-2521 is a creature that takes anyone who describes it in words, which is why its file is told only in pictures.",
+    "source": "https://scp-wiki.wikidot.com/scp-2521",
+    "author": "LurkD",
+    "edited": true
+  },
+  {
+    "id": "scp-2662",
+    "subject": "SCP-2662",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-2662 is a tentacled giant that would like a quiet life, but keeps involuntarily spawning cults eager to worship it.",
+    "source": "https://scp-wiki.wikidot.com/scp-2662",
+    "author": "SoullessSingularity",
+    "edited": true
+  },
+  {
+    "id": "scp-3000",
+    "subject": "SCP-3000",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-3000 is an eel hundreds of kilometers long in the Bay of Bengal, whose presence slowly erodes human memory.",
+    "source": "https://scp-wiki.wikidot.com/scp-3000",
+    "author": "A Random Day, djkaktus, and Joreth",
+    "edited": true
+  },
+  {
+    "id": "scp-3008",
+    "subject": "SCP-3008",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-3008 is an IKEA store that goes on forever; lost shoppers build settlements there while faceless staff roam at night.",
+    "source": "https://scp-wiki.wikidot.com/scp-3008",
+    "author": "Mortos",
+    "edited": true
+  },
+  {
+    "id": "scp-3812",
+    "subject": "SCP-3812",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-3812 was once an ordinary man; now it drifts through layers of reality, following a voice only it can hear.",
+    "source": "https://scp-wiki.wikidot.com/scp-3812",
+    "author": "djkaktus",
+    "edited": true
+  },
+  {
+    "id": "scp-5000",
+    "subject": "SCP-5000",
+    "tradition": "SCP Foundation fiction",
+    "text": "SCP-5000 is a battered protective suit from a world where the Foundation turned on humanity, and nobody learned why.",
+    "source": "https://scp-wiki.wikidot.com/scp-5000",
+    "author": "Tanhony",
     "edited": true
   }
 ]

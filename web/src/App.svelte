@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
+  import BookOpenIcon from '@lucide/svelte/icons/book-open';
   import CheckIcon from '@lucide/svelte/icons/check';
   import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
   import CpuIcon from '@lucide/svelte/icons/cpu';
@@ -51,6 +52,7 @@
   import ThemeToggle from './lib/ThemeToggle.svelte';
   import { connection, usable, watchConnection } from './lib/connection.svelte';
   import { kept, merged } from './lib/conversations';
+  import { lore, showLore } from './lib/lore.svelte';
   import { elevation, justRestarted, refreshElevation } from './lib/elevation.svelte';
   import { runtime } from './lib/runtime.svelte';
   import { watchEvents } from './lib/events';
@@ -496,18 +498,22 @@
                   size="icon-lg"
                   class="text-muted-foreground border-border rounded-full"
                   aria-label="Menu"
-                  title="Sign out and Stop Kelpy"
+                  title="Lore, Sign out and Stop Kelpy"
                 >
                   <SlidersHorizontalIcon class="size-[17px]" />
                 </Button>
               {/snippet}
             </DropdownMenu.Trigger>
-            <DropdownMenu.Content align="end" class="w-60 p-1.5">
+            <DropdownMenu.Content align="end" class="w-64 p-1.5">
               {#if status}
                 <DropdownMenu.Label class="text-muted-foreground truncate px-2.5 text-xs font-normal" title={status.home}>
                   Kelpy v{status.version} · {status.home}
                 </DropdownMenu.Label>
               {/if}
+              <DropdownMenu.CheckboxItem class="gap-2.5 px-2.5 py-2" checked={lore.on} onCheckedChange={showLore}>
+                <BookOpenIcon /> Show lore while Kelpy thinks
+              </DropdownMenu.CheckboxItem>
+              <DropdownMenu.Separator />
               <DropdownMenu.Item class="gap-2.5 px-2.5 py-2" onSelect={signOutAndForget}>
                 <LogOutIcon /> Sign out
               </DropdownMenu.Item>

@@ -13,6 +13,7 @@
   import Markdown from './Markdown.svelte';
   import MessageImages from './MessageImages.svelte';
   import PlanCard from './PlanCard.svelte';
+  import LoreBand from './LoreBand.svelte';
   import Waiting from './Waiting.svelte';
   import Welcome from './Welcome.svelte';
   import { connection, usable } from './connection.svelte';
@@ -278,11 +279,24 @@
     }
   }
 
-  /** Whether the view is at the end, as the user left it: decided when they scroll, never after content grows. */
+  /** Where the view was at the last scroll: one further up is the user's doing. */
+  let lastTop = 0;
+
+  /**
+   * Whether the view follows the end, as the user left it: it stops when they scroll up, and follows again at the end.
+   * Content that grew between the view following it and this event leaves the view above the end without anyone
+   * scrolling up (a tall card or text at once): that stops nothing.
+   */
   function scrolled() {
-    if (scroller) {
-      following = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40;
+    if (!scroller) {
+      return;
     }
+    if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40) {
+      following = true;
+    } else if (scroller.scrollTop < lastTop) {
+      following = false;
+    }
+    lastTop = scroller.scrollTop;
   }
 
   // Whatever makes the conversation taller, or its view shorter: text, an action card, an output opened, the message
@@ -672,6 +686,7 @@
       {/if}
       </div>
       <div class="mx-auto w-full max-w-conversation px-4 pb-3">
+        <LoreBand answering={running} />
         {@render messageBox()}
         <p class="text-muted-foreground mt-2 text-center text-xs">Enter sends, Shift+Enter starts a new line.</p>
       </div>

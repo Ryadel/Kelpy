@@ -84,7 +84,8 @@ pub async fn at_start(home: &Home, assume_yes: bool) -> Option<ExitCode> {
         println!("Kelpy {latest} is available: run `kelpy update` to install it.");
         return None;
     }
-    let question = format!("Kelpy {latest} is available (this is {VERSION}). Update now?");
+    let question =
+        format!("Kelpy {latest} is available (installed version: {VERSION}). Update now?");
     if !prompt::confirm(&question, true).unwrap_or(false) {
         // Asked once per version; the line above reminds at the next starts.
         let _ = fs::write(&declined, &latest);
@@ -148,7 +149,7 @@ pub async fn command(home: &Home, assume_yes: bool) -> Result<ExitCode> {
                 "Kelpy {latest} is available. Run `kelpy update --yes` to install it without questions."
             );
         }
-        let question = format!("Install Kelpy {latest} (this is {VERSION})?");
+        let question = format!("Install Kelpy {latest} (installed version: {VERSION})?");
         if !prompt::confirm(&question, true)? {
             return Ok(ExitCode::SUCCESS);
         }

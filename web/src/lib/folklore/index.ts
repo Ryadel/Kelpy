@@ -42,8 +42,8 @@ let deck: Promise<FolkloreDeck> | undefined;
 
 /** Bundled locally and loaded only when the first answer needs a waiting hint. */
 export function nextFolkloreEntry(): Promise<FolkloreEntry> {
-  deck ??= Promise.all([import('./world.json'), import('./scp.json')])
-    .then(([world, scp]) => new FolkloreDeck([
+  deck ??= Promise.all([import('./world.json'), import('./scp.json'), import('./backrooms.json')])
+    .then(([world, scp, backrooms]) => new FolkloreDeck([
       ...world.default.map((entry) => ({
         ...entry,
         author: 'Wikipedia contributors',
@@ -51,6 +51,11 @@ export function nextFolkloreEntry(): Promise<FolkloreEntry> {
         licenseUrl: 'https://creativecommons.org/licenses/by-sa/4.0/',
       })),
       ...scp.default.map((entry) => ({
+        ...entry,
+        license: 'CC BY-SA 3.0',
+        licenseUrl: 'https://creativecommons.org/licenses/by-sa/3.0/',
+      })),
+      ...backrooms.default.map((entry) => ({
         ...entry,
         license: 'CC BY-SA 3.0',
         licenseUrl: 'https://creativecommons.org/licenses/by-sa/3.0/',

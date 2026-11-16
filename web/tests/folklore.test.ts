@@ -2,8 +2,9 @@ import { describe, expect, test } from 'bun:test';
 import { FolkloreDeck, type FolkloreEntry } from '../src/lib/folklore';
 import world from '../src/lib/folklore/world.json';
 import scp from '../src/lib/folklore/scp.json';
+import backrooms from '../src/lib/folklore/backrooms.json';
 
-const entries = [...world, ...scp];
+const entries = [...world, ...scp, ...backrooms];
 const normalize = (text: string) => text.normalize('NFKD').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 
 describe('folklore catalog', () => {
@@ -23,13 +24,13 @@ describe('folklore catalog', () => {
       expect(entry.tradition).not.toMatch(/\[\[|\]\]/);
       expect(new URL(entry.source).protocol).toBe('https:');
     }
-    for (const entry of scp) expect(entry.author.trim()).not.toBe('');
+    for (const entry of [...scp, ...backrooms]) expect(entry.author.trim()).not.toBe('');
     for (const entry of world) expect(entry.revision).toBeGreaterThan(0);
   });
 
   test('includes the requested legends and Internet folklore, excluding movie-only inventions', () => {
     const names = new Set(entries.map((entry) => entry.subject));
-    for (const name of ['Kelpie', 'Baba Yaga', 'Bogeyman', 'Chupacabra', 'Slender Man', 'The Backrooms', 'SCP-173', 'SCP-999']) {
+    for (const name of ['Kelpie', 'Baba Yaga', 'Bogeyman', 'Chupacabra', 'Slender Man', 'The Backrooms', 'Jeff the Killer', 'Siren Head', 'Smile Dog', 'Yeti', 'Hanako-san', 'Resurrection Mary', 'SCP-173', 'SCP-999', 'SCP-3008', 'Level 0', 'Smilers']) {
       expect(names.has(name)).toBe(true);
     }
     for (const name of ['Babadook', 'The Babadook', 'Dracula', "Frankenstein's monster", 'Cthulhu', 'Godzilla', 'King Kong']) {

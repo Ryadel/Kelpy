@@ -2,7 +2,7 @@
 
 The catalog contains one short entry per distinct subject. Traditional beliefs and modern Internet stories are
 presented as folklore or fiction, not as claims that the creatures exist. Movie-only and modern literary
-inventions are excluded; SCP fiction and Internet-born legends are included.
+inventions are excluded; SCP and Backrooms fiction and Internet-born legends are included.
 
 ## World folklore (`world.json`)
 
@@ -21,7 +21,15 @@ text are licensed under [CC BY-SA 3.0](https://creativecommons.org/licenses/by-s
 The adaptations summarize the creatures' appearance, behavior or fictional containment premise.
 No SCP images, logos or audio are included.
 
-See the [SCP licensing guide](https://scp-wiki.wikidot.com/licensing-guide) and
+## Backrooms fiction (`backrooms.json`)
+
+Original concise descriptions of levels and entities, adapted from the individual Backrooms Wiki articles linked in
+the data. Each entry credits its authors, as the article's licensing box names them. Copyright belongs to those
+authors; editorial contributions copyright 2026 Ryadel. This data file and its adapted text are licensed under
+[CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/). No Backrooms Wiki images are included.
+
+See the [Backrooms Wiki licensing guide](https://backrooms-wiki.wikidot.com/licensing-guide),
+the [SCP licensing guide](https://scp-wiki.wikidot.com/licensing-guide) and
 [Wikipedia reuse guidance](https://en.wikipedia.org/wiki/Wikipedia:Reusing_Wikipedia_content).
 
 These content licenses are separate from Kelpy's software license.

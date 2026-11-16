@@ -143,25 +143,48 @@ struct Simple {
 /// so that each command of a pipeline, a list, a substitution or a quoted command line is seen.
 fn commands(text: &str) -> impl Iterator<Item = Simple> {
     text.split([';', '|', '&', '(', ')', '{', '}', '\n', '\r', '`'])
-        .filter_map(|text| {
-            let words: Vec<String> = text
-                .split_whitespace()
-                .map(|word| word.trim_matches(['\'', '"', ',']).to_owned())
-                .filter(|word| !word.is_empty())
-                .collect();
-            simple(&words, text)
-        })
+        .filter_map(|text| simple(words(text), text))
+}
+
+/// The words of `text`, split at white space but for quotes closed within it: a program's path such as
+/// `"C:\Program Files\PowerShell\7\pwsh.exe"` is one word. Quotes around a word and commas after it are removed;
+/// a quote left open is only removed.
+fn words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut rest = text.trim_start();
+    while let Some(first) = rest.chars().next() {
+        // Past the closing quote of a word that starts with one, if it closes.
+        let quoted = matches!(first, '"' | '\'')
+            .then(|| rest[1..].find(first).map(|at| at + 2))
+            .flatten()
+            .unwrap_or(0);
+        let end = rest[quoted..]
+            .find(char::is_whitespace)
+            .map_or(rest.len(), |at| quoted + at);
+        let word = &rest[..end];
+        let word = if quoted == end && end >= 2 {
+            &word[1..end - 1]
+        } else {
+            word.trim_matches(['\'', '"'])
+        };
+        let word = word.trim_end_matches([',', '\'', '"']);
+        if !word.is_empty() {
+            words.push(word.to_owned());
+        }
+        rest = rest[end..].trim_start();
+    }
+    words
 }
 
 /// The command `words` of `text` run in the end: what a wrapper such as `sudo -u root` runs, or a shell such as
 /// `bash -c`, `cmd /c` or `powershell -Command`, is seen in its place. The words keep their case until then: `sudo -H`
 /// is not `sudo -h`.
-fn simple(mut words: &[String], text: &str) -> Option<Simple> {
+fn simple(mut words: Vec<String>, text: &str) -> Option<Simple> {
     loop {
         let (first, rest) = words.split_first()?;
         // A variable set for the command.
         if first.contains('=') && !first.starts_with('$') {
-            words = rest;
+            words = rest.to_vec();
             continue;
         }
         let name = first
@@ -171,9 +194,10 @@ fn simple(mut words: &[String], text: &str) -> Option<Simple> {
             .to_lowercase();
         let name = name.trim_end_matches(".exe");
         if let Some(command) = command_line(name, rest) {
-            words = command;
+            // The command line it runs, often quoted as one word, is read again into words.
+            words = self::words(&command.join(" "));
         } else if let Some(wrapper) = WRAPPERS.iter().find(|wrapper| wrapper.name == name) {
-            words = wrapper.command(rest);
+            words = wrapper.command(rest).to_vec();
         } else {
             return Some(Simple {
                 name: name.to_owned(),
@@ -787,6 +811,20 @@ mod tests {
                 DELETES,
             ),
             ("powershell Remove-Item C:\\old", DELETES),
+            // A program's path with spaces, quoted.
+            (
+                "& \"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command \"Remove-Item C:\\sites\\old -Recurse\"",
+                DELETES,
+            ),
+            (
+                "\"C:\\Program Files\\Git\\usr\\bin\\rm.exe\" -rf /c/sites/old",
+                DELETES,
+            ),
+            (
+                "& 'C:\\Program Files\\PowerShell\\7\\pwsh.exe' -NoProfile -c 'Stop-Service WinRM'",
+                WAY_IN,
+            ),
+            ("sudo -u root '/opt/my tools/rm' -rf /srv/old", DELETES),
             ("pwsh -nop -Command \"Stop-Service WinRM\"", WAY_IN),
             (
                 "powershell -WindowStyle Hidden -Command Restart-Computer",
