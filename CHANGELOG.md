@@ -3,6 +3,29 @@
 Each release is on the [releases page](https://github.com/Ryadel/Kelpy/releases), with one executable per platform,
 the install scripts and the signed checksums. Versions follow [Semantic Versioning](https://semver.org).
 
+## 0.5.2 (2026-11-16)
+
+A quieter Web UI while Kelpy thinks, a larger lore catalogue, and fixes to Auto and the shared memory.
+
+- **Auto asks for programs with spaces in their path**: a command run through a quoted path, as in
+  `& "C:\Program Files\PowerShell\7\pwsh.exe" -Command "Remove-Item …"` or
+  `"C:\Program Files\Git\usr\bin\rm.exe" …`, is now judged by what it runs, and asks when it deletes files, stops
+  SSH or restarts the system. In 0.5.1 it ran without asking.
+- **The lore has its own place**: while an answer is written, a passage of lore sits above the message box, a new
+  one every 12 seconds (it waits while the pointer is on it), and "Thinking…" stays a single line in the
+  conversation. Its × hides it until the answer ends; the crossed eye turns it off in that browser, and *Show lore
+  while Kelpy thinks* in the menu at the top right turns it back on.
+- **The conversation stays in sight**: the Web UI follows the end of an answer as it grows, and stops only when you
+  scroll up. In 0.5.1 a tall passage of lore could leave the end hidden behind the message box.
+- **1252 entries of lore**, from 1000: classic SCP Foundation articles, levels and entities of the Backrooms,
+  creepypasta, urban legends, cryptids, Japanese urban legends and analog horror, each with its source and credit.
+- **Shared memory**: a setting changed and changed back within the same second while another Kelpy was checking it
+  is no longer noted as an unexpected change.
+- **Updates**: when a new version is out, Kelpy says which one is installed: "(installed version: 0.5.1)".
+
+Updating from 0.5.1: Kelpy offers the update at its next start, or run `kelpy update`. The shared records are not
+upgraded: a 0.5.1 and a 0.5.2 can share them.
+
 ## 0.5.1 (2026-11-14)
 
 Fixes to the commands Auto runs without asking, to the shared memory and to the terminal UI over SSH.
