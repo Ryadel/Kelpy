@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { marked } from 'marked';
-import { advance, settled } from '../src/lib/reveal';
+import { advance, revealed, settled } from '../src/lib/reveal';
 
 /** An answer using every construct that could show half-written. */
 const answer = `Here is **how** to check the \`nginx\` service, with _care_ and ~~old~~ steps.
@@ -68,6 +68,25 @@ describe('settled', () => {
     expect(settled('Read [the docs](https://ex ')).toBe('Read ');
     expect(settled('Press <kbd class ')).toBe('Press ');
     expect(settled('Run `systemctl status ')).toBe('Run ');
+  });
+});
+
+describe('revealed', () => {
+  test('a pause before the next action shows all the text received, including its last formatted phrase', () => {
+    for (const text of [
+      'Verifico la configurazione completa del servizio',
+      'Verifico **la configurazione completa del servizio**',
+      'Eseguo `Get-Service W3SVC`',
+      'Leggo [la documentazione](https://example.com)',
+    ]) {
+      let length = 0;
+      for (let frame = 0; frame < 100 && length < text.length; frame++) {
+        length = advance(length, text, 16);
+      }
+      expect(length).toBe(text.length);
+      expect(revealed(text, length)).toBe(text);
+    }
+    expect(revealed('Check **the service configuration**', 20)).toBe('Check ');
   });
 });
 

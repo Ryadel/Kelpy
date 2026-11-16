@@ -3,6 +3,20 @@
 Each release is on the [releases page](https://github.com/Ryadel/Kelpy/releases), with one executable per platform,
 the install scripts and the signed checksums. Versions follow [Semantic Versioning](https://semver.org).
 
+## 0.5.3 (2026-11-16)
+
+Fixes to streamed answers and the height of the lore carousel.
+
+- **Received text appears before the next command**: the Web UI now shows all received text once its typing
+  animation catches up. Previously, the last word or a whole bold phrase or inline command could stay hidden
+  until the next action arrived. The text was received and saved; reloading the conversation showed it all.
+- **The lore fits each passage**: the band above the message box now grows and shrinks with the current passage,
+  with a gentle height transition alongside the text's fade. It no longer keeps the height of the tallest passage
+  in the answer. The height animation respects reduced-motion preferences.
+
+Updating from 0.5.2: Kelpy offers the update at its next start, or run `kelpy update`. The shared records are not
+upgraded.
+
 ## 0.5.2 (2026-11-16)
 
 A quieter Web UI while Kelpy thinks, a larger lore catalogue, and fixes to Auto and the shared memory.

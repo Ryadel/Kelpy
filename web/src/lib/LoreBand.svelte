@@ -31,9 +31,9 @@
   let pointed = false;
   let asking = $state(false);
   let noted = $state(false);
+  let passage = $state<HTMLElement | null>(null);
+  /** The current passage's height: outgoing passages overlap it while it changes size. */
   let height = $state(0);
-  /** The tallest passage of this answer: a shorter one after it keeps its height, so nothing above moves. */
-  let floor = $state(0);
   /** Counts the answers: a passage drawn for one that has ended is not shown. */
   let turn = 0;
   /** The answer of `turn` is still being written. */
@@ -42,9 +42,15 @@
   const visible = $derived(open && !closed && lore.on && entry !== null);
 
   $effect(() => {
-    if (visible && height > untrack(() => floor)) {
-      floor = height;
+    if (!passage) {
+      return;
     }
+    const current = passage;
+    const measure = () => (height = current.getBoundingClientRect().height);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(current);
+    return () => observer.disconnect();
   });
 
   function draw(forTurn: number) {
@@ -69,7 +75,6 @@
     live = true;
     untrack(() => {
       closed = false;
-      floor = 0;
       if (lore.on) {
         draw(mine);
       }
@@ -111,12 +116,13 @@
       onpointerenter={() => (pointed = true)}
       onpointerleave={() => (pointed = false)}
     >
-      <div class="grid" style:min-height="{floor}px" bind:clientHeight={height}>
+      <div class="relative transition-[height] duration-500 ease-out motion-reduce:transition-none" style:height="{height}px">
         {#if entry}
           {#key entry.id}
             <!-- The credit stays in sight, as the entries' licences ask. -->
             <figure
-              class="border-primary/70 col-start-1 row-start-1 border-l-2 pl-3 [overflow-wrap:anywhere]"
+              bind:this={passage}
+              class="border-primary/70 absolute inset-x-0 top-0 border-l-2 pl-3 [overflow-wrap:anywhere]"
               in:fade={{ duration: 700 }}
               out:fade={{ duration: 700 }}
             >

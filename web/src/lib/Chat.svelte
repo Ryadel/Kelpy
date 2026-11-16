@@ -24,7 +24,7 @@
   import { sentMessages } from './history';
   import { splitImages } from './images';
   import type { ComposerImage, Outgoing } from './Composer.svelte';
-  import { advance, settled } from './reveal';
+  import { advance, revealed } from './reveal';
   import {
     ApiError,
     cancelAnswer,
@@ -500,7 +500,7 @@
     if (reveal?.id !== message.id || message.status !== 'streaming') {
       return message;
     }
-    return { ...message, content: settled(message.content.slice(0, reveal.shown)) };
+    return { ...message, content: revealed(message.content, reveal.shown) };
   }
 
   /** Reveals the answer's text that arrived, a few words a frame, until all of it shows. */

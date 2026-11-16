@@ -1,6 +1,6 @@
 /**
- * Showing an answer as it is written: the text that arrives in bursts is revealed a few words at a time, and never
- * with a Markdown or HTML construct left open, which would show its signs until it closes.
+ * Showing an answer as it is written: bursts are revealed a few words at a time, holding back partial Markdown
+ * while the animation catches up. Once it does, all the text received is shown.
  */
 
 /** The language of the blocks in which the model writes its explanations, shown as panels. */
@@ -30,6 +30,14 @@ export function advance(shown: number, arrived: string, elapsed: number): number
     next++;
   }
   return next;
+}
+
+/**
+ * The text revealed through `length`: keep partial Markdown out while the animation catches up, then show all
+ * that arrived. A pause before a tool call must not leave its last word or formatted phrase hidden.
+ */
+export function revealed(text: string, length: number): string {
+  return length >= text.length ? text : settled(text.slice(0, length));
 }
 
 /**
