@@ -7,8 +7,11 @@
 //! that failed in the same way before is not the change's doing, and the change is kept.
 //!
 //! The model's text may name secrets ([`crate::secret`]): their values are written, and the diff shows their
-//! placeholders. A file that may hold secrets can be written whole, never edited: an edit would tell the model
-//! whether a text occurs in it. Its current content is not shown in the diff.
+//! placeholders. A file that may hold secrets is never shown: written whole, its current content is not in the diff;
+//! edited, the diff shows only the text replaced and its replacement, with their lines, and the model learns only
+//! how many times it occurred. A change of an existing one tells the model something of it (whether a text occurs,
+//! whether it already holds a content), so it always asks, and what Kelpy found is told only once approved: the
+//! administrator sees each change tried. Writing a new one asks as any file does.
 
 use std::borrow::Cow;
 use std::io::{self, Write};
@@ -34,8 +37,8 @@ const PREVIEW_LINES: usize = 40;
 /// What the model asked to change in a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Edit {
-    /// Replaces `old`, which must occur exactly once, with `new`.
-    Replace { old: String, new: String },
+    /// Replaces `old` with `new`: `old` must occur exactly once, or, with `all`, at least once, every time replaced.
+    Replace { old: String, new: String, all: bool },
     /// The whole new content; the file is created if it does not exist.
     Write(String),
 }
@@ -45,6 +48,8 @@ pub enum Edit {
 pub struct FileChange {
     pub path: PathBuf,
     pub edit: Edit,
+    /// The model said the file holds credentials: it is changed like a file that may hold secrets.
+    pub sensitive: bool,
     pub planned: Option<Planned>,
 }
 
@@ -64,11 +69,23 @@ pub struct Planned {
     pub floor: Option<String>,
     /// Whether the file may hold secrets, or the change writes one: its content is neither shown nor kept.
     pub secret: bool,
+    /// How many times the text replaced occurred, for a replacement.
+    pub replaced: Option<usize>,
+    /// Why a replacement in a file that may hold secrets cannot be made: told the model only once approved, as the
+    /// model learns from it whether a text occurs in the file.
+    pub unmade: Option<String>,
 }
 
 impl Planned {
     /// What the card says besides the diff: when it is written, how it is checked and undone.
     pub fn notes(&self) -> Vec<String> {
+        if let Some(unmade) = &self.unmade {
+            return vec![format!(
+                "It cannot be made, and nothing is written: {}. Approving tells the AI so; denying tells it only \
+                 that you denied it.",
+                unmade.trim_end_matches('.')
+            )];
+        }
         let mut notes = vec![match self.before {
             Some(_) => "Written only if the file is still as shown, after a backup in Kelpy's backups folder.",
             None => "A new file: deleting it undoes the change.",
@@ -131,7 +148,7 @@ pub(crate) fn preview(edit: &Edit) -> String {
         text.lines().map(|line| format!("{sign}{line}")).collect()
     };
     let mut shown = match edit {
-        Edit::Replace { old, new } => [lines('-', old), lines('+', new)].concat(),
+        Edit::Replace { old, new, .. } => [lines('-', old), lines('+', new)].concat(),
         Edit::Write(content) => lines('+', content),
     };
     if shown.len() > PREVIEW_LINES {
@@ -175,26 +192,47 @@ pub async fn plan(
         return Err(ToolError::OwnData(path.clone()));
     }
     let real = plain(real);
-    // A secret file by its name, or one Kelpy wrote a secret into.
-    let secret_file = files::is_secret(&real) || held.contains(&real);
-    if secret_file && matches!(change.edit, Edit::Replace { .. }) {
-        return Err(ToolError::Secret(path.clone()));
-    }
     let before = if exists {
         Some(read(&real).await?)
     } else {
         None
     };
+    // A secret file by its name, one Kelpy wrote a secret into, one the model said holds credentials, or one whose
+    // text looks like it does, such as an appsettings.json with a connection string.
+    let secret_file = files::is_secret(&real)
+        || held.contains(&real)
+        || change.sensitive
+        || before.as_deref().is_some_and(files::holds_credentials);
     // A file with Windows line ends keeps them: what the model wrote is given the same.
     let crlf = before.as_deref().is_some_and(|text| text.contains("\r\n"));
     let ends = |text: &str| -> Result<String, ToolError> {
         let (text, _) = secrets.fill(text)?;
+        // Kelpy reads back only text: a file written with a NUL could be neither checked nor put back.
+        if text.contains('\0') {
+            return Err(invalid(
+                "the text holds a NUL character, which a text file may not hold",
+            ));
+        }
         Ok(if crlf && !text.contains('\r') {
             text.replace('\n', "\r\n")
         } else {
             text
         })
     };
+    // A change of a file that may hold secrets tells something of it: whether a text occurs, whether it already
+    // holds a content, whether it was valid JSON. What Kelpy finds is said only once the administrator has
+    // approved, and the card says it to them meanwhile. A new file has nothing to tell.
+    let blind = secret_file && before.is_some();
+    let mut unmade = None;
+    let refuse = |why: String, unmade: &mut Option<String>| -> Result<(), ToolError> {
+        if blind {
+            unmade.get_or_insert(why);
+            Ok(())
+        } else {
+            Err(invalid(why))
+        }
+    };
+    let mut replaced = None;
     let after = match (&change.edit, &before) {
         (Edit::Replace { .. }, None) => {
             return Err(invalid(format!(
@@ -202,58 +240,127 @@ pub async fn plan(
                 path.display()
             )));
         }
-        (Edit::Replace { old, new }, Some(before)) => {
+        (Edit::Replace { old, new, all }, Some(before)) => {
             let (old, new) = (ends(old)?, ends(new)?);
-            match before.matches(old.as_str()).count() {
-                1 => before.replacen(old.as_str(), &new, 1),
-                0 => {
-                    return Err(invalid(format!(
-                        "`old` does not occur in {}: read the file again and copy the text exactly",
-                        path.display()
-                    )));
+            // The model cannot read a file that may hold secrets: only the administrator can give the exact text.
+            let (exact, unique) = if secret_file {
+                (
+                    "the file may hold secrets, so you cannot read it: ask the administrator for the exact text",
+                    "set `all` to replace every one, or ask the administrator for a text that occurs once",
+                )
+            } else {
+                (
+                    "read the file again and copy the text exactly",
+                    "include the lines around it, so that it occurs once, or set `all` to replace every one",
+                )
+            };
+            let times = before.matches(old.as_str()).count();
+            // The size it would have, known before anything is built: `all` could make it grow without end.
+            let size =
+                (before.len() - times * old.len()) as u64 + (times as u64) * (new.len() as u64);
+            let why = match times {
+                0 => Some(format!(
+                    "`old` does not occur in {}: {exact}",
+                    path.display()
+                )),
+                times if times > 1 && !all => Some(format!(
+                    "`old` occurs {times} times in {}: {unique}",
+                    path.display()
+                )),
+                _ if size > MAX_FILE => Some(format!(
+                    "{} would grow to {} MiB, over the {} MiB a file changed may have",
+                    path.display(),
+                    size.div_ceil(1 << 20),
+                    MAX_FILE >> 20
+                )),
+                _ => None,
+            };
+            match why {
+                Some(why) => {
+                    refuse(why, &mut unmade)?;
+                    before.clone()
                 }
-                times => {
-                    return Err(invalid(format!(
-                        "`old` occurs {times} times in {}: include the lines around it, so that it occurs once",
-                        path.display()
-                    )));
+                None => {
+                    replaced = Some(times);
+                    before.replace(old.as_str(), &new)
                 }
             }
         }
         (Edit::Write(content), _) => ends(content)?,
     };
     if before.as_deref() == Some(after.as_str()) {
-        return Ok(Err(format!(
+        let already = format!(
             "{} already holds this content: nothing to change.",
             path.display()
-        )));
+        );
+        if !blind {
+            return Ok(Err(already));
+        }
+        unmade.get_or_insert(already);
     }
     if is_json(&real) {
         let valid = |text: &str| serde_json::from_str::<serde_json::Value>(text).map(|_| ());
         if let Err(error) = valid(&after) {
             // Kept only when the file was not valid JSON before either.
             if before.as_deref().is_none_or(|before| valid(before).is_ok()) {
-                return Err(invalid(format!(
-                    "the new content is not valid JSON: {error}"
-                )));
+                refuse(
+                    format!("the new content is not valid JSON: {error}"),
+                    &mut unmade,
+                )?;
             }
         }
     }
-    // The diff shows secrets by their names, and nothing of a secret file before the change.
-    let shown_before = match &before {
-        Some(_) if secret_file => String::new(),
-        Some(before) => secrets.redact(before),
-        None => String::new(),
+    // The diff shows secrets by their names, and nothing of a secret file but what the model wrote.
+    let diff = match (&change.edit, &before) {
+        (Edit::Replace { old, new, .. }, Some(before)) if blind => {
+            let filled = ends(old)?;
+            let at = before
+                .match_indices(filled.as_str())
+                .map(|(index, _)| before[..index].matches('\n').count() + 1);
+            blind_diff(&real, at, old, &secrets.redact(&ends(new)?))
+        }
+        (_, Some(_)) if secret_file => diff(&real, "", &secrets.redact(&after)),
+        (_, Some(before)) => diff(&real, &secrets.redact(before), &secrets.redact(&after)),
+        (_, None) => diff(&real, "", &secrets.redact(&after)),
     };
+    let floor = floor(os, &real).or_else(|| blind.then(|| BLIND.to_owned()));
     Ok(Ok(Planned {
-        diff: diff(&real, &shown_before, &secrets.redact(&after)),
+        diff,
         check: check(os, &real).filter(|check| installed(&check.program)),
-        floor: floor(os, &real),
+        floor,
         secret: secret_file || secrets.holds_any(&after),
+        replaced,
+        unmade,
         real,
         before,
         after,
     }))
+}
+
+/// Why a change of an existing file that may hold secrets always asks.
+pub(crate) const BLIND: &str = "It changes a file that may hold secrets, which the AI never sees: it always asks, so \
+                                that you see each change it tries.";
+
+/// The diff of a replacement in a file that may hold secrets: the text replaced and its replacement, at each line
+/// where it occurred, and nothing around them. `old` is shown as the model wrote it, its secrets by their names.
+fn blind_diff(path: &Path, lines: impl Iterator<Item = usize>, old: &str, new: &str) -> String {
+    let (old, new) = (old.replace("\r\n", "\n"), new.replace("\r\n", "\n"));
+    let name = path.to_string_lossy();
+    let mut text = format!("--- {name}\n+++ {name}\n");
+    for line in lines {
+        text.push_str(&format!("@@ line {line} @@\n"));
+        for removed in old.lines() {
+            text.push_str(&format!("-{removed}\n"));
+        }
+        for added in new.lines() {
+            text.push_str(&format!("+{added}\n"));
+        }
+        if text.len() > MAX_DIFF {
+            text.push_str("[… more occurrences not shown …]\n");
+            break;
+        }
+    }
+    text
 }
 
 /// Makes a planned change, writing what it does to `output`; the previous version goes to `backups`. Returns where.
@@ -263,6 +370,28 @@ pub async fn apply(
     output: &Output,
 ) -> Result<Option<PathBuf>, ToolError> {
     let real = &planned.real;
+    if let Some(unmade) = &planned.unmade {
+        return Err(invalid(unmade.clone()));
+    }
+    // Planned within the limit and as text: never write what could not be read back, and so not put back.
+    if planned.after.len() as u64 > MAX_FILE {
+        return Err(ToolError::TooLarge(real.clone()));
+    }
+    if planned.after.contains('\0') {
+        return Err(ToolError::NotText(real.clone()));
+    }
+    // A check's diagnostics may quote the file, and so a password Kelpy does not know: for a file that may hold
+    // secrets, only whether it passed is told.
+    let diagnostics = |check: &Command, text: &str| -> String {
+        if planned.secret {
+            format!(
+                "[not shown, as the file may hold secrets: the administrator can run `{}` to see it]",
+                check.display
+            )
+        } else {
+            text.to_owned()
+        }
+    };
     let now = match tokio::fs::symlink_metadata(real).await {
         Ok(_) => Some(read(real).await?),
         Err(_) => None,
@@ -282,8 +411,9 @@ pub async fn apply(
             format!("Before the change, `{}` passed.", check.display)
         } else {
             format!(
-                "Before the change, `{}` failed already:\n{text}",
-                check.display
+                "Before the change, `{}` failed already:\n{}",
+                check.display,
+                diagnostics(check, text)
             )
         });
     }
@@ -314,8 +444,12 @@ pub async fn apply(
         return Err(ToolError::ChangedMeanwhile(real.clone()));
     }
     let (added, removed) = counts(&planned.diff);
+    let occurrences = match planned.replaced {
+        Some(1) | None => String::new(),
+        Some(times) => format!(", {times} occurrences replaced"),
+    };
     output.line(&format!(
-        "Wrote {} (+{added} −{removed} lines).",
+        "Wrote {} (+{added} −{removed} lines{occurrences}).",
         real.display()
     ));
     let Some(check) = &planned.check else {
@@ -328,8 +462,9 @@ pub async fn apply(
         return Ok(saved);
     }
     output.line(&format!(
-        "After the change, `{}` failed:\n{text}",
-        check.display
+        "After the change, `{}` failed:\n{}",
+        check.display,
+        diagnostics(check, &text)
     ));
     if checked_before.is_some_and(|(passed, before)| !passed && before == text) {
         output.line("It failed in the same way before: the change is kept.");
@@ -343,7 +478,7 @@ pub async fn apply(
     output.line("The previous version was put back.");
     Err(ToolError::CheckFailed {
         check: check.display.clone(),
-        output: text,
+        output: diagnostics(check, &text),
     })
 }
 
@@ -648,15 +783,26 @@ mod tests {
             edit: Edit::Replace {
                 old: old.into(),
                 new: new.into(),
+                all: false,
             },
+            sensitive: false,
             planned: None,
         }
+    }
+
+    fn replace_all(path: &Path, old: &str, new: &str) -> FileChange {
+        let mut change = replace(path, old, new);
+        if let Edit::Replace { all, .. } = &mut change.edit {
+            *all = true;
+        }
+        change
     }
 
     fn write_all(path: &Path, content: &str) -> FileChange {
         FileChange {
             path: path.to_owned(),
             edit: Edit::Write(content.into()),
+            sensitive: false,
             planned: None,
         }
     }
@@ -756,6 +902,25 @@ mod tests {
 
         assert!(problem(planned(&replace(&path, "a", "c")).await).contains("occurs 2 times"));
         assert!(problem(planned(&replace(&path, "z", "c")).await).contains("does not occur"));
+        assert!(problem(planned(&replace_all(&path, "z", "c")).await).contains("does not occur"));
+        // With `all`, every occurrence, said in the result.
+        let every = planned(&replace_all(&path, "a\n", "c\n")).await.unwrap();
+        assert_eq!(
+            (every.after.as_str(), every.replaced),
+            ("c\nc\nb\n", Some(2))
+        );
+        let backups = tempfile::tempdir().unwrap();
+        let output = Output::new();
+        apply(&every, backups.path(), &output).await.unwrap();
+        assert!(
+            output
+                .snapshot()
+                .1
+                .contains("(+2 \u{2212}2 lines, 2 occurrences replaced)"),
+            "{}",
+            output.snapshot().1
+        );
+        fs::write(&path, "a\na\nb\n").unwrap();
         assert!(
             problem(planned(&write_all(&path, "a\na\nb\n")).await).contains("nothing to change")
         );
@@ -824,13 +989,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secrets_kelpys_data_and_invalid_json_are_refused() {
+    async fn kelpys_data_and_invalid_json_are_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let env = dir.path().join(".env");
-        assert!(matches!(
-            planned(&replace(&env, "A=1", "A=2")).await,
-            Err(ToolError::Secret(_))
-        ));
         let own = plan(
             &write_all(&dir.path().join("notes.md"), "x"),
             Os::current(),
@@ -909,7 +1069,8 @@ mod tests {
                 .any(|note| note.contains("may hold secrets"))
         );
 
-        // Written again with the same secret: nothing to change.
+        // Written again with the same secret: nothing to change, told only once approved, as it tells what the
+        // file holds. Replacing an existing secret file always asks.
         fs::write(&config, &written.after).unwrap();
         let again = plan(
             &write_all(
@@ -923,8 +1084,16 @@ mod tests {
             |_| true,
         )
         .await
+        .unwrap()
         .unwrap();
-        assert!(again.unwrap_err().contains("nothing to change"));
+        assert!(
+            again
+                .unmade
+                .as_deref()
+                .unwrap()
+                .contains("nothing to change")
+        );
+        assert_eq!(again.floor.as_deref(), Some(BLIND));
         // A secret that does not exist.
         let missing = planned(&write_all(&dir.path().join("a.conf"), "{{secret:nope}}"))
             .await
@@ -932,11 +1101,241 @@ mod tests {
         assert!(missing.to_string().contains("generate_secret"));
     }
 
+    #[tokio::test]
+    async fn a_secret_file_is_edited_blind_and_says_only_how_often_the_text_occurred() {
+        let (dir, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let env = dir.path().join(".env");
+        let content = "DB_HOST=old-db\r\nDB_PASSWORD=hunter2\r\nCACHE_HOST=old-db\r\n";
+        fs::write(&env, content).unwrap();
+
+        let blind = planned(&replace_all(&env, "old-db", "new-db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            blind.after,
+            "DB_HOST=new-db\r\nDB_PASSWORD=hunter2\r\nCACHE_HOST=new-db\r\n"
+        );
+        assert_eq!((blind.replaced, blind.unmade.as_deref()), (Some(2), None));
+        // The card: the text replaced and its replacement at each line, nothing around them.
+        assert!(
+            blind
+                .diff
+                .ends_with("@@ line 1 @@\n-old-db\n+new-db\n@@ line 3 @@\n-old-db\n+new-db\n"),
+            "{}",
+            blind.diff
+        );
+        assert!(!blind.diff.contains("hunter2") && !blind.diff.contains("DB_HOST"));
+        assert_eq!(blind.floor.as_deref(), Some(BLIND));
+        assert!(blind.secret);
+        assert_eq!(blind.recorded().content, None);
+        let output = Output::new();
+        apply(&blind, backups.path(), &output).await.unwrap();
+        assert_eq!(fs::read_to_string(&env).unwrap(), blind.after);
+        let told = output.snapshot().1;
+        assert!(told.contains("2 occurrences replaced"), "{told}");
+        assert!(
+            !told.contains("hunter2") && !told.contains("DB_HOST"),
+            "{told}"
+        );
+
+        // What it finds is told only once approved: the plan holds it, and applying says it, writing nothing.
+        fs::write(&env, content).unwrap();
+        for (change, found) in [
+            (replace(&env, "nope", "x"), "does not occur"),
+            (replace(&env, "old-db", "x"), "occurs 2 times"),
+            (replace(&env, "hunter2", "hunter2"), "nothing to change"),
+        ] {
+            let planned = planned(&change).await.unwrap();
+            let unmade = planned.unmade.clone().unwrap();
+            assert!(unmade.contains(found), "{unmade}");
+            assert_eq!(planned.floor.as_deref(), Some(BLIND));
+            assert!(
+                planned.notes()[0].contains("cannot be made"),
+                "{:?}",
+                planned.notes()
+            );
+            let error = apply(&planned, backups.path(), &Output::new())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(found), "{error}");
+            assert_eq!(fs::read_to_string(&env).unwrap(), content);
+        }
+        let missing = planned(&replace(&env, "nope", "x"))
+            .await
+            .unwrap()
+            .unmade
+            .unwrap();
+        assert!(missing.contains("ask the administrator"), "{missing}");
+    }
+
+    /// A check that prints the file at `path` and fails, as a validator quoting a line may.
+    fn quoting(path: &Path) -> Command {
+        let path = path.to_string_lossy().into_owned();
+        let (program, args) = if cfg!(windows) {
+            let script = format!("Get-Content -LiteralPath '{path}'; exit 1");
+            (
+                "powershell",
+                vec!["-NoProfile".to_owned(), "-Command".to_owned(), script],
+            )
+        } else {
+            let script = "cat \"$1\"; exit 1".to_owned();
+            ("sh", vec!["-c".to_owned(), script, "sh".to_owned(), path])
+        };
+        Command {
+            program: program.into(),
+            args,
+            env: Vec::new(),
+            display: "php -l".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_checks_diagnostics_of_a_secret_file_are_not_told() {
+        let (dir, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let env = dir.path().join(".env");
+        let content = "DB_HOST=old-db\nDB_PASSWORD=hunter2\n";
+        fs::write(&env, content).unwrap();
+        let mut blind = planned(&replace(&env, "old-db", "new-db")).await.unwrap();
+        blind.check = Some(quoting(&env));
+
+        let output = Output::new();
+        let error = apply(&blind, backups.path(), &output).await.unwrap_err();
+        assert!(matches!(error, ToolError::CheckFailed { .. }));
+        let (told, error) = (output.snapshot().1, error.to_string());
+        assert!(
+            !told.contains("hunter2") && !error.contains("hunter2"),
+            "{told}\n{error}"
+        );
+        assert!(
+            error.contains("the administrator can run `php -l`"),
+            "{error}"
+        );
+        // It failed before too, the same way as far as Kelpy can tell: the text compared is the real one.
+        assert!(told.contains("failed already"), "{told}");
+        assert_eq!(fs::read_to_string(&env).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_may_not_grow_a_file_past_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plain, env) = (dir.path().join("big.txt"), dir.path().join(".env"));
+        let content = "a".repeat(20_000);
+        fs::write(&plain, &content).unwrap();
+        fs::write(&env, &content).unwrap();
+        let huge = "x".repeat(2_048);
+
+        let refused = planned(&replace_all(&plain, "a", &huge)).await.unwrap_err();
+        assert!(
+            refused.to_string().contains("would grow to 40 MiB"),
+            "{refused}"
+        );
+        // In a secret file, told only once approved, and nothing written then either.
+        let blind = planned(&replace_all(&env, "a", &huge)).await.unwrap();
+        assert!(blind.unmade.as_deref().unwrap().contains("would grow"));
+        assert_eq!(blind.after.len(), content.len());
+        let backups = tempfile::tempdir().unwrap();
+        assert!(apply(&blind, backups.path(), &Output::new()).await.is_err());
+        assert_eq!(fs::read_to_string(&env).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn a_nul_is_never_written_as_it_could_not_be_read_back() {
+        let (dir, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let file = dir.path().join("app.conf");
+        fs::write(&file, "mode=a\n").unwrap();
+        for change in [
+            replace(&file, "a", "b\0"),
+            write_all(&file, "mode=\0\n"),
+            write_all(&dir.path().join("new.conf"), "\0"),
+        ] {
+            let refused = planned(&change).await.unwrap_err().to_string();
+            assert!(refused.contains("NUL"), "{refused}");
+        }
+        // Applying refuses it too, whatever was planned: the file is left as it was.
+        let mut planned = planned(&replace(&file, "a", "b")).await.unwrap();
+        planned.after = "mode=b\0\n".into();
+        let error = apply(&planned, backups.path(), &Output::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::NotText(_)), "{error}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "mode=a\n");
+    }
+
+    #[tokio::test]
+    async fn a_file_with_credentials_or_said_sensitive_is_edited_blind() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("appsettings.json");
+        fs::write(
+            &settings,
+            "{\n  \"ConnectionStrings\": { \"Db\": \"Server=db;Password=hunter2\" },\n  \"Level\": \"Info\"\n}\n",
+        )
+        .unwrap();
+        let blind = planned(&replace(&settings, "\"Info\"", "\"Debug\""))
+            .await
+            .unwrap();
+        assert!(blind.secret);
+        assert_eq!(blind.floor.as_deref(), Some(BLIND));
+        assert!(!blind.diff.contains("hunter2"), "{}", blind.diff);
+        assert!(blind.diff.contains("@@ line 3 @@"), "{}", blind.diff);
+        assert_eq!(blind.recorded().content, None);
+
+        // A file Kelpy cannot tell, said sensitive by the model.
+        let web = dir.path().join("web.config");
+        fs::write(
+            &web,
+            "<add key=\"Smtp\" value=\"hunter2\" />\n<add key=\"Mode\" value=\"a\" />\n",
+        )
+        .unwrap();
+        let shown = planned(&replace(&web, "value=\"a\"", "value=\"b\""))
+            .await
+            .unwrap();
+        assert!(shown.diff.contains("hunter2") && shown.floor.is_none());
+        let mut said = replace(&web, "value=\"a\"", "value=\"b\"");
+        said.sensitive = true;
+        let said = planned(&said).await.unwrap();
+        assert!(!said.diff.contains("hunter2") && said.floor.as_deref() == Some(BLIND));
+        // Written whole, said sensitive: it asks too, and what it finds waits for the approval.
+        let mut whole = write_all(&web, "<add key=\"Smtp\" value=\"hunter2\" />\n");
+        assert!(planned(&whole).await.unwrap().floor.is_none());
+        whole.sensitive = true;
+        let whole = planned(&whole).await.unwrap();
+        assert!(
+            whole.secret && !whole.diff.contains("Mode"),
+            "{}",
+            whole.diff
+        );
+        assert_eq!(whole.floor.as_deref(), Some(BLIND));
+        let mut same = write_all(&web, &fs::read_to_string(&web).unwrap());
+        same.sensitive = true;
+        assert!(
+            planned(&same)
+                .await
+                .unwrap()
+                .unmade
+                .unwrap()
+                .contains("nothing to change")
+        );
+        // A new one has nothing to tell: it asks as any new file, and is kept from others' eyes.
+        let mut new = write_all(&dir.path().join("secrets.json"), "{}");
+        new.sensitive = true;
+        let new = planned(&new).await.unwrap();
+        assert!(new.secret && new.floor.is_none());
+
+        // SSH's settings name passwords without holding one: shown as ever.
+        let sshd = dir.path().join("sshd_config");
+        fs::write(&sshd, "Port 22\nPasswordAuthentication yes\n").unwrap();
+        let ssh = planned(&replace(&sshd, "Port 22", "Port 2222"))
+            .await
+            .unwrap();
+        assert!(!ssh.secret && ssh.diff.contains("PasswordAuthentication"));
+    }
+
     #[test]
     fn a_plan_shows_the_lines_replaced_and_the_start_of_a_new_file() {
         let edit = Edit::Replace {
             old: "listen 80;".into(),
             new: "listen 8080;".into(),
+            all: false,
         };
         assert_eq!(preview(&edit), "-listen 80;\n+listen 8080;");
         let long = Edit::Write("x\n".repeat(50));

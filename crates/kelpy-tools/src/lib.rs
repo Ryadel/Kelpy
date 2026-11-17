@@ -56,8 +56,6 @@ pub enum ToolError {
     NotInstalled(Vec<String>),
     #[error("{} may hold secrets: Kelpy never sends it to the AI service", .0.display())]
     Protected(PathBuf),
-    #[error("{} may hold secrets: Kelpy does not change such files with this tool", .0.display())]
-    Secret(PathBuf),
     #[error("{} is Kelpy's own data: Kelpy does not change it", .0.display())]
     OwnData(PathBuf),
     #[error("{} is over {} MiB: too large to change and back up", .0.display(), change::MAX_FILE >> 20)]
@@ -513,7 +511,8 @@ impl Tools {
             tool(
                 "read_file",
                 "The content of a text file, up to 256 KiB. Files that may hold secrets (private keys, .env, \
-                 wp-config.php, password databases) are refused."
+                 wp-config.php, password databases) are refused: their values must never reach the AI service, so \
+                 do not print them with run_command either."
                     .into(),
                 &[("path", "The file's absolute path.")],
                 &[],
@@ -582,14 +581,17 @@ impl Tools {
                        nginx -t): if the change breaks the check, the previous version is put back at once. Files over \
                        20 MiB cannot be changed. Where a password or key goes, write {{secret:name}} after creating \
                        the secret with generate_secret: Kelpy puts its value in, and you never see it.";
-        tools.push(Tool {
+        let mut edit_file = Tool {
             kind: ToolKind::Changes,
             ..tool(
                 "edit_file",
                 format!(
                     "Changes a text file by replacing one exact piece of it, which must occur exactly once: copy it \
-                     from read_file, with enough lines around it to be unique. Files that may hold secrets (such as \
-                     wp-config.php, .env) cannot be edited, only written whole with write_file. {checked}"
+                     from read_file, with enough lines around it to be unique; with `all`, every time it occurs. \
+                     Files that may hold secrets (such as wp-config.php, .env) are changed this way too, without \
+                     being shown to you: give the exact text, as the administrator gave it or as you wrote it, and \
+                     the result says only how many times it occurred; each such change asks the administrator. \
+                     {checked}"
                 ),
                 &[
                     ("path", "The file's absolute path."),
@@ -598,8 +600,14 @@ impl Tools {
                 ],
                 &[],
             )
+        };
+        edit_file.parameters["properties"]["all"] = json!({
+            "type": "boolean",
+            "description": "Replace every occurrence of `old`, however many, instead of exactly one.",
         });
-        tools.push(Tool {
+        edit_file.parameters["properties"]["sensitive"] = sensitive();
+        tools.push(edit_file);
+        let mut write_file = Tool {
             kind: ToolKind::Changes,
             ..tool(
                 "write_file",
@@ -607,7 +615,8 @@ impl Tools {
                     "Creates a text file, or replaces all its content; its folder must exist. To change part of an \
                      existing file, use edit_file. An existing file keeps its owner and permissions. On Linux and \
                      macOS a new file that may hold secrets, or holds one, is readable by Kelpy's account only (mode \
-                     600): give the service that reads it access with run_command, such as chown or chmod. {checked}"
+                     600): give the service that reads it access with run_command, such as chown or chmod. Replacing \
+                     an existing file that may hold secrets asks the administrator each time. {checked}"
                 ),
                 &[
                     ("path", "The file's absolute path."),
@@ -615,7 +624,9 @@ impl Tools {
                 ],
                 &[],
             )
-        });
+        };
+        write_file.parameters["properties"]["sensitive"] = sensitive();
+        tools.push(write_file);
         let mut manage_service = Tool {
             kind: ToolKind::Changes,
             ..tool(
@@ -913,6 +924,13 @@ impl Tools {
                     }
                     Ok(value.to_owned())
                 };
+                let flag = |field: &str| -> Result<bool, ToolError> {
+                    match arguments.get(field) {
+                        None | Some(Value::Null) => Ok(false),
+                        Some(Value::Bool(flag)) => Ok(*flag),
+                        Some(_) => Err(invalid(format!("`{field}` must be true or false"))),
+                    }
+                };
                 let (summary, edit) = if name == "edit_file" {
                     let old = raw("old")?;
                     if old.is_empty() {
@@ -921,6 +939,7 @@ impl Tools {
                     let edit = Edit::Replace {
                         old,
                         new: raw("new")?,
+                        all: flag("all")?,
                     };
                     (format!("Change {}", path.display()), edit)
                 } else {
@@ -932,6 +951,7 @@ impl Tools {
                 let change = FileChange {
                     path,
                     edit,
+                    sensitive: flag("sensitive")?,
                     planned: None,
                 };
                 (summary, Work::ChangeFile(Box::new(change)))
@@ -1116,7 +1136,13 @@ impl Tools {
             _ => prepared.command_line(),
         };
         let floor = match &prepared.work {
-            Work::ChangeFile(change) => change::floor(self.os, &change.path),
+            // As planning would find it: changing an existing file that may hold secrets always asks, and only an
+            // existing file can have part of it replaced.
+            Work::ChangeFile(change) => change::floor(self.os, &change.path).or_else(|| {
+                ((change.sensitive || files::is_secret(&change.path))
+                    && (matches!(change.edit, Edit::Replace { .. }) || change.path.exists()))
+                .then(|| change::BLIND.to_owned())
+            }),
             Work::Service(change) => service::floor(&change.name, change.action),
             Work::Packages(change) if !change.install => Some(
                 "It removes packages: the programs stop working and their data may go with them."
@@ -1132,6 +1158,17 @@ impl Tools {
             floor,
         })
     }
+}
+
+/// The `sensitive` argument of `edit_file` and `write_file`.
+fn sensitive() -> Value {
+    json!({
+        "type": "boolean",
+        "description": "True when the file holds passwords, keys, tokens or connection strings that Kelpy may not \
+                        recognise (such as an appsettings.json or a web.config): Kelpy then changes it as a file \
+                        that may hold secrets, without showing it, and a change of an existing one asks the \
+                        administrator each time.",
+    })
 }
 
 /// A tool whose arguments are `required` and `optional` strings, plus the `reason` every tool asks for.
@@ -1393,6 +1430,11 @@ mod tests {
         } else {
             ("/etc/ssh/sshd_config", true)
         };
+        let env = if cfg!(windows) {
+            r"C:\srv\.env"
+        } else {
+            "/srv/app/.env"
+        };
         let plan = serde_json::json!({
             "reason": "To serve the blog",
             "goal": "Serve the blog with nginx",
@@ -1402,19 +1444,53 @@ mod tests {
                     "path": config, "old": "Port 22", "new": "Port 2222" } },
                 { "tool": "manage_service", "arguments": { "name": "nginx", "action": "restart" } },
                 { "tool": "remove_packages", "arguments": { "packages": ["apache2"] } },
+                { "tool": "edit_file", "arguments": {
+                    "path": env, "old": "old-db", "new": "new-db", "all": true } },
             ],
         });
         let prepared = linux.prepare("propose_plan", &plan.to_string()).unwrap();
         assert_eq!(prepared.summary, "Plan: Serve the blog with nginx");
         let proposal = prepared.proposal().unwrap();
         let steps = &proposal.steps;
-        assert_eq!(steps.len(), 4);
+        assert_eq!(steps.len(), 5);
         assert_eq!(steps[0].summary, "Install nginx");
         assert_eq!(steps[0].input, r#"{"packages":["nginx"]}"#);
         assert_eq!(steps[1].detail.as_deref(), Some("-Port 22\n+Port 2222"));
         assert_eq!(steps[1].floor.is_some(), floored);
         assert_eq!(steps[2].detail.as_deref(), Some("systemctl restart nginx"));
         assert!(steps[3].floor.is_some());
+        // A file that may hold secrets is edited blind: the step always asks.
+        assert_eq!(steps[4].floor.as_deref(), Some(change::BLIND));
+        // Written whole, it asks only when it exists: a new one has nothing to tell.
+        let dir = tempfile::tempdir().unwrap();
+        let written = |path: &std::path::Path, sensitive: bool| {
+            let call = serde_json::json!({ "steps": [{ "tool": "write_file", "arguments": {
+                "path": path, "content": "x", "sensitive": sensitive } }],
+                "reason": "r", "goal": "g" });
+            linux
+                .prepare("propose_plan", &call.to_string())
+                .unwrap()
+                .proposal()
+                .unwrap()
+                .steps[0]
+                .floor
+                .clone()
+        };
+        let (existing, new) = (
+            dir.path().join("settings.json"),
+            dir.path().join("new.json"),
+        );
+        std::fs::write(&existing, "{}").unwrap();
+        assert_eq!(written(&existing, true).as_deref(), Some(change::BLIND));
+        assert_eq!(written(&existing, false), None);
+        assert_eq!(written(&new, true), None);
+        assert!(
+            linux
+                .prepare("edit_file", &serde_json::json!({ "reason": "r", "path": env, "old": "a", "new": "b", "all": "yes" }).to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("`all` must be true or false")
+        );
 
         // A call carries out a step only with the same arguments, whatever their order and reason.
         assert_eq!(

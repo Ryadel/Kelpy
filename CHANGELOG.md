@@ -3,6 +3,33 @@
 Each release is on the [releases page](https://github.com/Ryadel/Kelpy/releases), with one executable per platform,
 the install scripts and the signed checksums. Versions follow [Semantic Versioning](https://semver.org).
 
+## 0.5.4 (2026-11-17)
+
+Changes to files that may hold secrets, and the lore steps aside for approvals.
+
+- **Files that may hold secrets can be edited**: in `.env`, `wp-config.php` and similar files, Kelpy now replaces a
+  text you give it, without the file being shown to the AI. The card shows only that text and its replacement, at
+  each line where it occurs. The AI learns only how many times it occurred. Each change of such a file, edited or
+  written whole, asks, in Auto too; only creating a new one does not. A check's messages about such a file, such as
+  `php -l`'s, are not shown, as they may quote it. In 0.5.2 these files could only be written whole.
+- **Files with credentials, whatever their name**: a file whose text gives a password, a secret, a connection
+  string or an API key a value, such as an `appsettings.json` or a `web.config`, is changed in the same way, and the
+  AI can mark any other file as sensitive.
+- **Replace every occurrence**: a file edit can replace a text every time it occurs, and says how many there were.
+  A change that would make a file larger than 20 MiB is refused before anything is written.
+- **A NUL character is never written**: a file change whose text holds one is refused. Previously it was written,
+  and Kelpy then could not read the file back to check it or put the previous version back.
+- **Commands that show nothing of a secret are allowed**: Kelpy no longer refuses to check whether a file that may
+  hold secrets exists, or to look at its size, date, permissions or encoding, or count the lines with a given key.
+  It still never shows such a file's content to the AI, even with your consent: when the content itself is needed,
+  it gives you the command to run. In Auto, a command that names such a file asks first, since counts asked one
+  after another could spell out a value.
+- **The lore steps aside for approvals**: while an action waits for you to approve or deny it, the lore is hidden,
+  and it comes back once Kelpy goes on. Closed with its ×, it stays closed until the answer ends.
+
+Updating from 0.5.2 or 0.5.3: Kelpy offers the update at its next start, or run `kelpy update`. The shared records
+are not upgraded.
+
 ## 0.5.3 (2026-11-16)
 
 Fixes to streamed answers and the height of the lore carousel.

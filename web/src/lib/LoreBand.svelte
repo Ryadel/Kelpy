@@ -11,9 +11,11 @@
   interface Props {
     /** An answer is being written in this conversation. */
     answering: boolean;
+    /** The answer waits for the administrator to approve or deny an action: Kelpy is not thinking meanwhile. */
+    waiting: boolean;
   }
 
-  let { answering }: Props = $props();
+  let { answering, waiting }: Props = $props();
 
   /** How long each passage stays, while the pointer is not on it. */
   const EVERY = 12_000;
@@ -39,7 +41,9 @@
   /** The answer of `turn` is still being written. */
   let live = false;
 
-  const visible = $derived(open && !closed && lore.on && entry !== null);
+  // Hidden at once while an action waits for approval: the decision is the administrator's, and the band would say
+  // Kelpy is still thinking.
+  const visible = $derived(open && !closed && !waiting && lore.on && entry !== null);
 
   $effect(() => {
     if (!passage) {
@@ -66,16 +70,33 @@
       .catch(() => {});
   }
 
-  // One passage when an answer starts, the next every few seconds while it is written.
+  // Each answer is a turn: its × holds until it ends, approvals included.
   $effect(() => {
     if (!answering) {
       return;
     }
     const mine = ++turn;
     live = true;
+    untrack(() => (closed = false));
+    return () => {
+      live = false;
+      setTimeout(() => {
+        if (turn === mine) {
+          open = false;
+        }
+      }, LINGER);
+    };
+  });
+
+  // One passage when Kelpy starts thinking, at the start of an answer or after an approval, the next every few
+  // seconds while it thinks. Declared after the turn's effect, so `turn` is already this answer's.
+  $effect(() => {
+    if (!answering || waiting) {
+      return;
+    }
+    const mine = turn;
     untrack(() => {
-      closed = false;
-      if (lore.on) {
+      if (lore.on && !closed) {
         draw(mine);
       }
     });
@@ -84,15 +105,7 @@
         draw(mine);
       }
     }, EVERY);
-    return () => {
-      live = false;
-      clearInterval(cycle);
-      setTimeout(() => {
-        if (turn === mine) {
-          open = false;
-        }
-      }, LINGER);
-    };
+    return () => clearInterval(cycle);
   });
 
   function turnOff() {

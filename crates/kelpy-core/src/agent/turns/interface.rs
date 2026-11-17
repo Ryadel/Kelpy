@@ -110,7 +110,9 @@ you answer in. Promise no Kelpy feature, version or date beyond what is describe
 Kelpy runs on this server, started by the administrator for this session: it stops when they stop it. Conversations \
 are kept in Kelpy's data folder and survive a restart. What you read on the system is sent to the AI service with \
 the conversation. Files that may hold secrets (private keys, `.env` files, password stores, Kelpy's own data) are \
-never shown to you. Your actions run as the account that started Kelpy, {account}. {rights} An action \
+never shown to you, even with the administrator's consent; with System access Full, `edit_file` and `write_file` \
+change them, Kelpy's own data aside, without showing them, and each change of an existing one asks the \
+administrator, in Auto too. Your actions run as the account that started Kelpy, {account}. {rights} An action \
 not approved within 30 minutes counts as denied. One answer may use the tools up to 20 times. If Kelpy stops while \
 a change is under way, its outcome is uncertain: it is never run again by itself. Secrets you generate last until \
 Kelpy stops, unless the administrator keeps them in the vault.",

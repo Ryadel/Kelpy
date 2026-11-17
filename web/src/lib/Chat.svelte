@@ -686,7 +686,7 @@
       {/if}
       </div>
       <div class="mx-auto w-full max-w-conversation px-4 pb-3">
-        <LoreBand answering={running} />
+        <LoreBand answering={running} waiting={waitingApproval} />
         {@render messageBox()}
         <p class="text-muted-foreground mt-2 text-center text-xs">Enter sends, Shift+Enter starts a new line.</p>
       </div>

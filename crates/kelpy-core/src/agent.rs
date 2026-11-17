@@ -1715,6 +1715,17 @@ mod tests {
         };
         let told = instructions(full, Looking::Yes, &kelpy_tools::Account::current(), None);
         assert!(told.contains(CHANGING) && !told.contains(LOOKING));
+        // Files that may hold secrets: the rule by its aim, what shows nothing allowed, consent no exception.
+        for rule in [LOOKING, CHANGING] {
+            assert!(rule.contains("must never reach the AI service"), "{rule}");
+            assert!(rule.contains("Never count a pattern on a value"), "{rule}");
+            assert!(rule.contains("consent does not change this"), "{rule}");
+            assert!(
+                !rule.contains("Never use a command to read files"),
+                "{rule}"
+            );
+        }
+        assert!(CHANGING.contains("use `edit_file`, never a command"));
         for (looking, words) in [
             (Looking::NotAllowed, "System access is None"),
             (Looking::Unsupported, "This model cannot use tools"),
@@ -2857,10 +2868,6 @@ mod tests {
                     "content": "<?php define('DB_PASSWORD', '{{secret:wp_db}}');\n",
                 }),
             ),
-            calling(
-                "edit_file",
-                &json!({ "reason": "x", "path": config, "old": "DB_", "new": "X_" }),
-            ),
         ] {
             server.respond_once(CHAT, "200 OK", queued);
         }
@@ -2890,10 +2897,6 @@ mod tests {
                 .iter()
                 .all(|action| action.state != ActionState::Waiting)
         );
-        // A secret file is written whole, never edited.
-        let edit = actions.last().unwrap();
-        assert_eq!(edit.state, ActionState::Failed);
-        assert!(edit.error.as_deref().unwrap().contains("may hold secrets"));
         let stored = serde_json::to_string(&agent.messages(session.id).await.unwrap()).unwrap();
         assert!(!stored.contains(value));
         for request in chat_requests(&server) {
@@ -2906,6 +2909,76 @@ mod tests {
             "{report}"
         );
         assert!(!report.contains(value));
+    }
+
+    #[tokio::test]
+    async fn a_secret_file_is_edited_blind_and_asks_even_in_auto_what_it_finds_included() {
+        let (dir, folder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let env = folder.path().join(".env");
+        let content = "DB_HOST=old-db\nDB_PASSWORD=hunter2\nCACHE_HOST=old-db\n";
+        fs::write(&env, content).unwrap();
+        let server = model("Done.").await;
+        for queued in [
+            calling(
+                "edit_file",
+                &json!({ "reason": "New host", "path": env, "old": "old-db", "new": "new-db", "all": true }),
+            ),
+            calling(
+                "edit_file",
+                &json!({ "reason": "Guess", "path": env, "old": "DB_PASSWORD=letmein", "new": "x" }),
+            ),
+        ] {
+            server.respond_once(CHAT, "200 OK", queued);
+        }
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let session = agent
+            .create_session(None, full(Approval::Auto))
+            .await
+            .unwrap();
+
+        let mut answer = agent.send(session.id, "Move the host", ()).await.unwrap();
+        // In Auto too, each asks: the administrator sees each text looked for.
+        let waiting = until(&mut answer, ActionState::Waiting).await;
+        let change = waiting.change.as_ref().unwrap();
+        assert!(
+            change.diff.contains("@@ line 1 @@\n-old-db\n+new-db\n"),
+            "{}",
+            change.diff
+        );
+        assert!(!change.diff.contains("hunter2"), "{}", change.diff);
+        assert!(change.floor.is_some());
+        agent
+            .decide(session.id, waiting.id, true, None)
+            .await
+            .unwrap();
+        let done = until(&mut answer, ActionState::Done).await;
+        assert!(
+            done.output.contains("2 occurrences replaced"),
+            "{}",
+            done.output
+        );
+        assert_eq!(
+            fs::read_to_string(&env).unwrap(),
+            "DB_HOST=new-db\nDB_PASSWORD=hunter2\nCACHE_HOST=new-db\n"
+        );
+        // A text that does not occur is told only once approved: denied, the model learns nothing of the file.
+        let guess = until(&mut answer, ActionState::Waiting).await;
+        let notes = &guess.change.as_ref().unwrap().notes;
+        assert!(notes[0].contains("cannot be made"), "{notes:?}");
+        agent
+            .decide(session.id, guess.id, false, None)
+            .await
+            .unwrap();
+        collect(answer).await;
+        let requests = chat_requests(&server);
+        assert!(!requests.iter().any(|request| request.contains("hunter2")));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.contains("does not occur"))
+        );
+        let stored = serde_json::to_string(&agent.messages(session.id).await.unwrap()).unwrap();
+        assert!(!stored.contains("hunter2"));
     }
 
     #[tokio::test]

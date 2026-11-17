@@ -155,6 +155,7 @@ impl Server {
             work: Work::ChangeFile(Box::new(FileChange {
                 path,
                 edit: Edit::Write(content),
+                sensitive: false,
                 planned: None,
             })),
             already: None,

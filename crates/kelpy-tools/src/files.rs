@@ -200,6 +200,40 @@ pub(crate) fn is_secret(path: &Path) -> bool {
             && folders.ends_with(&["system32".to_owned(), "config".to_owned()]))
 }
 
+/// Whether a file's text looks like it holds credentials, whatever its name, as an appsettings.json or a web.config
+/// may: a key such as a password, a secret, a connection string, an API or access key given a value (`Password=`,
+/// `"ApiKey": `, `client_secret:`, `<password>`), or a private key block. A word alone is not enough:
+/// `PasswordAuthentication no` names no password. The model can still say a file is sensitive.
+pub(crate) fn holds_credentials(text: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "password",
+        "passwd",
+        "pwd",
+        "secret",
+        "connectionstring",
+        "connection_string",
+        "apikey",
+        "api_key",
+        "api-key",
+        "accesskey",
+        "access_key",
+        "privatekey",
+        "private_key",
+    ];
+    let lower = text.to_lowercase();
+    if lower.contains("private key-----") {
+        return true;
+    }
+    KEYS.iter().any(|key| {
+        lower.match_indices(key).any(|(at, _)| {
+            // The key, maybe plural, maybe closing its quotes, then its value.
+            let rest = lower[at + key.len()..].trim_start_matches('s');
+            let rest = rest.trim_start_matches(['"', '\'']).trim_start();
+            rest.starts_with(['=', ':', '>'])
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +274,30 @@ mod tests {
             "/srv/app/environment.md",
         ] {
             assert!(!is_secret(Path::new(plain)), "{plain}");
+        }
+    }
+
+    #[test]
+    fn credentials_are_recognised_by_a_key_given_a_value() {
+        for holding in [
+            r#"{ "ConnectionStrings": { "Db": "Server=db;User Id=app;Password=x" } }"#,
+            r#"<connectionStrings><add name="Db" connectionString="Server=db" /></connectionStrings>"#,
+            r#"{ "Smtp": { "ApiKey": "x" } }"#,
+            "client_secret: x",
+            "DB_PASSWORD = x",
+            "<password>x</password>",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "aws_secret_access_key = x",
+        ] {
+            assert!(holds_credentials(holding), "{holding}");
+        }
+        for plain in [
+            "PasswordAuthentication no",
+            "# Set the password with passwd",
+            r#"{ "Logging": { "LogLevel": { "Default": "Information" } } }"#,
+            "server { listen 80; root /var/www; }",
+        ] {
+            assert!(!holds_credentials(plain), "{plain}");
         }
     }
 
