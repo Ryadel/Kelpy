@@ -345,6 +345,10 @@ export type RuntimeEvent =
   | { type: 'connections_changed' }
   /** The provider, or what it needs to answer, changed: read it again. */
   | { type: 'provider_changed' }
+  /** The administrator's likely next message, written after the answer `after`. */
+  | { type: 'suggestion'; session_id: number; after: number; text: string }
+  /** Suggesting the next message was turned on or off. */
+  | { type: 'suggestions_changed'; enabled: boolean }
   /** Restarting as administrator became possible, started, or failed: read it again. */
   | { type: 'elevation_changed' }
   /** Some events were missed: read again everything shown. */
@@ -505,6 +509,12 @@ export const chooseMemory = async (use: MemoryUse): Promise<{ restarts: boolean;
 };
 
 export const fetchProvider = () => json<ProviderInfo>('/api/provider');
+
+/** Whether the next message is suggested after each answer, for every conversation. */
+export const fetchSuggestions = () => json<{ enabled: boolean }>('/api/suggestions');
+
+export const saveSuggestions = (enabled: boolean) =>
+  json<{ enabled: boolean }>('/api/suggestions', { method: 'PUT', body: JSON.stringify({ enabled }) });
 
 export const saveProvider = (update: ProviderUpdate) =>
   json<ProviderInfo>('/api/provider', {

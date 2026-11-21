@@ -11,15 +11,20 @@ use serde_json::json;
 use crate::Banner;
 use crate::history::{self, Recall};
 use crate::model::{
-    Action, ActionState, ChatEvent, Connection, ContextUse, Conversation, Message, ProviderState,
-    Role, RuntimeEvent, Session, Status,
+    Action, ActionState, ChatEvent, Connection, ContextUse, Conversation, Message, ProviderInfo,
+    ProviderState, Role, RuntimeEvent, Session, Status, provider_state,
 };
+use crate::setup::{self, Call, Lack, Reply, Setup};
 use crate::ui::WIDE;
 
 /// What the terminal UI asks of the runtime.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     LoadProvider,
+    /// Reads whether the next message is suggested.
+    LoadSuggestions,
+    /// Turns suggesting the next message on or off, for every interface.
+    SetSuggestions(bool),
     LoadConnections,
     DecideConnection {
         id: u64,
@@ -55,6 +60,12 @@ pub enum Effect {
         session: i64,
         change: serde_json::Value,
     },
+    /// A request of the setup window `setup`, for its step `ticket`.
+    Setup {
+        setup: u64,
+        ticket: u64,
+        call: Call,
+    },
     /// Ends the terminal UI.
     Exit(Exit),
 }
@@ -71,7 +82,15 @@ pub enum Exit {
 /// What comes back from the runtime.
 #[derive(Debug, Clone)]
 pub enum Update {
-    Provider(ProviderState),
+    Provider(ProviderInfo),
+    /// The runtime's answer to a request of the setup window `setup`, for its step `ticket`.
+    Setup {
+        setup: u64,
+        ticket: u64,
+        reply: Reply,
+    },
+    /// Whether the next message is suggested after each answer.
+    Suggestions(bool),
     /// The remote connections waiting for a decision.
     Connections(Vec<Connection>),
     Sessions {
@@ -112,6 +131,14 @@ pub enum Focus {
 pub struct App {
     pub banner: Banner,
     pub provider: ProviderState,
+    /// What the runtime said of the provider last, for the setup window.
+    provider_info: Option<ProviderInfo>,
+    /// What the provider lacked when last read: the setup opens by itself when that changes to something lacking.
+    lacked: Option<Lack>,
+    /// The setup window, open: Ctrl+P opens it and closes it.
+    pub setup: Option<Setup>,
+    /// Raised by each setup window opened: answers for one closed are dropped.
+    setups: u64,
     /// Remote connections waiting for a decision: Ctrl+Y and Ctrl+N decide the first.
     pub connections: Vec<Connection>,
     pub sessions: Vec<Session>,
@@ -136,6 +163,12 @@ pub struct App {
     recall: Recall,
     pub focus: Focus,
     pub notice: Option<String>,
+    /// Whether Kelpy suggests the next message after each answer: F5 turns it on or off, for every interface.
+    pub suggestions: bool,
+    /// The latest suggestion of each conversation: the answer it follows and its text. Shown while that answer is the
+    /// conversation's last message and the box is empty; typing over it drops it. One per conversation, so that a
+    /// suggestion for another conversation never replaces the open one's.
+    suggestions_by: HashMap<i64, (i64, String)>,
     /// How many lines the conversation is scrolled up from its end.
     pub scroll: usize,
     /// Quitting asks first: it stops Kelpy while an answer is being written.
@@ -189,6 +222,10 @@ impl App {
         Self {
             banner,
             provider: ProviderState::default(),
+            provider_info: None,
+            lacked: None,
+            setup: None,
+            setups: 0,
             connections: Vec::new(),
             sessions: Vec::new(),
             selected: None,
@@ -203,6 +240,8 @@ impl App {
             recall: Recall::default(),
             focus: Focus::Message,
             notice: None,
+            suggestions: false,
+            suggestions_by: HashMap::new(),
             scroll: 0,
             confirming_quit: false,
             stops_runtime,
@@ -226,7 +265,24 @@ impl App {
             Effect::LoadProvider,
             Effect::LoadSessions(self.listing),
             Effect::LoadConnections,
+            Effect::LoadSuggestions,
         ]
+    }
+
+    /// The suggested next message, while it shows: in the empty box of its conversation, after its answer.
+    pub fn suggested(&self) -> Option<&str> {
+        let (after, text) = self.suggestions_by.get(&self.selected?)?;
+        let current = self.input.is_empty()
+            && !self.running()
+            && self.messages.last().is_some_and(|last| last.id == *after);
+        current.then_some(text.as_str())
+    }
+
+    /// Typing over the open conversation's suggestion drops it.
+    fn drop_suggestion(&mut self) {
+        if let Some(id) = self.selected {
+            self.suggestions_by.remove(&id);
+        }
     }
 
     /// Reads conversation `id` from now on.
@@ -321,6 +377,10 @@ impl App {
             };
         }
         self.notice = None;
+        let quit = control && matches!(key.code, KeyCode::Char('c' | 'q'));
+        if self.setup.is_some() && !quit {
+            return self.setup_key(key);
+        }
         match key.code {
             KeyCode::Char('c' | 'q') if control => {
                 if self.stops_runtime && !self.answering.is_empty() {
@@ -330,6 +390,7 @@ impl App {
                     vec![Effect::Exit(Exit::Quit)]
                 }
             }
+            KeyCode::Char('p') if control => self.open_setup(),
             KeyCode::Char('y') if control => self.decide(true),
             KeyCode::Char('n') if control => self.decide(false),
             KeyCode::Char('o') if control && self.opens_links => {
@@ -369,6 +430,7 @@ impl App {
                 }
             }),
             KeyCode::F(4) => self.change_modes(|modes| modes.explanations = !modes.explanations),
+            KeyCode::F(5) => vec![Effect::SetSuggestions(!self.suggestions)],
             KeyCode::PageUp => {
                 self.scroll += 10;
                 Vec::new()
@@ -384,9 +446,93 @@ impl App {
         }
     }
 
-    /// Text pasted in the terminal goes to the message.
-    pub fn paste(&mut self, text: &str) {
+    /// The keys while the setup window is open: a connection waiting is still decided, Ctrl+O opens the address the
+    /// setup shows, Ctrl+P closes it; the others are the setup's.
+    fn setup_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('y') if control && !self.connections.is_empty() => self.decide(true),
+            KeyCode::Char('n') if control && !self.connections.is_empty() => self.decide(false),
+            KeyCode::Char('p') if control => self.setup_calls(vec![Call::Close]),
+            KeyCode::Char('o') if control => {
+                let link = self.setup.as_ref().and_then(Setup::link);
+                match link.filter(|_| self.opens_links) {
+                    Some(link) => vec![Effect::OpenLink(link.to_owned())],
+                    None => Vec::new(),
+                }
+            }
+            _ => {
+                let calls = self.setup.as_mut().map(|open| open.key(key));
+                self.setup_calls(calls.unwrap_or_default())
+            }
+        }
+    }
+
+    /// Opens the setup window from its first question, reading the choices first if they were not read yet.
+    fn open_setup(&mut self) -> Vec<Effect> {
+        let loading = self.provider_info.is_none();
+        let mut effects = self.show_setup(Setup::new(self.provider_info.clone()), Vec::new());
+        if loading {
+            effects.push(Effect::LoadProvider);
+        }
+        effects
+    }
+
+    fn show_setup(&mut self, setup: Setup, calls: Vec<Call>) -> Vec<Effect> {
+        self.setups += 1;
+        self.setup = Some(setup);
         self.focus = Focus::Message;
+        self.overlay = false;
+        self.setup_calls(calls)
+    }
+
+    /// The setup's requests, for the runtime; closing the window closes it here, and stops what it followed.
+    fn setup_calls(&mut self, calls: Vec<Call>) -> Vec<Effect> {
+        let Some(open) = &self.setup else {
+            return Vec::new();
+        };
+        let (setup, ticket) = (self.setups, open.ticket);
+        let mut effects = Vec::new();
+        for call in calls {
+            let call = if call == Call::Close {
+                self.setup = None;
+                Call::Stop
+            } else {
+                call
+            };
+            effects.push(Effect::Setup {
+                setup,
+                ticket,
+                call,
+            });
+        }
+        effects
+    }
+
+    /// The runtime's view of the provider: the setup opens by itself when the provider newly lacks something.
+    fn provider_read(&mut self, info: ProviderInfo) -> Vec<Effect> {
+        self.provider = provider_state(&info);
+        let lack = setup::lack(&info);
+        let mut effects = Vec::new();
+        if let Some(open) = &mut self.setup {
+            open.loaded(info.clone());
+        } else if let Some(missing) = lack.filter(|_| lack != self.lacked) {
+            let (opened, calls) = Setup::lacking(info.clone(), missing);
+            effects = self.show_setup(opened, calls);
+        }
+        self.lacked = lack;
+        self.provider_info = Some(info);
+        effects
+    }
+
+    /// Text pasted in the terminal goes to the message, or to the setup window's field while it is open.
+    pub fn paste(&mut self, text: &str) {
+        if let Some(open) = &mut self.setup {
+            open.paste(text);
+            return;
+        }
+        self.focus = Focus::Message;
+        self.drop_suggestion();
         self.input.push_str(&text.replace("\r\n", "\n"));
     }
 
@@ -443,7 +589,17 @@ impl App {
                 self.cursor = index + 1;
                 return self.select(Some(self.sessions[index].id));
             }
-            KeyCode::Char(char) if !control => self.input.push(char),
+            KeyCode::Tab if self.suggested().is_some() => {
+                if let Some((_, text)) =
+                    self.selected.and_then(|id| self.suggestions_by.remove(&id))
+                {
+                    self.input = text;
+                }
+            }
+            KeyCode::Char(char) if !control => {
+                self.drop_suggestion();
+                self.input.push(char);
+            }
             KeyCode::Enter
                 if key
                     .modifiers
@@ -535,7 +691,23 @@ impl App {
 
     pub fn apply(&mut self, update: Update) -> Vec<Effect> {
         match update {
-            Update::Provider(provider) => self.provider = provider,
+            Update::Provider(info) => return self.provider_read(info),
+            Update::Setup {
+                setup,
+                ticket,
+                reply,
+            } => {
+                let current = setup == self.setups;
+                let open = self
+                    .setup
+                    .as_mut()
+                    .filter(|open| current && open.ticket == ticket);
+                if let Some(open) = open {
+                    let calls = open.reply(reply);
+                    return self.setup_calls(calls);
+                }
+            }
+            Update::Suggestions(enabled) => self.suggestions = enabled,
             Update::Connections(connections) => self.connections = connections,
             Update::Sessions { listing, sessions } => {
                 // A conversation added or deleted since the read began: the list read is out of date.
@@ -714,6 +886,7 @@ impl App {
             }
             RuntimeEvent::SessionChanged { session } => self.upsert(session),
             RuntimeEvent::SessionDeleted { id } => {
+                self.suggestions_by.remove(&id);
                 self.listing += 1;
                 self.sessions.retain(|session| session.id != id);
                 self.cursor = self.cursor.min(self.sessions.len());
@@ -738,6 +911,19 @@ impl App {
                     self.context = context.or(self.context);
                 }
             }
+            RuntimeEvent::Suggestion {
+                session_id,
+                after,
+                text,
+            } => {
+                self.suggestions_by.insert(session_id, (after, text));
+            }
+            RuntimeEvent::SuggestionsChanged { enabled } => {
+                self.suggestions = enabled;
+                if !enabled {
+                    self.suggestions_by.clear();
+                }
+            }
             RuntimeEvent::ProviderChanged => return vec![Effect::LoadProvider],
             RuntimeEvent::ConnectionsChanged => return vec![Effect::LoadConnections],
             RuntimeEvent::Resync => {
@@ -746,6 +932,7 @@ impl App {
                     Effect::LoadProvider,
                     Effect::LoadSessions(self.listing),
                     Effect::LoadConnections,
+                    Effect::LoadSuggestions,
                 ]
                 .into_iter()
                 .chain(read)
@@ -842,6 +1029,176 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_suggested_message_shows_in_the_empty_box_and_tab_takes_it() {
+        let mut app = App::new(Banner::default(), true);
+        app.apply(Update::Sessions {
+            listing: 0,
+            sessions: vec![session(1, 1)],
+        });
+        let [Effect::Open { id: 1, read, since }] = app.select(Some(1))[..] else {
+            panic!()
+        };
+        app.apply(Update::Conversation {
+            id: 1,
+            read,
+            since,
+            conversation: Conversation {
+                messages: vec![
+                    message(10, Role::User, "502?"),
+                    message(11, Role::Assistant, "Fixed."),
+                ],
+                running: false,
+                context: None,
+            },
+        });
+        // For another answer, or another conversation: not shown.
+        for (session_id, after) in [(1, 10), (2, 11)] {
+            app.apply(Update::Runtime(RuntimeEvent::Suggestion {
+                session_id,
+                after,
+                text: "Why?".into(),
+            }));
+            assert_eq!(app.suggested(), None);
+        }
+        app.apply(Update::Runtime(RuntimeEvent::Suggestion {
+            session_id: 1,
+            after: 11,
+            text: "Check the logs".into(),
+        }));
+        assert_eq!(app.suggested(), Some("Check the logs"));
+        // Another conversation's suggestion does not replace this one's.
+        app.apply(Update::Runtime(RuntimeEvent::Suggestion {
+            session_id: 2,
+            after: 30,
+            text: "Elsewhere".into(),
+        }));
+        assert_eq!(app.suggested(), Some("Check the logs"));
+        assert!(app.key(key(KeyCode::Tab)).is_empty());
+        assert_eq!(
+            (app.input.as_str(), app.suggested()),
+            ("Check the logs", None)
+        );
+
+        // Typing over it drops it, even once the box is empty again.
+        app.input.clear();
+        app.apply(Update::Runtime(RuntimeEvent::Suggestion {
+            session_id: 1,
+            after: 11,
+            text: "Check the logs".into(),
+        }));
+        app.key(key(KeyCode::Char('x')));
+        app.key(key(KeyCode::Backspace));
+        assert_eq!(app.suggested(), None);
+
+        // F5 asks to turn them off; turned off, the suggestion goes.
+        assert_eq!(app.key(key(KeyCode::F(5))), [Effect::SetSuggestions(true)]);
+        app.apply(Update::Runtime(RuntimeEvent::Suggestion {
+            session_id: 1,
+            after: 11,
+            text: "Again".into(),
+        }));
+        app.apply(Update::Runtime(RuntimeEvent::SuggestionsChanged {
+            enabled: false,
+        }));
+        assert_eq!(app.suggested(), None);
+    }
+
+    #[test]
+    fn the_setup_opens_by_itself_once_for_what_is_lacking_and_takes_the_keys() {
+        let mut app = App::new(Banner::default(), true);
+        let none = crate::setup::tests::info(json!(null), None);
+        assert!(app.apply(Update::Provider(none.clone())).is_empty());
+        assert!(app.setup.is_some());
+        // Typing goes to the setup, never to the message: a key pasted stays out of the message box.
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::Enter));
+        app.key(key(KeyCode::Enter));
+        app.paste("sk-secret");
+        app.key(key(KeyCode::Char('x')));
+        assert_eq!(app.input, "");
+        // Closed, it does not open again while the same thing is lacking.
+        assert!(matches!(
+            app.key(control('p'))[..],
+            [Effect::Setup {
+                call: Call::Stop,
+                ..
+            }]
+        ));
+        assert!(app.setup.is_none());
+        app.apply(Update::Provider(none));
+        assert!(app.setup.is_none());
+
+        // The ChatGPT sign-in ends later: it opens again, at the sign-in.
+        let chatgpt = crate::setup::tests::info(
+            json!({"kind": "chatgpt", "service": "chatgpt", "model": "gpt-5.5"}),
+            Some("sign_in"),
+        );
+        let effects = app.apply(Update::Provider(chatgpt));
+        let [
+            Effect::Setup {
+                setup,
+                ticket,
+                call: Call::ChatGptStatus,
+            },
+        ] = effects[..]
+        else {
+            panic!("{effects:?}")
+        };
+        // An answer for another window, or another step, is dropped.
+        let status = |signed_in| {
+            Reply::ChatGpt(
+                serde_json::from_value(
+                    json!({"signed_in": signed_in, "registered": null, "kept": false}),
+                )
+                .unwrap(),
+            )
+        };
+        for (setup, ticket) in [(setup - 1, ticket), (setup, ticket + 1)] {
+            app.apply(Update::Setup {
+                setup,
+                ticket,
+                reply: status(json!(null)),
+            });
+        }
+        assert_eq!(
+            app.setup.as_ref().unwrap().view(false).title,
+            "ChatGPT plan"
+        );
+        app.apply(Update::Setup {
+            setup,
+            ticket,
+            reply: status(json!(null)),
+        });
+        assert_eq!(
+            app.setup.as_ref().unwrap().view(false).title,
+            "ChatGPT plan · Sign in"
+        );
+        // Ctrl+O opens the code's address only where this computer has a browser.
+        assert!(app.key(control('o')).is_empty());
+    }
+
+    #[test]
+    fn ctrl_p_opens_the_setup_reading_the_choices_first() {
+        let mut app = App::new(Banner::default(), true);
+        let effects = app.key(control('p'));
+        assert_eq!(effects, [Effect::LoadProvider]);
+        assert_eq!(
+            app.setup.as_ref().unwrap().view(false).title,
+            "Connect to AI"
+        );
+        let configured = crate::setup::tests::info(
+            json!({"kind": "ollama", "service": "ollama", "model": "qwen3.5:9b"}),
+            None,
+        );
+        app.apply(Update::Provider(configured));
+        let view = app.setup.as_ref().unwrap().view(false);
+        assert_eq!(view.title, "How does Kelpy connect to AI?");
+        assert!(format!("{view:?}").contains("In use: qwen3.5:9b (Ollama)."));
+        // Ctrl+C still quits.
+        assert_eq!(app.key(control('c')), [Effect::Exit(Exit::Quit)]);
+    }
+
+    #[test]
     fn a_first_message_creates_a_conversation_with_the_chosen_modes() {
         let mut app = App::new(Banner::default(), true);
         assert_eq!(
@@ -897,11 +1254,13 @@ pub(crate) mod tests {
     #[test]
     fn a_message_kelpy_would_refuse_is_kept_and_why_is_said() {
         let mut app = App::new(Banner::default(), true);
-        app.apply(Update::Provider(ProviderState {
-            label: "No AI provider".into(),
-            problem: Some("choose one in the Web UI or run `kelpy provider`".into()),
-            configured: false,
-        }));
+        app.apply(Update::Provider(
+            serde_json::from_value(json!({"configured": null})).unwrap(),
+        ));
+        // Opened by itself, and closed.
+        assert!(app.setup.is_some());
+        app.key(key(KeyCode::Esc));
+        assert!(app.setup.is_none());
         for char in "uptime?".chars() {
             app.key(key(KeyCode::Char(char)));
         }
@@ -910,9 +1269,7 @@ pub(crate) mod tests {
         assert_eq!(app.selected, None);
         assert_eq!(
             app.notice.as_deref(),
-            Some(
-                "No AI provider configured yet: choose one in the Web UI or run 'kelpy provider'."
-            )
+            Some("No AI provider configured yet: press Ctrl+P to set one up.")
         );
     }
 
@@ -1186,7 +1543,7 @@ pub(crate) mod tests {
     #[test]
     fn a_list_read_before_a_conversation_was_added_or_deleted_is_read_again() {
         let mut app = App::new(Banner::default(), false);
-        let [_, read, _] = &app.start()[..] else {
+        let [_, read, _, _] = &app.start()[..] else {
             panic!()
         };
         assert_eq!(read, &Effect::LoadSessions(0));

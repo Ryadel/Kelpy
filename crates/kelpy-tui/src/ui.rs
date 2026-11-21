@@ -18,6 +18,7 @@ use crate::Capabilities;
 use crate::app::{App, Focus, Modes};
 use crate::mark::{Kelpie, Mark, Wordmark};
 use crate::model::{Action, ContextUse};
+use crate::setup_ui;
 use crate::theme::Theme;
 use crate::transcript::{Fact, Transcript, fact_lines, facts, tail, unquoted, wrap};
 
@@ -45,6 +46,14 @@ pub fn draw(frame: &mut Frame, app: &App, transcript: &mut Transcript, terminal:
     if app.focus == Focus::Conversations {
         conversations(frame, app, terminal.theme, area);
     }
+    if let Some(setup) = &app.setup {
+        // Over all but the last row, which says what else waits.
+        let over = Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        setup_ui::window(frame, &setup.view(app.opens_links), terminal.theme, over);
+    }
 }
 
 /// The footer of the terminal UI inline, all it draws: what is under way (`live`), a rule, the message box or the
@@ -52,6 +61,20 @@ pub fn draw(frame: &mut Frame, app: &App, transcript: &mut Transcript, terminal:
 pub fn draw_inline(frame: &mut Frame, app: &App, terminal: Capabilities, live: Vec<Line<'static>>) {
     let area = frame.area();
     let theme = terminal.theme;
+    if let Some(setup) = &app.setup {
+        // The last row says what else waits, if anything; else the setup's keys.
+        let other = !app.connections.is_empty() || app.confirming_quit || app.notice.is_some();
+        setup_ui::footer(frame, &setup.view(app.opens_links), theme, area, !other);
+        if other {
+            let last = Rect {
+                y: area.bottom().saturating_sub(1),
+                height: 1.min(area.height),
+                ..area
+            };
+            key_line(frame, app, theme, last);
+        }
+        return;
+    }
     if app.focus == Focus::Conversations {
         conversations(frame, app, theme, area);
         return;
@@ -214,7 +237,7 @@ fn status_line(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
         } else {
             "Ctrl+C quit"
         };
-        Span::styled(format!("Ctrl+R conversations · {quit}"), dim)
+        Span::styled(format!("Ctrl+P AI · Ctrl+R conversations · {quit}"), dim)
     };
     let access = Span::styled(
         access_name(modes.access),
@@ -660,6 +683,7 @@ fn side_panel(frame: &mut Frame, app: &App, theme: Theme, area: Rect, over: bool
         Line::from(vec![Span::styled(format!("{name:<10}"), dim), value])
     };
     lines.push(row("Model", Span::styled(app.provider.label.clone(), text)));
+    lines.push(row("", Span::styled("Ctrl+P change", dim)));
     if let Some(problem) = &app.provider.problem {
         lines.extend(
             wrap(&unquoted(problem), width)
@@ -812,7 +836,9 @@ fn message_box(
     let prompt = Span::styled("› ", Style::new().fg(theme.accent()).bold());
     let mut lines = vec![Line::raw("")];
     if app.input.is_empty() {
-        let hint = if app.starting() && !app.sessions.is_empty() {
+        let hint = if let Some(suggested) = app.suggested() {
+            suggested
+        } else if app.starting() && !app.sessions.is_empty() {
             "Write, or press a number to continue"
         } else if app.starting() {
             "What do you need to do?"
@@ -854,6 +880,8 @@ fn message_box(
         "Esc stop the answer".to_owned()
     } else if app.waiting().is_some() {
         "A decision waits".to_owned()
+    } else if app.suggested().is_some() {
+        "Tab use the suggestion".to_owned()
     } else {
         format!("Enter send · {} new line", terminal.newline_key())
     };
@@ -919,9 +947,22 @@ fn key_line(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
             format!(" {}", unquoted(notice)),
             Style::new().fg(theme.bad()).bold(),
         )
+    } else if app.setup.is_some() {
+        let quit = if app.stops_runtime {
+            "Ctrl+C stop Kelpy"
+        } else {
+            "Ctrl+C quit"
+        };
+        Line::styled(
+            format!(" Ctrl+P close the setup · {quit}"),
+            Style::new().fg(theme.dim()),
+        )
     } else {
         // The keys that matter now first, then as many others as fit whole, and how to quit.
         let mut keys = Vec::new();
+        if app.provider.problem.is_some() {
+            keys.push("Ctrl+P set up AI");
+        }
         if app.running() {
             keys.push("Esc stop the answer");
         }
@@ -932,10 +973,18 @@ fn key_line(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
             keys.push("Ctrl+O open the Web UI");
         }
         keys.push("Ctrl+R conversations");
+        if app.provider.problem.is_none() {
+            keys.push("Ctrl+P AI");
+        }
         if !app.starting() {
             keys.push("Ctrl+B panel");
         }
         keys.extend(["F2 access", "F4 explanations"]);
+        keys.push(if app.suggestions {
+            "F5 suggestions on"
+        } else {
+            "F5 suggestions off"
+        });
         if !app.starting() {
             keys.push("PgUp/PgDn scroll");
         }

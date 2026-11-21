@@ -1,5 +1,6 @@
 //! The provider setup in the terminal: the questions of the Web UI's setup, asked of the running Kelpy, which keeps
-//! the API key or the sign-in in memory.
+//! the API key or the sign-in in memory. The questions, their order and the requests are shared with the terminal
+//! UI's setup window ([`kelpy_client::setup`]); this module asks them as lines in a terminal.
 //!
 //! The questions block on the terminal, so the setup runs on a thread of its own, with a small runtime for its
 //! requests.
@@ -12,86 +13,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use reqwest::Method;
+use futures_util::StreamExt;
+pub(crate) use kelpy_client::setup::lifetime;
+use kelpy_client::setup::{
+    self, Chosen, CodeEvent, Download, Installation, KEEP_WARNING, KindInfo, OLLAMA_DOWNLOAD,
+    OllamaProblem, ProviderInfo, SHOWN_MODELS, SIGN_IN_MINUTES, Service, SignInMethod, gigabytes,
+    key_question, matching, model_options, ollama_options, qr_code,
+};
+use kelpy_client::{Client, Method};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tokio::runtime::Runtime;
 
 use crate::prompt;
-use kelpy_client::Client;
 
-/// How long a sign-in with ChatGPT may take in the browser, as the runtime allows.
-const SIGN_IN_TIME: Duration = Duration::from_secs(10 * 60);
-/// The most models listed at once: a longer list is searched by part of the name instead.
-const SHOWN_MODELS: usize = 20;
-
-#[derive(Deserialize)]
-struct ProviderInfo {
-    configured: Option<Configured>,
-    kinds: Vec<KindInfo>,
-    ways: Vec<WayInfo>,
-    services: Vec<Service>,
-    sign_in_methods: Vec<SignInMethod>,
-}
-
-#[derive(Deserialize)]
-struct SignInMethod {
-    id: String,
-    name: String,
-    pros: String,
-    cons: String,
-    recommended: String,
-}
-
-#[derive(Deserialize)]
-struct Configured {
-    kind: String,
-    model: String,
-    service: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct KindInfo {
-    id: String,
-    default_base_url: Option<String>,
-    key_variable: Option<String>,
-    accepts_key: bool,
-    requires_key: bool,
-    key_in_environment: bool,
-}
-
-#[derive(Deserialize)]
-struct WayInfo {
-    id: String,
-    name: String,
-    description: String,
-}
-
-#[derive(Deserialize)]
-struct Service {
-    id: String,
-    name: String,
-    way: String,
-    kind: String,
-    base_url: Option<String>,
-    description: String,
-    key_page: Option<String>,
-    steps: Vec<String>,
-    models: Vec<String>,
-}
-
-/// The models a setup offers, as the runtime lists them.
-#[derive(Deserialize)]
-struct ModelList {
-    models: Vec<ModelChoice>,
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ModelChoice {
-    id: String,
-    recommended: bool,
-}
+/// How long a sign-in as an agent may take in the browser, as the runtime allows.
+const SIGN_IN_TIME: Duration = Duration::from_secs(SIGN_IN_MINUTES * 60);
 
 /// An answer to "Model:".
 enum ModelOption {
@@ -99,81 +34,6 @@ enum ModelOption {
     /// Search the service's list, of this many models.
     Search(usize),
     Another,
-}
-
-#[derive(Deserialize)]
-struct OllamaStatus {
-    base_url: String,
-    running: bool,
-    error: Option<String>,
-    installed: bool,
-    models: Vec<LocalModel>,
-    memory: Option<u64>,
-    suggestions: Vec<Suggestion>,
-}
-
-/// How Ollama would be installed, as `POST /api/ollama/install` shows it.
-#[derive(Deserialize)]
-struct Installer {
-    command: String,
-    notes: Vec<String>,
-}
-
-/// An installation's progress.
-#[derive(Deserialize)]
-struct Installation {
-    output: String,
-    done: bool,
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct LocalModel {
-    name: String,
-    size: u64,
-    #[serde(default)]
-    cloud: bool,
-}
-
-#[derive(Deserialize)]
-struct Suggestion {
-    name: String,
-    size: u64,
-    description: String,
-}
-
-#[derive(Deserialize)]
-struct Download {
-    status: String,
-    completed: u64,
-    total: u64,
-    done: bool,
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChatGptStatus {
-    signed_in: Option<Account>,
-    registered: Option<String>,
-    kept: bool,
-}
-
-#[derive(Deserialize)]
-struct Account {
-    email: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChatGptModel {
-    slug: String,
-    display_name: String,
-}
-
-/// What the setup chose.
-struct Chosen {
-    model: String,
-    base_url: Option<String>,
-    api_key: Option<String>,
 }
 
 /// Asks whether to set up the provider now, at a start without one, and runs the setup if so.
@@ -206,12 +66,8 @@ pub async fn configure(
     base_url: Option<String>,
     key_from: Option<String>,
 ) -> Result<()> {
-    let info: ProviderInfo = client.get("/api/provider").await?;
-    let Some(service) = info
-        .services
-        .iter()
-        .find(|candidate| candidate.id == service)
-    else {
+    let info = client.provider_info().await?;
+    let Some(service) = info.service(service) else {
         let known: Vec<&str> = info
             .services
             .iter()
@@ -235,13 +91,8 @@ pub async fn configure(
 
 /// Prints the provider in use.
 pub async fn show(client: &Client) -> Result<()> {
-    let info: ProviderInfo = client.get("/api/provider").await?;
-    match info.configured {
-        Some(configured) => println!(
-            "{} ({})",
-            configured.model,
-            configured.service.unwrap_or(configured.kind)
-        ),
+    match client.provider_info().await?.in_use() {
+        Some(in_use) => println!("{in_use}"),
         None => {
             println!("No AI provider is set up. Run `kelpy provider` in a terminal to set one up.")
         }
@@ -282,71 +133,32 @@ pub async fn import_agent(client: &Client, path: &Path) -> Result<()> {
 }
 
 async fn save(client: &Client, service: &Service, chosen: &Chosen) -> Result<()> {
-    let _: serde_json::Value = client
-        .send(
-            Method::PUT,
-            "/api/provider",
-            &json!({
-                "kind": service.kind,
-                "service": service.id,
-                "model": chosen.model,
-                "base_url": chosen.base_url,
-                "api_key": chosen.api_key,
-            }),
-        )
-        .await?;
+    client.save_provider(&chosen.request(service)).await?;
     println!("Provider saved: {} ({}).", chosen.model, service.name);
     Ok(())
 }
 
 struct Setup {
     client: Client,
-    runtime: Runtime,
+    runtime: tokio::runtime::Runtime,
 }
 
 impl Setup {
-    fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        Ok(self.runtime.block_on(self.client.get(path))?)
-    }
-
-    fn post<T: serde::de::DeserializeOwned>(
-        &self,
-        path: &str,
-        body: &serde_json::Value,
-    ) -> Result<T> {
-        Ok(self
-            .runtime
-            .block_on(self.client.send(Method::POST, path, body))?)
-    }
-
-    /// Forgets the agent registration: the next sign-in as an agent registers again, with any account.
-    fn forget_registration(&self) -> Result<()> {
-        self.runtime.block_on(
-            self.client
-                .delete::<serde::de::IgnoredAny>("/api/chatgpt/agent"),
-        )?;
-        Ok(())
+    fn wait<T>(&self, request: impl Future<Output = T>) -> T {
+        self.runtime.block_on(request)
     }
 
     fn run(&self) -> Result<()> {
-        let info: ProviderInfo = self.get("/api/provider")?;
-        if let Some(configured) = &info.configured {
-            println!(
-                "In use: {} ({}).",
-                configured.model,
-                configured.service.as_deref().unwrap_or(&configured.kind)
-            );
+        let info: ProviderInfo = self.wait(self.client.provider_info())?;
+        if let Some(in_use) = info.in_use() {
+            println!("In use: {in_use}.");
         }
         println!();
         println!("How does Kelpy connect to AI?");
         let way = pick(&info.ways, |way| {
             (way.name.clone(), Some(way.description.clone()))
         })?;
-        let services: Vec<&Service> = info
-            .services
-            .iter()
-            .filter(|service| service.way == way.id)
-            .collect();
+        let services = info.services_of(&way.id);
         let service = if services.len() == 1 {
             services[0]
         } else {
@@ -357,9 +169,7 @@ impl Setup {
             })?
         };
         let kind = info
-            .kinds
-            .iter()
-            .find(|kind| kind.id == service.kind)
+            .kind_of(service)
             .context("the runtime did not describe this kind of provider")?;
         println!();
         let chosen = match service.kind.as_str() {
@@ -374,7 +184,7 @@ impl Setup {
             "ollama" => self.ollama(service)?,
             _ => self.keyed(service, kind)?,
         };
-        self.runtime.block_on(save(&self.client, service, &chosen))
+        self.wait(save(&self.client, service, &chosen))
     }
 
     /// A service with an API key: the steps to get it, the address if the user gives it, the key and the model.
@@ -390,10 +200,10 @@ impl Setup {
         }
         println!();
 
-        let base_url = if service.base_url.is_none() && kind.default_base_url.is_none() {
+        let base_url = if setup::asks_address(service, kind) {
             loop {
                 let address = prompt::ask("API address, such as http://10.0.0.5:8000/v1", "")?;
-                if address.starts_with("http://") || address.starts_with("https://") {
+                if setup::is_address(&address) {
                     break Some(address);
                 }
                 println!("The address starts with http:// or https://.");
@@ -402,27 +212,21 @@ impl Setup {
             None
         };
 
-        let api_key = if kind.accepts_key {
-            let from_environment = kind
-                .key_variable
-                .as_deref()
-                .filter(|_| kind.key_in_environment);
-            let question = match from_environment {
-                Some(variable) => format!("API key, hidden; empty to use {variable}"),
-                None if kind.requires_key || service.way != "local" => "API key, hidden".to_owned(),
-                None => "API key, hidden; empty if the server needs none".to_owned(),
-            };
-            loop {
-                let key = prompt::secret(&question)?;
-                let needed =
-                    from_environment.is_none() && (kind.requires_key || service.way == "free");
-                if !key.is_empty() || !needed {
-                    break Some(key).filter(|key| !key.is_empty());
+        let api_key = match key_question(service, kind) {
+            Some(question) => {
+                let asked = match &question.note {
+                    Some(note) => format!("API key, hidden; {note}"),
+                    None => "API key, hidden".to_owned(),
+                };
+                loop {
+                    let key = prompt::secret(&asked)?;
+                    if !key.is_empty() || !question.needed {
+                        break Some(key).filter(|key| !key.is_empty());
+                    }
+                    println!("This service needs an API key.");
                 }
-                println!("This service needs an API key.");
             }
-        } else {
-            None
+            None => None,
         };
 
         let model = self.choose_model(service, base_url.as_deref(), api_key.as_deref())?;
@@ -441,38 +245,13 @@ impl Setup {
         base_url: Option<&str>,
         api_key: Option<&str>,
     ) -> Result<String> {
-        let query = json!({
-            "kind": service.kind, "service": service.id, "base_url": base_url, "api_key": api_key,
-        });
-        let list = self
-            .runtime
-            .block_on(
-                self.client
-                    .send::<ModelList>(Method::POST, "/api/provider/models", &query),
-            )
-            .unwrap_or_else(|error| ModelList {
-                models: service
-                    .models
-                    .iter()
-                    .map(|id| ModelChoice {
-                        id: id.clone(),
-                        recommended: true,
-                    })
-                    .collect(),
-                error: Some(error.to_string()),
-            });
+        let list = self.wait(self.client.models(service, base_url, api_key));
         if let Some(error) = &list.error {
             println!("The service's list is unavailable: {error}. Any model name can be typed.");
         }
-        let (recommended, others): (Vec<ModelChoice>, Vec<ModelChoice>) = list
-            .models
-            .into_iter()
-            .partition(|choice| choice.recommended);
-        let others: Vec<String> = others.into_iter().map(|choice| choice.id).collect();
-        let mut options: Vec<ModelOption> = recommended
-            .into_iter()
-            .map(|choice| ModelOption::Model(choice.id))
-            .collect();
+        let (recommended, others) = model_options(list);
+        let mut options: Vec<ModelOption> =
+            recommended.into_iter().map(ModelOption::Model).collect();
         if others.len() <= SHOWN_MODELS {
             options.extend(others.iter().cloned().map(ModelOption::Model));
         } else {
@@ -502,21 +281,13 @@ impl Setup {
 
     /// A ChatGPT plan: the sign-in, unless a session is open, and the model, `current` proposed first.
     fn chatgpt(&self, methods: &[SignInMethod], current: Option<&str>) -> Result<Chosen> {
-        let status: ChatGptStatus = self.get("/api/chatgpt")?;
+        let status = self.wait(self.client.chatgpt_status())?;
         if let Some(account) = &status.signed_in {
-            println!(
-                "Signed in as {} {}.",
-                account.email.as_deref().unwrap_or("your ChatGPT account"),
-                lifetime(status.kept)
-            );
+            println!("Signed in as {} {}.", account.name(), lifetime(status.kept));
         } else {
             println!("Sign in:");
             let method = pick(methods, |method| {
-                let details = format!(
-                    "Recommended {}\n     Pros. {}\n     Cons. {}",
-                    method.recommended, method.pros, method.cons
-                );
-                (method.name.clone(), Some(details))
+                (method.name.clone(), Some(method.details().join("\n     ")))
             })?;
             println!();
             let keep = ask_keep()?;
@@ -530,12 +301,12 @@ impl Setup {
                         true,
                     )?
                 {
-                    self.forget_registration()?;
+                    self.wait(self.client.forget_registration())?;
                 }
                 self.sign_in(keep)?;
             }
         }
-        let models: Vec<ChatGptModel> = self.get("/api/chatgpt/models")?;
+        let models = self.wait(self.client.chatgpt_models())?;
         if models.is_empty() {
             bail!("the ChatGPT account offers no models");
         }
@@ -558,71 +329,44 @@ impl Setup {
     /// Signs in as the Codex CLI: shows the address, a QR code of it and the code, and waits until the code is
     /// approved on any device.
     fn sign_in_with_code(&self, keep: bool) -> Result<()> {
-        #[derive(Deserialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
-        enum CodeEvent {
-            Code {
-                verification_url: String,
-                user_code: String,
-            },
-            SignedIn {
-                account: Account,
-            },
-            Failed {
-                error: String,
-            },
-        }
-
-        let mut outcome = None;
-        self.runtime
-            .block_on(
-                self.client
-                    .each_event("/api/chatgpt/code", &json!({ "keep": keep }), |event| match event {
-                        CodeEvent::Code {
-                            verification_url,
-                            user_code,
-                        } => {
-                            println!(
-                                "On any device, open this address or scan the QR code, sign in to ChatGPT and enter \
-                                 the code."
-                            );
-                            println!();
-                            println!("{}", qr_code(&verification_url));
-                            println!("  {verification_url}");
-                            println!();
-                            println!("  Code: {user_code}");
-                            println!();
-                            println!("The code expires in 15 minutes. Waiting for approval…");
-                        }
-                        CodeEvent::SignedIn { account } => outcome = Some(Ok(account)),
-                        CodeEvent::Failed { error } => outcome = Some(Err(error)),
-                    }),
-            )?;
-        match outcome {
-            Some(Ok(account)) => {
-                println!(
-                    "Signed in as {}.",
-                    account.email.as_deref().unwrap_or("your ChatGPT account")
-                );
-                Ok(())
+        let account = self.wait(async {
+            let events = self.client.sign_in_with_code(keep).await?;
+            let mut events = std::pin::pin!(events);
+            while let Some(data) = events.next().await {
+                match serde_json::from_str::<CodeEvent>(&data?)? {
+                    CodeEvent::Code {
+                        verification_url,
+                        user_code,
+                    } => {
+                        println!(
+                            "On any device, open this address or scan the QR code, sign in to ChatGPT and enter \
+                             the code."
+                        );
+                        println!();
+                        println!("{}", qr_code(&verification_url));
+                        println!("  {verification_url}");
+                        println!();
+                        println!("  Code: {user_code}");
+                        println!();
+                        println!("The code expires in 15 minutes. Waiting for approval…");
+                    }
+                    CodeEvent::SignedIn { account } => return Ok(account),
+                    CodeEvent::Failed { error } => bail!("{error}"),
+                }
             }
-            Some(Err(error)) => bail!("{error}"),
-            None => bail!("the sign-in ended without an outcome"),
-        }
+            bail!("the sign-in ended without an outcome")
+        })?;
+        println!("Signed in as {}.", account.name());
+        Ok(())
     }
 
     /// Signs in as an agent: the browser may be on another computer, so the user can also paste the address OpenAI
     /// sends it back to.
     fn sign_in(&self, keep: bool) -> Result<()> {
-        #[derive(Deserialize)]
-        struct Started {
-            url: String,
-        }
-
-        let started: Started = self.post("/api/chatgpt/sign-in", &json!({ "keep": keep }))?;
+        let url = self.wait(self.client.start_sign_in(keep))?;
         println!("Open this address in a browser and sign in:");
         println!();
-        println!("  {}", started.url);
+        println!("  {url}");
         println!();
         println!(
             "OpenAI then sends the browser to a 127.0.0.1 address. If Kelpy's page opens, sign in there if asked; the \
@@ -647,27 +391,29 @@ impl Setup {
                 Ok(line) => {
                     let line = line?;
                     if !line.is_empty() {
-                        match self.finish_sign_in(&line) {
-                            Ok(()) => return Ok(()),
-                            Err(error) => println!("{error:#}"),
+                        match self.wait(self.client.finish_sign_in(&line)) {
+                            Ok(account) => {
+                                println!("Signed in as {}.", account.name());
+                                return Ok(());
+                            }
+                            Err(error) => println!("{error}"),
                         }
                     }
                     let _ = wanted.send(());
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let status: ChatGptStatus = self.get("/api/chatgpt")?;
+                    let status = self.wait(self.client.chatgpt_status())?;
                     if let Some(account) = status.signed_in {
                         println!();
-                        println!(
-                            "Signed in as {}. Press Enter to continue.",
-                            account.email.as_deref().unwrap_or("your ChatGPT account")
-                        );
+                        println!("Signed in as {}. Press Enter to continue.", account.name());
                         // The line the reader is waiting for.
                         let _ = lines.recv();
                         return Ok(());
                     }
                     if Instant::now() > deadline {
-                        bail!("the sign-in took longer than 10 minutes; run the setup again");
+                        bail!(
+                            "the sign-in took longer than {SIGN_IN_MINUTES} minutes; run the setup again"
+                        );
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the terminal closed"),
@@ -675,61 +421,21 @@ impl Setup {
         }
     }
 
-    fn finish_sign_in(&self, address: &str) -> Result<()> {
-        let address = reqwest::Url::parse(address.trim()).context("not a web address")?;
-        let param = |name: &str| {
-            address
-                .query_pairs()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| value.into_owned())
-        };
-        let account: Account = self.post(
-            "/api/chatgpt/callback",
-            &json!({
-                "code": param("code"),
-                "state": param("state"),
-                "client_id": param("client_id"),
-                "error": param("error"),
-            }),
-        )?;
-        println!(
-            "Signed in as {}.",
-            account.email.as_deref().unwrap_or("your ChatGPT account")
-        );
-        Ok(())
-    }
-
     /// Ollama: where it runs, its models, and a download if the model chosen is not there yet.
     fn ollama(&self, service: &Service) -> Result<Chosen> {
         let mut address = prompt::ask("Ollama address, empty for this computer", "")?;
         let status = loop {
-            let query = if address.is_empty() {
-                String::new()
-            } else {
-                format!("?base_url={}", form_encode(&address))
-            };
-            let status: OllamaStatus = self.get(&format!("/api/ollama{query}"))?;
-            if status.running {
+            let status = self.wait(self.client.ollama(&address))?;
+            let Some(problem) = status.problem() else {
                 break status;
-            }
-            if status.installed {
-                println!(
-                    "Ollama is installed but does not answer at {}. Start it.",
-                    status.base_url
-                );
-            } else if status.memory.is_none() {
-                println!(
-                    "No Ollama answers at {}: {}",
-                    status.base_url,
-                    status.error.as_deref().unwrap_or("no details")
-                );
-            } else {
-                println!("Ollama is not installed on this computer.");
+            };
+            println!("{}", status.explain().unwrap_or_default());
+            if problem == OllamaProblem::NotInstalled {
                 if self.install_ollama()? {
                     continue;
                 }
                 println!(
-                    "Download it from https://ollama.com/download, or enter the address of a computer running it."
+                    "Download it from {OLLAMA_DOWNLOAD}, or enter the address of a computer running it."
                 );
             }
             if !prompt::confirm("Check again?", true)? {
@@ -741,37 +447,7 @@ impl Setup {
             println!("{step}");
         }
 
-        let installed: Vec<(String, String)> = status
-            .models
-            .iter()
-            .map(|model| {
-                let detail = if model.cloud {
-                    "runs on ollama.com".to_owned()
-                } else {
-                    gigabytes(model.size)
-                };
-                (model.name.clone(), detail)
-            })
-            .collect();
-        let downloadable: Vec<&Suggestion> = status
-            .suggestions
-            .iter()
-            .filter(|suggestion| installed.iter().all(|(name, _)| *name != suggestion.name))
-            .collect();
-        let mut options: Vec<(String, String)> = installed
-            .iter()
-            .map(|(name, size)| (format!("{name}  {size}"), String::new()))
-            .collect();
-        options.extend(downloadable.iter().map(|suggestion| {
-            (
-                format!(
-                    "{}  download {}",
-                    suggestion.name,
-                    gigabytes(suggestion.size)
-                ),
-                suggestion.description.clone(),
-            )
-        }));
+        let options = ollama_options(&status);
         if options.is_empty() {
             bail!("no models installed, and none suggested for this computer's memory");
         }
@@ -780,22 +456,18 @@ impl Setup {
             Some(memory) => println!("Model (this computer has {} of RAM):", gigabytes(memory)),
             None => println!("Model:"),
         }
-        let index = pick_index(&options, 0, |(name, description)| {
+        let index = pick_index(&options, 0, |option| {
             (
-                name.clone(),
-                Some(description.clone()).filter(|text| !text.is_empty()),
+                format!("{}  {}", option.name, option.detail),
+                option.description.clone(),
             )
         })?;
-        let model = match index.checked_sub(installed.len()) {
-            None => installed[index].0.clone(),
-            Some(suggestion) => {
-                let name = downloadable[suggestion].name.clone();
-                self.download(&status.base_url, &name)?;
-                name
-            }
-        };
+        let option = &options[index];
+        if option.download {
+            self.download(&status.base_url, &option.name)?;
+        }
         Ok(Chosen {
-            model,
+            model: option.name.clone(),
             base_url: Some(address).filter(|address| !address.is_empty()),
             api_key: None,
         })
@@ -803,9 +475,7 @@ impl Setup {
 
     /// Offers to install Ollama on this computer, showing the command first. Returns whether it was installed.
     fn install_ollama(&self) -> Result<bool> {
-        let Ok(installer) =
-            self.post::<Installer>("/api/ollama/install", &json!({ "preview": true }))
-        else {
+        let Ok(installer) = self.wait(self.client.ollama_installer()) else {
             return Ok(false);
         };
         println!("Kelpy can install it: {}", installer.command);
@@ -815,22 +485,23 @@ impl Setup {
         if !prompt::confirm("Install Ollama now?", false)? {
             return Ok(false);
         }
-        let mut shown = 0;
-        let mut failed = None;
-        self.runtime.block_on(self.client.each_event(
-            "/api/ollama/install",
-            &json!({}),
-            |installation: Installation| {
+        let failed = self.wait(async {
+            let events = self.client.install_ollama().await?;
+            let mut events = std::pin::pin!(events);
+            let mut shown = 0;
+            while let Some(data) = events.next().await {
+                let installation: Installation = serde_json::from_str(&data?)?;
                 // The output so far comes each time: only what is new is printed.
                 if let Some(new) = installation.output.get(shown..) {
                     print!("{new}");
                     shown = installation.output.len();
                 }
                 if installation.done {
-                    failed = installation.error;
+                    return anyhow::Ok(installation.error);
                 }
-            },
-        ))?;
+            }
+            Ok(Some("the installation ended without an outcome".to_owned()))
+        })?;
         match failed {
             None => {
                 println!("Ollama is installed and answers.");
@@ -844,31 +515,20 @@ impl Setup {
     }
 
     fn download(&self, base_url: &str, model: &str) -> Result<()> {
-        let mut failed = None;
-        self.runtime.block_on(self.client.each_event(
-            "/api/ollama/download",
-            &json!({ "base_url": base_url, "model": model }),
-            |download: Download| {
-                let progress = if download.total > 0 {
-                    format!(
-                        "  {} of {}",
-                        gigabytes(download.completed),
-                        gigabytes(download.total)
-                    )
-                } else {
-                    String::new()
-                };
-                print!(
-                    "\r{:<72}",
-                    format!("{model}: {}{progress}", download.status)
-                );
+        let failed = self.wait(async {
+            let events = self.client.download_model(base_url, model).await?;
+            let mut events = std::pin::pin!(events);
+            while let Some(data) = events.next().await {
+                let download: Download = serde_json::from_str(&data?)?;
+                print!("\r{:<72}", format!("{model}: {}", download.progress()));
                 let _ = io::stdout().flush();
                 if download.done {
                     println!();
-                    failed = download.error;
+                    return anyhow::Ok(download.error);
                 }
-            },
-        ))?;
+            }
+            Ok(Some("the download ended without an outcome".to_owned()))
+        })?;
         match failed {
             Some(error) => bail!("the download failed: {error}"),
             None => Ok(()),
@@ -876,22 +536,9 @@ impl Setup {
     }
 }
 
-/// Whether a ChatGPT session is saved on disk, after the account it is signed in as: if not, it ends when Kelpy stops.
-pub(crate) fn lifetime(kept: bool) -> &'static str {
-    if kept {
-        "(saved - log out to clear)"
-    } else {
-        "(not saved - close to clear)"
-    }
-}
-
 /// Whether the sign-in stays across restarts: off unless the user answers yes after the warning.
 fn ask_keep() -> Result<bool> {
-    println!(
-        "Kelpy can save the sign-in on this computer, so that ChatGPT works again after a restart. It is then \
-         saved in the Kelpy folder (data/), readable only by you: anyone who can read it as you or as an administrator \
-         can use your ChatGPT plan until you sign out. Not recommended on a server you hand over to others."
-    );
+    println!("{KEEP_WARNING}");
     Ok(prompt::confirm(
         "Save the sign-in on this computer?",
         false,
@@ -936,15 +583,6 @@ fn search_model(models: &[String]) -> Result<String> {
     }
 }
 
-/// The models whose name contains `term`, ignoring case.
-fn matching<'a>(models: &'a [String], term: &str) -> Vec<&'a String> {
-    let term = term.to_lowercase();
-    models
-        .iter()
-        .filter(|model| model.to_lowercase().contains(&term))
-        .collect()
-}
-
 /// Lists `items` numbered, with a description under each if any, and returns the one chosen.
 fn pick<T>(items: &[T], show: impl Fn(&T) -> (String, Option<String>)) -> io::Result<&T> {
     Ok(&items[pick_index(items, 0, show)?])
@@ -964,72 +602,4 @@ fn pick_index<T>(
         }
     }
     Ok(prompt::choose(items.len(), proposed + 1)? - 1)
-}
-
-/// `text` as a QR code in text, light on dark as most terminals show it, with its quiet zone; empty if it does not fit
-/// in one.
-fn qr_code(text: &str) -> String {
-    use qrcode::render::unicode::Dense1x2;
-    qrcode::QrCode::new(text.as_bytes())
-        .map(|code| {
-            code.render::<Dense1x2>()
-                .dark_color(Dense1x2::Light)
-                .light_color(Dense1x2::Dark)
-                .build()
-        })
-        .unwrap_or_default()
-}
-
-/// A size in bytes, in gigabytes with one decimal: `6.6 GB`.
-fn gigabytes(bytes: u64) -> String {
-    format!("{:.1} GB", bytes as f64 / 1e9)
-}
-
-/// Encodes `text` for a URL's query.
-fn form_encode(text: &str) -> String {
-    text.bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn models_are_searched_by_part_of_the_name_ignoring_case() {
-        let models =
-            ["openai/gpt-oss-120b", "qwen/Qwen3.8-27b", "google/gemma-4"].map(String::from);
-        assert_eq!(matching(&models, "QWEN"), [&models[1]]);
-        assert_eq!(matching(&models, "/g").len(), 2);
-        assert!(matching(&models, "claude").is_empty());
-    }
-
-    #[test]
-    fn addresses_are_encoded_for_the_query() {
-        assert_eq!(
-            form_encode("http://10.0.0.5:11434/v1"),
-            "http%3A%2F%2F10.0.0.5%3A11434%2Fv1"
-        );
-    }
-
-    #[test]
-    fn qr_codes_are_drawn_as_square_text() {
-        let qr = qr_code("https://auth.openai.com/codex/device");
-        let lines: Vec<usize> = qr.lines().map(|line| line.chars().count()).collect();
-        assert!(lines.len() > 10);
-        // Two modules per line: as many lines as half the width, rounded up.
-        assert!(lines.iter().all(|width| *width == lines[0]));
-        assert_eq!(lines.len(), lines[0].div_ceil(2));
-    }
-
-    #[test]
-    fn sizes_are_shown_in_gigabytes() {
-        assert_eq!(gigabytes(6_600_000_000), "6.6 GB");
-    }
 }

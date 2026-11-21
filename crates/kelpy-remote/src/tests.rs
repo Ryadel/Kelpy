@@ -15,6 +15,10 @@ impl russh::client::Handler for Client {
 
 /// A server allowing `key` without asking, with its files in `folder`.
 async fn server(folder: &tempfile::TempDir, key: &PrivateKey) -> Remote {
+    server_with_web(folder, key, 9).await
+}
+
+async fn server_with_web(folder: &tempfile::TempDir, key: &PrivateKey, web_port: u16) -> Remote {
     let events = Events::new();
     let connections = Arc::new(Connections::new(
         folder.path().join("remote.log"),
@@ -27,14 +31,91 @@ async fn server(folder: &tempfile::TempDir, key: &PrivateKey) -> Remote {
         port: 0,
         host_key: folder.path().join("host_key"),
         files: Arc::new(Files::new(folder.path().join("files"), events)),
-        web_port: 9,
-        api_url: "http://127.0.0.1:9".into(),
+        web_port,
+        api_url: format!("http://127.0.0.1:{web_port}"),
         token: "token".into(),
         banner: Default::default(),
         connections,
     })
     .await
     .unwrap()
+}
+
+async fn forward(
+    client: &russh::client::Handle<Client>,
+    port: u16,
+) -> Result<russh::Channel<russh::client::Msg>, russh::Error> {
+    client
+        .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 0)
+        .await
+}
+
+#[tokio::test]
+async fn forwards_reuse_their_slots_after_either_side_sends_eof_first() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let folder = tempfile::tempdir().unwrap();
+        let key = key();
+        let remote = server_with_web(&folder, &key, port).await;
+        let client = signed_in(remote.port, &key).await;
+        for n in 0..40 {
+            let mut channel = forward(&client, port).await.unwrap();
+            let (mut web, _) = listener.accept().await.unwrap();
+            if n % 2 == 0 {
+                channel.eof().await.unwrap();
+                assert_eq!(web.read(&mut [0]).await.unwrap(), 0);
+            }
+            web.write_all(b"answer").await.unwrap();
+            web.shutdown().await.unwrap();
+            let mut body = Vec::new();
+            channel.make_reader().read_to_end(&mut body).await.unwrap();
+            assert_eq!(body, b"answer");
+            if n % 2 == 1 {
+                channel.eof().await.unwrap();
+                assert_eq!(web.read(&mut [0]).await.unwrap(), 0);
+            }
+            // The peer finishes the SSH close after both TCP directions have drained.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            channel.close().await.unwrap();
+        }
+        assert!(remote.stop(Duration::from_secs(5)).await);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn forwards_have_their_own_bounded_quota_and_a_peer_close_releases_a_slot() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let folder = tempfile::tempdir().unwrap();
+    let key = key();
+    let remote = server_with_web(&folder, &key, port).await;
+    let client = signed_in(remote.port, &key).await;
+    let mut sessions = Vec::new();
+    for _ in 0..MAX_CHANNELS {
+        sessions.push(client.channel_open_session().await.unwrap());
+    }
+    assert!(client.channel_open_session().await.is_err());
+    let mut forwards = Vec::new();
+    let mut sockets = Vec::new();
+    for _ in 0..MAX_FORWARDS {
+        forwards.push(forward(&client, port).await.unwrap());
+        sockets.push(listener.accept().await.unwrap().0);
+    }
+    assert!(matches!(
+        forward(&client, port).await,
+        Err(russh::Error::ChannelOpenFailure(
+            ChannelOpenFailure::ResourceShortage
+        ))
+    ));
+    forwards.pop().unwrap().close().await.unwrap();
+    forward(&client, port).await.unwrap();
+    assert!(client.channel_open_session().await.is_err());
+    assert!(remote.stop(Duration::from_secs(5)).await);
 }
 
 fn key() -> PrivateKey {

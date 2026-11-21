@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
   import BookOpenIcon from '@lucide/svelte/icons/book-open';
+  import SparklesIcon from '@lucide/svelte/icons/sparkles';
   import CheckIcon from '@lucide/svelte/icons/check';
   import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
   import CpuIcon from '@lucide/svelte/icons/cpu';
@@ -22,6 +23,7 @@
   import {
     describe,
     fetchProvider,
+    fetchSuggestions,
     finishChatGptSignIn,
     keepChatGptReturn,
     takeChatGptReturn,
@@ -37,6 +39,7 @@
     type RuntimeEvent,
     type RuntimeStatus,
     type Session,
+    saveSuggestions,
   } from './lib/api';
   import Chat from './lib/Chat.svelte';
   import ConnectionDialog from './lib/ConnectionDialog.svelte';
@@ -44,6 +47,7 @@
   import NewConversation from './lib/NewConversation.svelte';
   import type { Outgoing } from './lib/Composer.svelte';
   import ProviderDialog from './lib/ProviderDialog.svelte';
+  import ResizeHandle from './lib/ResizeHandle.svelte';
   import RestartDialog from './lib/RestartDialog.svelte';
   import SecretsDialog from './lib/SecretsDialog.svelte';
   import Sessions from './lib/Sessions.svelte';
@@ -55,6 +59,7 @@
   import { lore, showLore } from './lib/lore.svelte';
   import { elevation, justRestarted, refreshElevation } from './lib/elevation.svelte';
   import { runtime } from './lib/runtime.svelte';
+  import { SIDEBAR, loadWidth, saveWidth } from './lib/panels';
   import { watchEvents } from './lib/events';
 
   type View =
@@ -86,6 +91,9 @@
   let connectionsChanges = $state(0);
   /** On wide screens the conversations are a sidebar, which can be hidden. */
   let sidebarOpen = $state(true);
+  /** Its width, dragged by its edge and kept in this browser. */
+  let sidebarWidth = $state(loadWidth(SIDEBAR));
+  $effect(() => saveWidth(SIDEBAR, sidebarWidth));
   /** On small screens the conversations open in a panel instead. */
   let sessionsOpen = $state(false);
   /** The Command log panel, beside the open conversation: it stays open, or closed, across reloads. */
@@ -93,8 +101,11 @@
   let logOpen = $state(localStorage.getItem(LOG_KEY) === 'open');
   $effect(() => localStorage.setItem(LOG_KEY, logOpen ? 'open' : 'closed'));
   let chat = $state<Chat | null>(null);
+  /** Whether Kelpy suggests the next message after each answer: one setting for every conversation and interface. */
+  let suggestions = $state(false);
   /** Ends the subscription to Kelpy's events, which keeps the page in step with every other page and interface. */
   let stopEvents: (() => void) | null = null;
+  let loadRetry: ReturnType<typeof setTimeout> | undefined;
 
   const current = $derived(sessions.find((session) => session.id === selected) ?? null);
 
@@ -126,16 +137,6 @@
     }
   }
 
-  // Kelpy answers again: a page still connecting loads. A page in use catches up when its events resume.
-  let wasReachable = true;
-  $effect(() => {
-    const reachable = connection.reachable;
-    if (reachable && !wasReachable) {
-      untrack(() => view.kind === 'connecting' && void load());
-    }
-    wasReachable = reachable;
-  });
-
   // Signed out, stopped or failed: nothing more to follow.
   $effect(() => {
     if (view.kind !== 'ready' && view.kind !== 'connecting') {
@@ -144,6 +145,7 @@
   });
 
   function endEvents() {
+    clearTimeout(loadRetry);
     stopEvents?.();
     stopEvents = null;
   }
@@ -152,6 +154,7 @@
     try {
       let fetched: Session[];
       [runtime.status, provider, fetched] = await Promise.all([fetchStatus(), fetchProvider(), fetchSessions()]);
+      void refreshSuggestions();
       sessions = merged(sessions, fetched);
       void refreshElevation();
       connection.resumed += 1;
@@ -162,12 +165,20 @@
 
   async function load(notice: string | null = null) {
     endEvents();
+    view = { kind: 'connecting' };
+    const events = watchEvents({
+      onEvent: receive,
+      onResumed: () => { if (view.kind === 'ready') void catchUp(); },
+      onEnded: fail,
+    });
+    stopEvents = events.stop;
     try {
-      const events = watchEvents({ onEvent: receive, onResumed: () => void catchUp(), onEnded: fail });
-      stopEvents = events.stop;
       await events.subscribed;
-      let fetched: Session[];
-      [runtime.status, provider, fetched] = await Promise.all([fetchStatus(), fetchProvider(), fetchSessions()]);
+      const [loadedStatus, loadedProvider, fetched] = await Promise.all([fetchStatus(), fetchProvider(), fetchSessions()]);
+      if (stopEvents !== events.stop) return;
+      runtime.status = loadedStatus;
+      provider = loadedProvider;
+      void refreshSuggestions();
       sessions = merged(sessions, fetched);
       selected ??= sessions[0]?.id ?? null;
       view = { kind: 'ready' };
@@ -184,7 +195,13 @@
         providerOpen = true;
       }
     } catch (reason: unknown) {
-      fail(reason, notice);
+      if (stopEvents !== events.stop) return;
+      // One successful parallel request can mark the connection reachable even when another request failed.
+      if (reason instanceof Unreachable && view.kind === 'connecting') {
+        loadRetry = setTimeout(() => void load(notice), 2_000);
+      } else {
+        fail(reason, notice);
+      }
     }
   }
 
@@ -217,6 +234,23 @@
     }
   }
 
+  async function refreshSuggestions() {
+    try {
+      suggestions = (await fetchSuggestions()).enabled;
+    } catch (reason: unknown) {
+      fail(reason);
+    }
+  }
+
+  async function changeSuggestions(enabled: boolean) {
+    try {
+      suggestions = (await saveSuggestions(enabled)).enabled;
+      if (!suggestions) chat?.dropSuggestion();
+    } catch (reason: unknown) {
+      fail(reason);
+    }
+  }
+
   /** A change made here or anywhere else: by this page, another page, or another interface. */
   function receive(event: RuntimeEvent) {
     switch (event.type) {
@@ -239,6 +273,13 @@
         break;
       case 'provider_changed':
         void refreshProvider();
+        break;
+      case 'suggestion':
+        chat?.receiveSuggestion(event);
+        break;
+      case 'suggestions_changed':
+        suggestions = event.enabled;
+        if (!event.enabled) chat?.dropSuggestion();
         break;
       case 'secrets_changed':
         secretsChanges += 1;
@@ -338,7 +379,17 @@
 {#if view.kind === 'ready'}
   <div class="flex h-dvh overflow-hidden">
     {#if sidebarOpen}
-      <aside class="bg-sidebar text-sidebar-foreground hidden w-[260px] shrink-0 flex-col md:flex">
+      <aside
+        class="bg-sidebar text-sidebar-foreground relative hidden max-w-[40vw] shrink-0 flex-col md:flex"
+        style:width="{sidebarWidth}px"
+      >
+        <ResizeHandle
+          label="Resize the conversations"
+          panel={SIDEBAR}
+          edge="right"
+          width={sidebarWidth}
+          onResize={(width) => (sidebarWidth = width)}
+        />
         <div class="flex h-14 shrink-0 items-center px-3">
           {@render brand()}
           <Button
@@ -498,13 +549,13 @@
                   size="icon-lg"
                   class="text-muted-foreground border-border rounded-full"
                   aria-label="Menu"
-                  title="Lore, Sign out and Stop Kelpy"
+                  title="Lore, suggestions, Sign out and Stop Kelpy"
                 >
                   <SlidersHorizontalIcon class="size-[17px]" />
                 </Button>
               {/snippet}
             </DropdownMenu.Trigger>
-            <DropdownMenu.Content align="end" class="w-64 p-1.5">
+            <DropdownMenu.Content align="end" class="w-72 p-1.5">
               {#if status}
                 <DropdownMenu.Label class="text-muted-foreground truncate px-2.5 text-xs font-normal" title={status.home}>
                   Kelpy v{status.version} · {status.home}
@@ -512,6 +563,19 @@
               {/if}
               <DropdownMenu.CheckboxItem class="gap-2.5 px-2.5 py-2" checked={lore.on} onCheckedChange={showLore}>
                 <BookOpenIcon /> Show lore while Kelpy thinks
+              </DropdownMenu.CheckboxItem>
+              <DropdownMenu.CheckboxItem
+                class="items-start gap-2.5 px-2.5 py-2"
+                checked={suggestions}
+                onCheckedChange={(on) => void changeSuggestions(on)}
+              >
+                <SparklesIcon class="mt-0.5" />
+                <span>
+                  Suggest the next message
+                  <span class="text-muted-foreground block text-xs">
+                    One more request to the model after each answer. For every conversation.
+                  </span>
+                </span>
               </DropdownMenu.CheckboxItem>
               <DropdownMenu.Separator />
               <DropdownMenu.Item class="gap-2.5 px-2.5 py-2" onSelect={signOutAndForget}>

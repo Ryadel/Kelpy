@@ -18,6 +18,7 @@ mod server;
 mod turns;
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,6 +103,8 @@ pub struct Agent {
     files: Arc<Files>,
     /// Remote connections and their approval.
     connections: Arc<Connections>,
+    /// `config.toml`, where the settings changed from the interfaces are kept.
+    config: PathBuf,
 }
 
 impl Agent {
@@ -162,7 +165,32 @@ impl Agent {
                 events.clone(),
             )),
             events,
+            config: home.config_path(),
         })
+    }
+
+    /// Suggests the administrator's next message after each answer, as `config.toml` says. Off until turned on, so
+    /// that an agent without a configuration sends no request beyond its answers.
+    pub fn with_suggestions(self, enabled: bool) -> Self {
+        self.turns.set_suggests(enabled);
+        self
+    }
+
+    /// Whether the administrator's next message is suggested after each answer.
+    pub fn suggestions(&self) -> bool {
+        self.turns.suggests()
+    }
+
+    /// Turns suggesting the next message on or off, from now on and in `config.toml`.
+    pub fn set_suggestions(&self, enabled: bool) -> Result<(), AgentError> {
+        // Saved and applied in the same order: two changes at once leave the file and the runtime alike.
+        static CHANGING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _changing = kelpy_common::lock(&CHANGING);
+        crate::config::save_suggestions(&self.config, enabled)?;
+        self.turns.set_suggests(enabled);
+        self.events
+            .publish(crate::events::Event::SuggestionsChanged { enabled });
+        Ok(())
     }
 
     /// Checks what Kelpy left on the server against what is there now, as when Kelpy starts: the differences found
@@ -767,6 +795,79 @@ mod tests {
         assert!(agent.stop_all(Duration::from_secs(1)).await);
         assert_eq!(events.next().await, Some(Event::Stopping));
         assert_eq!(events.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_completed_answer_is_followed_by_the_suggested_next_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = model("\"Find out what stopped php-fpm\"").await;
+        server.respond_once(
+            CHAT,
+            "200 OK",
+            stream("php-fpm was down: started again.", None),
+        );
+        let agent = agent(&dir, format!("{}/v1", server.url));
+        let agent = Arc::into_inner(agent).unwrap().with_suggestions(true);
+        let session = agent.create_session(None, Modes::default()).await.unwrap();
+        let mut events = agent.subscribe();
+        let answer = collect(
+            agent
+                .send(session.id, "The shop returns 502", ())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (done, _) = done(&answer);
+        let suggested = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(Event::Suggestion {
+                    session_id,
+                    after,
+                    text,
+                }) = events.next().await
+                {
+                    return (session_id, after, text);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            suggested,
+            (
+                session.id,
+                done.id,
+                "Find out what stopped php-fpm".to_owned()
+            )
+        );
+        let asked = server.requests().pop().unwrap();
+        assert!(
+            asked.contains("predict the next message") && asked.contains("The shop returns 502")
+        );
+
+        // Turned off: kept in the configuration, told to the interfaces, and no request after the next answer.
+        agent.set_suggestions(false).unwrap();
+        assert!(!agent.suggestions());
+        assert!(
+            !Config::load(&dir.path().join("config.toml"))
+                .unwrap()
+                .suggestions
+                .enabled
+        );
+        assert!(matches!(
+            events.next().await,
+            Some(Event::SuggestionsChanged { enabled: false })
+        ));
+        let before = server.requests().len();
+        collect(agent.send(session.id, "Thanks", ()).await.unwrap()).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = server.requests();
+        assert!(after.len() > before);
+        assert!(
+            after[before..]
+                .iter()
+                .all(|request| !request.contains("predict the next message"))
+        );
     }
 
     #[tokio::test]

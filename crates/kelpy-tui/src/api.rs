@@ -6,6 +6,11 @@ use serde_json::json;
 
 use crate::model::{Connections, Conversation, ProviderInfo, Session};
 
+#[derive(serde::Deserialize)]
+struct Suggestions {
+    enabled: bool,
+}
+
 /// A client of one running Kelpy. Clones share its connections.
 #[derive(Clone)]
 pub struct Api(Client);
@@ -16,7 +21,30 @@ impl Api {
     }
 
     pub(crate) async fn provider(&self) -> Result<ProviderInfo, ClientError> {
-        self.0.get("/api/provider").await
+        self.0.provider_info().await
+    }
+
+    /// The client itself, for the setup's requests.
+    pub(crate) fn client(&self) -> &Client {
+        &self.0
+    }
+
+    /// Whether the next message is suggested after each answer.
+    pub(crate) async fn suggestions(&self) -> Result<bool, ClientError> {
+        let setting: Suggestions = self.0.get("/api/suggestions").await?;
+        Ok(setting.enabled)
+    }
+
+    pub(crate) async fn set_suggestions(&self, enabled: bool) -> Result<bool, ClientError> {
+        let setting: Suggestions = self
+            .0
+            .send(
+                Method::PUT,
+                "/api/suggestions",
+                &json!({ "enabled": enabled }),
+            )
+            .await?;
+        Ok(setting.enabled)
     }
 
     pub(crate) async fn sessions(&self) -> Result<Vec<Session>, ClientError> {

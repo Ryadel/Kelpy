@@ -466,8 +466,10 @@ pub enum StopReason {
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("no API key: {}", match variable {
-        Some(variable) => format!("set {variable}, enter one in the Web UI or run `kelpy provider`"),
-        None => "enter one in the Web UI or run `kelpy provider`".to_owned(),
+        Some(variable) => format!(
+            "set {variable}, or enter one with Ctrl+P in the terminal UI, in the Web UI or with `kelpy provider`"
+        ),
+        None => "enter one with Ctrl+P in the terminal UI, in the Web UI or with `kelpy provider`".to_owned(),
     })]
     MissingKey { variable: Option<&'static str> },
     #[error("an OpenAI-compatible provider needs the address of its API")]

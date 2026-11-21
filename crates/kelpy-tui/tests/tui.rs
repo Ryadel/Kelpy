@@ -21,6 +21,16 @@ const WIDTH: u16 = 110;
 
 /// A runtime on a loopback port, answering with `pieces`; returns the API for the terminal UI and the agent.
 async fn runtime(pieces: &'static [&'static str]) -> (Api, Arc<Agent>) {
+    let (api, agent, _) = runtime_with(pieces, true).await;
+    (api, agent)
+}
+
+/// A runtime whose model answers with `pieces`, set up as its provider if `configured`; returns the API for the
+/// terminal UI, the agent and the model's address.
+async fn runtime_with(
+    pieces: &'static [&'static str],
+    configured: bool,
+) -> (Api, Arc<Agent>, String) {
     let home = Home::init(tempfile::tempdir().unwrap().keep()).unwrap();
     let agent = Arc::new(
         Agent::new(
@@ -31,12 +41,13 @@ async fn runtime(pieces: &'static [&'static str]) -> (Api, Arc<Agent>) {
         )
         .unwrap(),
     );
-    let provider = serde_json::json!({
-        "kind": "ollama", "model": "test", "base_url": chat_completions(pieces, Duration::ZERO).await,
-    });
-    agent
-        .configure_provider(serde_json::from_value(provider).unwrap())
-        .unwrap();
+    let model = chat_completions(pieces, Duration::ZERO).await;
+    if configured {
+        let provider = serde_json::json!({ "kind": "ollama", "model": "test", "base_url": model });
+        agent
+            .configure_provider(serde_json::from_value(provider).unwrap())
+            .unwrap();
+    }
     let listener = kelpy_gateway::bind(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, None)
         .await
         .unwrap();
@@ -69,7 +80,23 @@ async fn runtime(pieces: &'static [&'static str]) -> (Api, Arc<Agent>) {
         std::future::pending(),
     ));
     let api = Api::new(format!("http://127.0.0.1:{port}"), auth.token().to_owned()).unwrap();
-    (api, agent)
+    (api, agent, model)
+}
+
+/// Each group of keys after its pause, then a last pause before the end. Each pause starts when the keys before it
+/// are taken.
+fn paced(groups: Vec<(Duration, Vec<Event>)>, last: Duration) -> impl Stream<Item = Event> + Unpin {
+    let steps = stream::iter(groups).flat_map(|(pause, keys)| {
+        stream::once(async move { tokio::time::sleep(pause).await })
+            .flat_map(move |()| stream::iter(keys.clone()))
+    });
+    let end = stream::once(async move { tokio::time::sleep(last).await })
+        .filter_map(|()| std::future::ready(None));
+    Box::pin(steps.chain(end))
+}
+
+fn typed(text: &str) -> Vec<Event> {
+    text.chars().map(|char| key(KeyCode::Char(char))).collect()
 }
 
 fn key(code: KeyCode) -> Event {
@@ -149,6 +176,51 @@ async fn inline_the_conversation_goes_into_the_terminals_history_and_the_footer_
     assert!(order.is_sorted(), "{written}");
     // The footer is gone.
     assert!(!written.contains("Write a message"), "{written}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_ai_the_setup_opens_by_itself_and_saves_the_server_chosen() {
+    let (api, agent, model) = runtime_with(&["Fine."], false).await;
+    let mut terminal = Terminal::new(TestBackend::new(WIDTH, 30)).unwrap();
+    let options = Options {
+        banner: Banner::default(),
+        stops_runtime: true,
+        screen: Screen::Full,
+        background: Background::Dark,
+        open: None,
+    };
+    let wait = Duration::from_millis(800);
+    let (down, enter) = (key(KeyCode::Down), key(KeyCode::Enter));
+    let keys = paced(
+        vec![
+            // Local model, then the other local server: its address, no key, and a model its list lacks.
+            (
+                wait,
+                vec![down.clone(), down.clone(), down.clone(), enter.clone()],
+            ),
+            (Duration::ZERO, vec![down, enter.clone()]),
+            (
+                Duration::ZERO,
+                [typed(&model), vec![enter.clone()]].concat(),
+            ),
+            (Duration::ZERO, vec![enter.clone()]),
+            (wait, [typed("test"), vec![enter]].concat()),
+        ],
+        Duration::from_millis(1000),
+    );
+    let exit = kelpy_tui::run(&mut terminal, keys, api, options)
+        .await
+        .unwrap();
+    assert_eq!(exit, Exit::Quit);
+    let shown = screen(&terminal);
+    assert!(
+        shown.contains("Provider saved: test (Other local server)."),
+        "{shown}"
+    );
+    let configured = agent.provider_info().configured.unwrap();
+    assert_eq!(configured.model, "test");
+    assert_eq!(configured.service.as_deref(), Some("local-server"));
+    assert_eq!(configured.base_url.as_deref(), Some(model.as_str()));
 }
 
 #[tokio::test(flavor = "multi_thread")]

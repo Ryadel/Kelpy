@@ -13,12 +13,15 @@ mod inline;
 mod mark;
 mod model;
 mod remote;
+mod setup;
+mod setup_ui;
 mod theme;
 mod transcript;
 mod ui;
 
 use std::collections::HashSet;
 use std::io::{self, Write};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,15 +37,17 @@ use ratatui::layout::Size;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::{AbortHandle, JoinError, JoinSet};
 
 pub use api::Api;
 pub use app::Exit;
 use app::{App, Effect, Update};
 pub use kelpy_client::ClientError;
+use kelpy_client::setup::{CodeEvent, Download, Installation, SIGN_IN_MINUTES};
 use mark::Rgb;
 use model::{ChatEvent, RuntimeEvent};
 use remote::{AnsiBackend, KeyParser};
+use setup::{Call, Reply};
 use terminal_colorsaurus::QueryOptions;
 use theme::{Colours, Theme};
 
@@ -54,6 +59,10 @@ const RECONNECT: Duration = Duration::from_secs(2);
 const INLINE_HEIGHT: u16 = 10;
 /// How long the terminal of an SSH session has to tell its background. Terminals that do not tell say so at once.
 const ASK_TIME: Duration = Duration::from_secs(1);
+/// How long the setup window shows that the provider is saved before it closes.
+const SAVED_SHOWN: Duration = Duration::from_millis(2500);
+/// How often a sign-in as an agent is checked, while the browser may complete it.
+const SIGN_IN_CHECK: Duration = Duration::from_secs(2);
 
 pub struct Options {
     pub banner: Banner,
@@ -385,6 +394,7 @@ where
         updates,
         tasks: JoinSet::new(),
         following: Arc::default(),
+        setup_task: None,
     };
     runner.subscribe();
     let mut transcript = transcript::Transcript::default();
@@ -472,6 +482,9 @@ fn failure(ended: Result<(), JoinError>) -> Option<Update> {
     }
 }
 
+/// A setup request's answer, once it comes.
+type Answer = Pin<Box<dyn Future<Output = Result<Reply, ClientError>> + Send>>;
+
 /// Runs the effects in the background, sending their results back as updates; the loop collects them as they end.
 /// Dropped, it stops them all.
 struct Runner {
@@ -481,6 +494,9 @@ struct Runner {
     tasks: JoinSet<()>,
     /// The conversations whose answer is being followed, so that none is followed twice.
     following: Arc<Mutex<HashSet<i64>>>,
+    /// What the setup window follows, for its window and step: a sign-in, an installation, a download. Stopped when
+    /// the step changes or the window closes.
+    setup_task: Option<((u64, u64), AbortHandle)>,
 }
 
 impl Runner {
@@ -488,14 +504,24 @@ impl Runner {
         let (api, updates) = (self.api.clone(), self.updates.clone());
         match effect {
             Effect::LoadProvider => {
-                self.spawn(async move { Ok(Update::Provider(api.provider().await?.state())) })
+                self.spawn(async move { Ok(Update::Provider(api.provider().await?)) })
             }
+            Effect::Setup {
+                setup,
+                ticket,
+                call,
+            } => self.setup(setup, ticket, call),
             Effect::LoadSessions(listing) => self.spawn(async move {
                 Ok(Update::Sessions {
                     listing,
                     sessions: api.sessions().await?,
                 })
             }),
+            Effect::LoadSuggestions => {
+                self.spawn(async move { Ok(Update::Suggestions(api.suggestions().await?)) })
+            }
+            Effect::SetSuggestions(enabled) => self
+                .spawn(async move { Ok(Update::Suggestions(api.set_suggestions(enabled).await?)) }),
             Effect::LoadConnections => {
                 self.spawn(async move { Ok(Update::Connections(api.connections().await?.waiting)) })
             }
@@ -586,6 +612,179 @@ impl Runner {
                 Ok(Update::Session(api.update_session(session, &change).await?))
             }),
             Effect::Exit(_) => {}
+        }
+    }
+
+    /// Runs a request of the setup window `setup`, for its step `ticket`; what the step followed before stops.
+    fn setup(&mut self, setup: u64, ticket: u64, call: Call) {
+        let at = (setup, ticket);
+        let ends = matches!(call, Call::Stop | Call::Close);
+        if let Some((running, handle)) = &self.setup_task
+            && (*running != at || ends)
+        {
+            handle.abort();
+            self.setup_task = None;
+        }
+        let client = self.api.client().clone();
+        let updates = self.updates.clone();
+        let reply = move |reply| Update::Setup {
+            setup,
+            ticket,
+            reply,
+        };
+        let answer: Option<Answer> = match call {
+            Call::Stop | Call::Close => return,
+            Call::Models {
+                service,
+                base_url,
+                api_key,
+            } => Some(Box::pin(async move {
+                let list = client
+                    .models(&service, base_url.as_deref(), api_key.as_deref())
+                    .await;
+                Ok(Reply::Models(list))
+            })),
+            Call::ChatGptStatus => Some(Box::pin(async move {
+                Ok(Reply::ChatGpt(client.chatgpt_status().await?))
+            })),
+            Call::FinishSignIn(address) => Some(Box::pin(async move {
+                Ok(Reply::SignedIn(client.finish_sign_in(&address).await?))
+            })),
+            Call::ChatGptModels => Some(Box::pin(async move {
+                Ok(Reply::ChatGptModels(client.chatgpt_models().await?))
+            })),
+            Call::Ollama(address) => Some(Box::pin(async move {
+                Ok(Reply::Ollama(client.ollama(&address).await?))
+            })),
+            Call::Installer => Some(Box::pin(async move {
+                let installer = client.ollama_installer().await;
+                Ok(Reply::Installer(
+                    installer.map_err(|error| error.to_string()),
+                ))
+            })),
+            Call::Save(request) => Some(Box::pin(async move {
+                client.save_provider(&request).await?;
+                Ok(Reply::Saved)
+            })),
+            Call::CloseLater => Some(Box::pin(async move {
+                tokio::time::sleep(SAVED_SHOWN).await;
+                Ok(Reply::Close)
+            })),
+            Call::SignInWithCode { keep } => {
+                let task = self.tasks.spawn(async move {
+                    let events = client.sign_in_with_code(keep).await;
+                    relay(
+                        events,
+                        &updates,
+                        reply,
+                        "the sign-in ended without an outcome",
+                        |event| match event {
+                            CodeEvent::Code {
+                                verification_url,
+                                user_code,
+                            } => (
+                                Reply::Code {
+                                    url: verification_url,
+                                    code: user_code,
+                                },
+                                false,
+                            ),
+                            CodeEvent::SignedIn { account } => (Reply::SignedIn(account), true),
+                            CodeEvent::Failed { error } => (Reply::Failed(error), true),
+                        },
+                    )
+                    .await;
+                });
+                self.setup_task = Some((at, task));
+                None
+            }
+            Call::StartSignIn { keep, forget } => {
+                let task = self.tasks.spawn(async move {
+                        let send = |answer| updates.send(reply(answer));
+                        let started = async {
+                            if forget {
+                                client.forget_registration().await?;
+                            }
+                            client.start_sign_in(keep).await
+                        };
+                        match started.await {
+                            Ok(url) => {
+                                let _ = send(Reply::SignInAddress(url)).await;
+                            }
+                            Err(error) => {
+                                let _ = send(Reply::Failed(error.to_string())).await;
+                                return;
+                            }
+                        }
+                        // The browser comes back to Kelpy, which completes the sign-in: it shows here once done.
+                        let deadline =
+                            tokio::time::Instant::now() + Duration::from_secs(SIGN_IN_MINUTES * 60);
+                        loop {
+                            tokio::time::sleep(SIGN_IN_CHECK).await;
+                            if let Ok(status) = client.chatgpt_status().await
+                                && let Some(account) = status.signed_in
+                            {
+                                let _ = send(Reply::SignedIn(account)).await;
+                                return;
+                            }
+                            if tokio::time::Instant::now() > deadline {
+                                let late = format!(
+                                    "The sign-in took longer than {SIGN_IN_MINUTES} minutes: press Esc and start it \
+                                     again."
+                                );
+                                let _ = send(Reply::Failed(late)).await;
+                                return;
+                            }
+                        }
+                    });
+                self.setup_task = Some((at, task));
+                None
+            }
+            Call::Install => {
+                let task = self.tasks.spawn(async move {
+                    let events = client.install_ollama().await;
+                    relay(
+                        events,
+                        &updates,
+                        reply,
+                        "the installation ended without an outcome",
+                        |installation: Installation| {
+                            let done = installation.done;
+                            (Reply::Installation(installation), done)
+                        },
+                    )
+                    .await;
+                });
+                self.setup_task = Some((at, task));
+                None
+            }
+            Call::Download { base_url, model } => {
+                let task = self.tasks.spawn(async move {
+                    let events = client.download_model(&base_url, &model).await;
+                    relay(
+                        events,
+                        &updates,
+                        reply,
+                        "the download ended without an outcome",
+                        |download: Download| {
+                            let done = download.done;
+                            (Reply::Download(download), done)
+                        },
+                    )
+                    .await;
+                });
+                self.setup_task = Some((at, task));
+                None
+            }
+        };
+        if let Some(answer) = answer {
+            let updates = self.updates.clone();
+            self.tasks.spawn(async move {
+                let answer = answer
+                    .await
+                    .unwrap_or_else(|error| Reply::Failed(error.to_string()));
+                let _ = updates.send(reply(answer)).await;
+            });
         }
     }
 
@@ -690,6 +889,40 @@ async fn forward(
             return;
         }
     }
+}
+
+/// Sends each event of a stream the setup window follows as its reply, until one that ends it; `unfinished` says what
+/// went wrong when the stream ends before.
+async fn relay<T: DeserializeOwned>(
+    events: Result<impl Stream<Item = Result<String, ClientError>>, ClientError>,
+    updates: &mpsc::Sender<Update>,
+    reply: impl Fn(Reply) -> Update,
+    unfinished: &str,
+    convert: impl Fn(T) -> (Reply, bool),
+) {
+    let events = match events {
+        Ok(events) => events,
+        Err(error) => {
+            let _ = updates.send(reply(Reply::Failed(error.to_string()))).await;
+            return;
+        }
+    };
+    let mut events = std::pin::pin!(events);
+    while let Some(data) = events.next().await {
+        let (answer, last) = match data {
+            Ok(data) => match parse::<T>(&data) {
+                Some(event) => convert(event),
+                None => continue,
+            },
+            Err(error) => (Reply::Failed(error.to_string()), true),
+        };
+        if updates.send(reply(answer)).await.is_err() || last {
+            return;
+        }
+    }
+    let _ = updates
+        .send(reply(Reply::Failed(unfinished.to_owned())))
+        .await;
 }
 
 fn parse<T: DeserializeOwned>(data: &str) -> Option<T> {

@@ -15,6 +15,8 @@ use ratatui::widgets::{Paragraph, Widget};
 use crate::app::App;
 use crate::mark::{Kelpie, Mark, Wordmark};
 use crate::model::{ActionState, Message, Role, Status};
+use crate::setup::Para;
+use crate::setup_ui;
 use crate::theme::Theme;
 use crate::transcript::{action_lines, fact_lines, note, stamp, text_lines, wrap};
 use crate::ui::{kelpy_name, start_facts};
@@ -27,6 +29,8 @@ pub struct Scrollback {
     /// The conversation written, and what of each of its messages.
     conversation: Option<i64>,
     printed: HashMap<i64, Printed>,
+    /// What the setup window's step explains, as last written: written again only when it changes.
+    setup: Vec<Para>,
 }
 
 /// What of a message was written.
@@ -87,6 +91,17 @@ impl Scrollback {
             if message.role == Role::User {
                 lines.push(stamp(message, &now, width_used, theme));
             }
+        }
+        // What the setup's step explains goes above the footer, where a QR code has the rows it needs.
+        match &app.setup {
+            Some(setup) => {
+                let view = setup.view(app.opens_links);
+                if !view.text.is_empty() && view.text != self.setup {
+                    lines.extend(setup_ui::history(&view, width_used, theme));
+                    self.setup = view.text;
+                }
+            }
+            None => self.setup.clear(),
         }
         if !lines.is_empty() {
             blocks.push(paragraph(lines, width));
@@ -374,6 +389,33 @@ mod tests {
         assert!(scrollback.take(&app, 80, Theme::default()).is_none());
         app.messages.push(message(9, Role::User, "Later"));
         assert!(scrollback.take(&app, 80, Theme::default()).is_none());
+    }
+
+    #[test]
+    fn what_the_setup_explains_goes_into_the_history_once() {
+        let mut scrollback = Scrollback::default();
+        let mut app = started();
+        app.loaded = true;
+        scrollback.take(&app, 80, Theme::default());
+        app.setup = Some(crate::setup::Setup::new(Some(crate::setup::tests::info(
+            json!(null),
+            None,
+        ))));
+        let lines = text(&scrollback.take(&app, 80, Theme::default()).unwrap()).join("\n");
+        assert!(
+            lines.contains("── How does Kelpy connect to AI?"),
+            "{lines}"
+        );
+        assert!(lines.contains("  In use: none."), "{lines}");
+        assert!(scrollback.take(&app, 80, Theme::default()).is_none());
+        // Closed and opened again: written again.
+        app.setup = None;
+        assert!(scrollback.take(&app, 80, Theme::default()).is_none());
+        app.setup = Some(crate::setup::Setup::new(Some(crate::setup::tests::info(
+            json!(null),
+            None,
+        ))));
+        assert!(scrollback.take(&app, 80, Theme::default()).is_some());
     }
 
     /// The working conversation of the screens' tests, already loaded.

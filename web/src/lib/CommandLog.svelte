@@ -6,9 +6,11 @@
   import { cn } from '$lib/utils';
   import Elapsed from './Elapsed.svelte';
   import OperationDialog from './OperationDialog.svelte';
+  import ResizeHandle from './ResizeHandle.svelte';
   import { clock, duration, restorable, stateLabels } from './actions';
   import { describe, fetchExport, fetchReport, restoreAction, type Action } from './api';
   import { download } from './download';
+  import { COMMAND_LOG, loadWidth, saveWidth } from './panels';
 
   interface Props {
     /** Every action of the open conversation, in order: the answers' and the administrator's. */
@@ -27,6 +29,9 @@
   let restoring = $state<Action | null>(null);
   let dialog = $state(false);
   let error = $state<string | null>(null);
+  /** Its width beside the conversation, dragged by its edge and kept in this browser; on a narrow screen it covers it. */
+  let width = $state(loadWidth(COMMAND_LOG));
+  $effect(() => saveWidth(COMMAND_LOG, width));
 
   // A new entry shows at once, unless the user scrolled back to read an older one.
   $effect(() => {
@@ -73,9 +78,18 @@
 </script>
 
 <aside
-  class="bg-sidebar fixed inset-y-0 right-0 z-40 flex w-full max-w-sm flex-col border-l shadow-lg lg:static lg:z-auto lg:w-[380px] lg:max-w-none lg:shadow-none"
+  class="bg-sidebar fixed inset-y-0 right-0 z-40 flex w-full max-w-sm flex-col border-l shadow-lg lg:relative lg:z-auto lg:w-(--log-width) lg:max-w-[50vw] lg:shadow-none"
+  style:--log-width="{width}px"
   aria-label="Command log"
 >
+  <ResizeHandle
+    label="Resize the Command log"
+    panel={COMMAND_LOG}
+    edge="left"
+    {width}
+    onResize={(to) => (width = to)}
+    class="max-lg:hidden"
+  />
   <div class="flex h-14 shrink-0 items-center gap-1 px-4">
     <h2 class="mr-auto font-medium">Command log</h2>
     <Button

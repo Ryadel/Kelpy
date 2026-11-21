@@ -6,6 +6,8 @@
 //! may take long, but ends when nothing arrives for [`STREAM_IDLE`], while the runtime sends a keep-alive every 15
 //! seconds. An event is read whole up to [`MAX_EVENT`].
 
+pub mod setup;
+
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};

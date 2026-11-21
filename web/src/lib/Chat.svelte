@@ -135,11 +135,19 @@
    */
   const sessionId = $derived(session.id);
 
+  /** The administrator's likely next message, written by Kelpy after the answer `after`. */
+  let suggestion = $state<{ after: number; text: string } | null>(null);
+  /** Shown while that answer is still the last message and no other is being written. */
+  const suggested = $derived(
+    suggestion !== null && !running && messages.at(-1)?.id === suggestion.after ? suggestion : null,
+  );
+
   $effect(() => {
     const id = sessionId;
     messages = [];
     administrator = [];
     summarisedThrough = null;
+    suggestion = null;
     endings = {};
     error = null;
     loaded = false;
@@ -233,6 +241,18 @@
       follow(id).catch(report);
     } else {
       apply({ ...event, type: 'done' });
+    }
+  }
+
+  /** Suggestions were turned off: the one shown goes, and Tab no longer takes it. */
+  export function dropSuggestion() {
+    suggestion = null;
+  }
+
+  /** Kelpy suggested the administrator's next message in some conversation: one for this conversation is kept. */
+  export function receiveSuggestion(event: { session_id: number; after: number; text: string }) {
+    if (event.session_id === session.id) {
+      suggestion = { after: event.after, text: event.text };
     }
   }
 
@@ -574,6 +594,7 @@
     onSend={send}
     onStop={stop}
     history={sent}
+    suggestion={suggested}
   />
 {/snippet}
 

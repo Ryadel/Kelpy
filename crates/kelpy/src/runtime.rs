@@ -526,7 +526,9 @@ async fn serve(home: &Home, launch: &Launch, limits: Limits, start: Start) -> Re
     let home = &home;
     let agent = Arc::new(told(
         &mut ready,
-        Agent::new(home, store, config.provider.clone(), Endpoints::default()).map_err(Into::into),
+        Agent::new(home, store, config.provider.clone(), Endpoints::default())
+            .map(|agent| agent.with_suggestions(config.suggestions.enabled))
+            .map_err(Into::into),
     )?);
     let (auth, port, started_at, limits, ssh) = match handover {
         Some(handover) => {
@@ -1534,7 +1536,7 @@ fn describe_provider(agent: &Agent) -> String {
     let Some(provider) = &info.configured else {
         return paint(
             false,
-            "not set up: choose one in the Web UI or run `kelpy provider`",
+            "not set up: Ctrl+P in the terminal UI, the Web UI or `kelpy provider`",
         );
     };
     let name = |id: &str| {
@@ -1561,11 +1563,11 @@ fn describe_access(agent: &Agent, info: &ProviderInfo) -> (bool, String) {
     match (info.needs, info.key) {
         (Some(Needed::SignIn), _) => (
             false,
-            "not signed in: sign in from the Web UI or run `kelpy provider`".to_owned(),
+            "not signed in: Ctrl+P in the terminal UI, the Web UI or `kelpy provider`".to_owned(),
         ),
         (Some(Needed::Key), _) => (
             false,
-            "no API key: enter it in the Web UI or run `kelpy provider`".to_owned(),
+            "no API key: Ctrl+P in the terminal UI, the Web UI or `kelpy provider`".to_owned(),
         ),
         (None, _) if provider.kind.signs_in() => {
             let status = agent.chatgpt().status();

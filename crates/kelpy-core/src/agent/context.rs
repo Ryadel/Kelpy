@@ -347,7 +347,7 @@ fn take_quarters(chars: impl Iterator<Item = char>, quarters: u64) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use kelpy_storage::Status;
 

@@ -3,6 +3,7 @@ use crate::Banner;
 use crate::app::tests::{message, session, waiting};
 use crate::model::{ContextUse, ProviderState, Role};
 use crate::theme::Colours;
+use crossterm::event::KeyCode;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -341,11 +342,114 @@ fn inline_the_footer_has_the_message_box_and_the_status_line() {
     let rows: Vec<String> = text(&screen).lines().map(str::to_owned).collect();
     assert_eq!(
         rows[9].trim_end(),
-        " web-01 · Read-only · Ask               Ctrl+R conversations · Ctrl+C stop Kelpy"
+        " web-01 · Read-only · Ask   Ctrl+P AI · Ctrl+R conversations · Ctrl+C stop Kelpy"
     );
     assert!(rows[4].starts_with("─"), "{rows:#?}");
     assert_eq!(rows[3].trim_end(), "  Checking the");
     shows(&screen, &["› █ Write a message", "Esc stop the answer"]);
+}
+
+/// `started`, with the setup window open on its first question.
+fn setting_up() -> App {
+    let mut app = started();
+    app.setup = Some(crate::setup::Setup::new(Some(crate::setup::tests::info(
+        json!(null),
+        None,
+    ))));
+    app
+}
+
+fn press(app: &mut App, keys: &[KeyCode]) {
+    for code in keys {
+        app.key(crossterm::event::KeyEvent::new(
+            *code,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+}
+
+#[test]
+fn the_setup_window_shows_over_the_screen_and_never_the_key_typed() {
+    let mut app = setting_up();
+    let screen = drawn(&app, (100, 32), DARK);
+    shows(
+        &screen,
+        &[
+            " How does Kelpy connect to AI? ",
+            "In use: none. Kelpy cannot answer until one is chosen.",
+            "› ChatGPT plan",
+            "Paid by your plan.",
+            " ↑↓ choose · Enter next · Esc close ",
+            "Ctrl+P close the setup",
+        ],
+    );
+    // The screen behind is dimmed.
+    assert!(screen[(0, 3)].modifier.contains(Modifier::DIM));
+    press(&mut app, &[KeyCode::Down, KeyCode::Enter, KeyCode::Enter]);
+    app.paste("sk-ant-api03-secret");
+    let screen = drawn(&app, (100, 32), DARK);
+    shows(
+        &screen,
+        &[
+            " Anthropic (Claude) · Key ",
+            "1 Get a key from Anthropic (Claude).",
+            "API key, hidden",
+            &format!("› {}█", "•".repeat(19)),
+        ],
+    );
+    assert!(!text(&screen).contains("secret"));
+}
+
+#[test]
+fn the_code_to_approve_shows_with_its_qr_code_where_it_fits() {
+    let mut app = setting_up();
+    let setup = app.setup.as_mut().unwrap();
+    setup.key(crossterm::event::KeyEvent::from(KeyCode::Enter));
+    setup.reply(crate::setup::Reply::ChatGpt(
+        serde_json::from_value(json!({"signed_in": null, "registered": null, "kept": false}))
+            .unwrap(),
+    ));
+    setup.key(crossterm::event::KeyEvent::from(KeyCode::Enter));
+    setup.key(crossterm::event::KeyEvent::from(KeyCode::Enter));
+    setup.reply(crate::setup::Reply::Code {
+        url: "https://auth.openai.com/codex/device".into(),
+        code: "K7QF-2MXD".into(),
+    });
+    let tall = drawn(&app, (100, 48), DARK);
+    shows(
+        &tall,
+        &[
+            "https://auth.openai.com/codex/device",
+            "Code  K7QF-2MXD",
+            "▀▀▀▀▀▀▀",
+        ],
+    );
+    // Too few rows for the QR code: the address and the code stay.
+    let short = drawn(&app, (100, 24), DARK);
+    shows(
+        &short,
+        &["https://auth.openai.com/codex/device", "Code  K7QF-2MXD"],
+    );
+    assert!(!text(&short).contains("▀▀▀▀▀▀▀"));
+}
+
+#[test]
+fn inline_the_setup_takes_the_footer() {
+    let app = setting_up();
+    let screen = drawn_inline(&app, 80, Vec::new());
+    let rows: Vec<String> = text(&screen).lines().map(str::to_owned).collect();
+    assert!(
+        rows[0].starts_with("─ How does Kelpy connect to AI? ─"),
+        "{rows:#?}"
+    );
+    assert!(rows[0].trim_end().ends_with(" Ctrl+P"), "{rows:#?}");
+    // The descriptions under the one chosen only.
+    shows(
+        &screen,
+        &["› ChatGPT plan", "Paid by your plan.", "  API key"],
+    );
+    assert!(!text(&screen).contains("Billed per use."));
+    assert_eq!(rows[9].trim_end(), " ↑↓ choose · Enter next · Esc close");
 }
 
 #[test]

@@ -23,6 +23,11 @@ port = 0
 # At start, ask GitHub for the latest release and offer to install it. `kelpy update` works either way.
 check = true
 
+[suggestions]
+# After each answer, ask the model for the administrator's likely next message, shown in grey in the message box.
+# One more request to the model per answer. Also changed from the Web UI menu and the terminal UI (F5).
+enabled = true
+
 # The AI provider, also editable from the Web UI and with `kelpy provider`. Example:
 # [provider]
 # kind = "anthropic"            # anthropic, chatgpt, openai, ollama or openai-compatible
@@ -37,6 +42,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub provider: Option<ProviderConfig>,
     pub updates: UpdatesConfig,
+    pub suggestions: SuggestionsConfig,
     pub memory: MemoryConfig,
 }
 
@@ -91,6 +97,19 @@ pub struct UpdatesConfig {
 impl Default for UpdatesConfig {
     fn default() -> Self {
         Self { check: true }
+    }
+}
+
+/// The `[suggestions]` section. Homes created before it existed have no such section, and suggest.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SuggestionsConfig {
+    pub enabled: bool,
+}
+
+impl Default for SuggestionsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -160,25 +179,18 @@ impl Config {
 
 /// Replaces the `[provider]` section of the configuration file, keeping everything else, comments included.
 pub fn save_provider(path: &Path, provider: &ProviderConfig) -> Result<(), ConfigError> {
-    let failed = |message: String| ConfigError::Write {
-        path: path.to_path_buf(),
-        message,
-    };
-    let text = fs::read_to_string(path).map_err(|error| failed(error.to_string()))?;
-    let mut document: toml_edit::DocumentMut = text
-        .parse()
-        .map_err(|error: toml_edit::TomlError| failed(error.to_string()))?;
-    let mut table = toml_edit::Table::new();
-    table["kind"] = toml_edit::value(provider.kind.id());
-    table["model"] = toml_edit::value(provider.model.as_str());
-    if let Some(base_url) = &provider.base_url {
-        table["base_url"] = toml_edit::value(base_url.as_str());
-    }
-    if let Some(service) = &provider.service {
-        table["service"] = toml_edit::value(service.as_str());
-    }
-    document["provider"] = toml_edit::Item::Table(table);
-    write_document(path, &document)
+    edit(path, |document| {
+        let mut table = toml_edit::Table::new();
+        table["kind"] = toml_edit::value(provider.kind.id());
+        table["model"] = toml_edit::value(provider.model.as_str());
+        if let Some(base_url) = &provider.base_url {
+            table["base_url"] = toml_edit::value(base_url.as_str());
+        }
+        if let Some(service) = &provider.service {
+            table["service"] = toml_edit::value(service.as_str());
+        }
+        document["provider"] = toml_edit::Item::Table(table);
+    })
 }
 
 /// Keeps the server's memory in the server folder `shared` from now on, writing the `[memory]` section.
@@ -193,32 +205,58 @@ pub fn save_memory(
     using: MemoryUse,
     shared: Option<&Path>,
 ) -> Result<(), ConfigError> {
-    let text = fs::read_to_string(path).map_err(|error| ConfigError::Write {
+    edit(path, |document| {
+        if !document.contains_table("memory") {
+            let mut table = toml_edit::Table::new();
+            table.decor_mut().set_prefix(
+                "\n# Which memory of the server Kelpy uses: \"private\", only for you, or \"shared\" with the other \
+                 administrators\n# of this computer, in the folder `shared`, which only they can open.\n",
+            );
+            document["memory"] = toml_edit::Item::Table(table);
+        }
+        let using = match using {
+            MemoryUse::Private => "private",
+            MemoryUse::Shared => "shared",
+        };
+        document["memory"]["use"] = toml_edit::value(using);
+        if let Some(shared) = shared {
+            document["memory"]["shared"] = toml_edit::value(shared.to_string_lossy().as_ref());
+        }
+    })
+}
+
+/// Records in the configuration at `path` whether the next message is suggested, keeping the rest of the file.
+pub fn save_suggestions(path: &Path, enabled: bool) -> Result<(), ConfigError> {
+    edit(path, |document| {
+        if !document.contains_table("suggestions") {
+            let mut table = toml_edit::Table::new();
+            table.decor_mut().set_prefix(
+                "\n# After each answer, ask the model for the administrator's likely next message, shown in grey in \
+                 the message box.\n# One more request to the model per answer.\n",
+            );
+            document["suggestions"] = toml_edit::Item::Table(table);
+        }
+        document["suggestions"]["enabled"] = toml_edit::value(enabled);
+    })
+}
+
+/// Held while the configuration is read, changed and written: two changes at once, such as the provider and the
+/// suggestions from two interfaces, would otherwise each write the file as it read it, and one would be lost.
+static EDITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Reads the configuration at `path`, applies `change` and writes it back, keeping everything else, comments
+/// included; one change at a time.
+fn edit(path: &Path, change: impl FnOnce(&mut toml_edit::DocumentMut)) -> Result<(), ConfigError> {
+    let failed = |message: String| ConfigError::Write {
         path: path.to_path_buf(),
-        message: error.to_string(),
-    })?;
-    let mut document: toml_edit::DocumentMut =
-        text.parse()
-            .map_err(|error: toml_edit::TomlError| ConfigError::Write {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })?;
-    if !document.contains_table("memory") {
-        let mut table = toml_edit::Table::new();
-        table.decor_mut().set_prefix(
-            "\n# Which memory of the server Kelpy uses: \"private\", only for you, or \"shared\" with the other \
-             administrators\n# of this computer, in the folder `shared`, which only they can open.\n",
-        );
-        document["memory"] = toml_edit::Item::Table(table);
-    }
-    let using = match using {
-        MemoryUse::Private => "private",
-        MemoryUse::Shared => "shared",
+        message,
     };
-    document["memory"]["use"] = toml_edit::value(using);
-    if let Some(shared) = shared {
-        document["memory"]["shared"] = toml_edit::value(shared.to_string_lossy().as_ref());
-    }
+    let _editing = kelpy_common::lock(&EDITING);
+    let text = fs::read_to_string(path).map_err(|error| failed(error.to_string()))?;
+    let mut document: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|error: toml_edit::TomlError| failed(error.to_string()))?;
+    change(&mut document);
     write_document(path, &document)
 }
 
@@ -236,6 +274,27 @@ fn write_document(path: &Path, document: &toml_edit::DocumentMut) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changes_made_at_once_are_all_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, DEFAULT_CONFIG).unwrap();
+        let provider: ProviderConfig =
+            toml::from_str("kind = \"ollama\"\nmodel = \"qwen3.5:9b\"").unwrap();
+        for _ in 0..20 {
+            std::thread::scope(|scope| {
+                scope.spawn(|| save_suggestions(&path, false).unwrap());
+                scope.spawn(|| save_provider(&path, &provider).unwrap());
+                scope.spawn(|| save_memory(&path, MemoryUse::Private, None).unwrap());
+            });
+            let config = Config::load(&path).unwrap();
+            assert!(!config.suggestions.enabled);
+            assert_eq!(config.provider.unwrap().model, "qwen3.5:9b");
+            save_suggestions(&path, true).unwrap();
+            fs::write(&path, DEFAULT_CONFIG).unwrap();
+        }
+    }
 
     #[test]
     fn the_shared_memory_is_recorded_keeping_the_rest_of_the_file() {
@@ -273,6 +332,7 @@ mod tests {
         assert_eq!(config.server.host, ServerConfig::default().host);
         assert_eq!(config.server.port, 0);
         assert!(config.updates.check);
+        assert!(config.suggestions.enabled);
     }
 
     #[test]

@@ -46,6 +46,17 @@ pub enum Event {
         /// What the answer's last request took of the model's context window, if it got as far as a request.
         context: Option<ContextUse>,
     },
+    /// The administrator's likely next message in a conversation, written by the model after the answer `after`.
+    /// Shown until the administrator writes or sends; a new answer replaces it.
+    Suggestion {
+        session_id: i64,
+        after: i64,
+        text: String,
+    },
+    /// Suggesting the next message was turned on or off.
+    SuggestionsChanged {
+        enabled: bool,
+    },
     /// An operation the administrator asked for started or ended: it is not part of an answer.
     ActionChanged {
         session_id: i64,
@@ -80,6 +91,8 @@ impl Event {
             Self::SessionDeleted { .. } => "session_deleted",
             Self::AnswerStarted { .. } => "answer_started",
             Self::AnswerEnded { .. } => "answer_ended",
+            Self::Suggestion { .. } => "suggestion",
+            Self::SuggestionsChanged { .. } => "suggestions_changed",
             Self::ActionChanged { .. } => "action_changed",
             Self::DifferencesChanged => "differences_changed",
             Self::SecretsChanged => "secrets_changed",

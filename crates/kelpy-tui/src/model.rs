@@ -2,6 +2,7 @@
 //! types, as it sends them, so that nothing it sends is lost on the way: a conversation's revision, every detail of
 //! an action to approve. The envelopes of the streams are the terminal UI's, as it follows only some events.
 
+pub use kelpy_client::setup::ProviderInfo;
 pub use kelpy_core::storage::{Action, ActionState, Message, Role, Session, Status};
 use serde::Deserialize;
 
@@ -67,6 +68,15 @@ pub enum RuntimeEvent {
         #[serde(default)]
         context: Option<ContextUse>,
     },
+    /// The administrator's likely next message, written after the answer `after`.
+    Suggestion {
+        session_id: i64,
+        after: i64,
+        text: String,
+    },
+    SuggestionsChanged {
+        enabled: bool,
+    },
     ProviderChanged,
     ConnectionsChanged,
     Resync,
@@ -88,28 +98,6 @@ pub struct Connection {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Connections {
     pub waiting: Vec<Connection>,
-}
-
-/// The provider, as far as the terminal UI shows it.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ProviderInfo {
-    pub configured: Option<Configured>,
-    pub needs: Option<String>,
-    #[serde(default)]
-    pub services: Vec<Service>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Configured {
-    pub kind: String,
-    pub service: Option<String>,
-    pub model: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Service {
-    pub id: String,
-    pub name: String,
 }
 
 /// The provider as the terminal UI shows it: its name and model, and what keeps it from answering, if anything.
@@ -137,37 +125,27 @@ impl ProviderState {
     }
 }
 
-impl ProviderInfo {
-    pub fn state(&self) -> ProviderState {
-        let Some(configured) = &self.configured else {
-            return ProviderState {
-                label: "No AI provider".into(),
-                problem: Some("choose one in the Web UI or run `kelpy provider`".into()),
-                configured: false,
-            };
+/// The provider as the terminal UI shows it, from what the runtime says of it.
+pub fn provider_state(info: &ProviderInfo) -> ProviderState {
+    let Some(configured) = &info.configured else {
+        return ProviderState {
+            label: "No AI provider".into(),
+            problem: Some("press Ctrl+P to set one up".into()),
+            configured: false,
         };
-        let name = |id: &str| {
-            self.services
-                .iter()
-                .find(|service| service.id == id)
-                .map(|service| service.name.as_str())
-        };
-        let service = configured
-            .service
-            .as_deref()
-            .and_then(name)
-            .or_else(|| name(&configured.kind))
-            .unwrap_or(&configured.kind);
-        let problem = match self.needs.as_deref() {
-            Some("sign_in") => Some("not signed in: sign in from the Web UI"),
-            Some("key") => Some("no API key: enter it in the Web UI"),
-            _ => None,
-        };
-        ProviderState {
-            label: format!("{service} ({})", configured.model),
-            problem: problem.map(str::to_owned),
-            configured: true,
-        }
+    };
+    let service = info
+        .configured_service()
+        .map_or(configured.kind.as_str(), |service| service.name.as_str());
+    let problem = match info.needs.as_deref() {
+        Some("sign_in") => Some("not signed in: Ctrl+P signs in"),
+        Some("key") => Some("no API key: Ctrl+P enters it"),
+        _ => None,
+    };
+    ProviderState {
+        label: format!("{service} ({})", configured.model),
+        problem: problem.map(str::to_owned),
+        configured: true,
     }
 }
 
@@ -198,12 +176,12 @@ mod tests {
         };
         assert_eq!(ready.refusal(), None);
         let keyless = ProviderState {
-            problem: Some("no API key: enter it in the Web UI".into()),
+            problem: Some("no API key: Ctrl+P enters it".into()),
             ..ready
         };
         assert_eq!(
             keyless.refusal().as_deref(),
-            Some("Groq (llama): no API key: enter it in the Web UI.")
+            Some("Groq (llama): no API key: Ctrl+P enters it.")
         );
     }
 
@@ -211,19 +189,23 @@ mod tests {
     fn the_provider_is_named_with_its_state() {
         let info: ProviderInfo = serde_json::from_str(
             r#"{"configured":{"kind":"openai_compatible","service":"groq","model":"llama"},"needs":"key",
-                "services":[{"id":"groq","name":"Groq"}]}"#,
+                "services":[{"id":"groq","name":"Groq","way":"free","kind":"openai_compatible","base_url":null,
+                "description":"","key_page":null,"steps":[],"models":[]}]}"#,
         )
         .unwrap();
         assert_eq!(
-            info.state(),
+            provider_state(&info),
             ProviderState {
                 label: "Groq (llama)".into(),
-                problem: Some("no API key: enter it in the Web UI".into()),
+                problem: Some("no API key: Ctrl+P enters it".into()),
                 configured: true,
             }
         );
         let none: ProviderInfo =
             serde_json::from_str(r#"{"configured":null,"needs":null}"#).unwrap();
-        assert!(none.state().problem.unwrap().starts_with("choose one"));
+        assert_eq!(
+            provider_state(&none).refusal().as_deref(),
+            Some("No AI provider configured yet: press Ctrl+P to set one up.")
+        );
     }
 }

@@ -95,8 +95,8 @@ backup: that is the administrator's own action, told to you with their next mess
 report of the conversation (what changed, what did not complete, where secrets went, what stays on the server), \
 and Export the operations that succeeded, with their arguments. When Kelpy finds that something it changed was \
 changed outside it, a bar above the conversation says so, and the administrator settles each difference with Accept \
-or Put back. Stop, beside the message box, ends your answer. The AI provider menu in the top bar changes the service \
-and the model (Change provider). Files, in the top bar, uploads files to the server and lists them; the paperclip in the \
+or Put back. Stop, beside the message box, ends your answer. After an answer, the message box may show in grey the administrator's likely next message, written by a separate request to the model; Tab takes it, and Suggest the next message, in the menu of the top bar, turns this on or off for every conversation. The AI provider menu in the top bar changes the service \
+and the model (Change provider); in the terminal UI, Ctrl+P opens the same setup. Files, in the top bar, uploads files to the server and lists them; the paperclip in the \
 message box, or a file dropped on it, uploads it and writes its path in the message. Secrets, in the top bar, is where \
 the administrator adds secrets for every conversation, sees and copies the values of every secret, and keeps them in \
 the vault, an encrypted store that opens with a passphrase or an SSH key; the vault is locked again when Kelpy stops.
@@ -205,6 +205,7 @@ mod tests {
             "aria-label=\"Secrets\"",
             "title=\"AI provider\"",
             "'Change provider'",
+            "Suggest the next message",
         ] {
             assert!(app.contains(label), "{label}");
         }

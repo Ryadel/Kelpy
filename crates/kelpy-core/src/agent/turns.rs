@@ -12,10 +12,12 @@ mod actions;
 mod fitting;
 mod interface;
 mod seen;
+mod suggestion;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -320,6 +322,11 @@ pub(super) struct Turns {
     vision: Mutex<HashMap<WindowKey, bool>>,
     /// The images of the administrator's messages, for the model.
     seen: Mutex<Seen>,
+    /// Whether the administrator's next message is suggested after each answer.
+    suggestions: AtomicBool,
+    /// The suggestions being written: by conversation, their number and their stop signal.
+    suggesting: Mutex<HashMap<i64, (u64, CancellationToken)>>,
+    last_suggestion: AtomicU64,
 }
 
 /// A message of the administrator, as it is sent.
@@ -440,6 +447,9 @@ impl Turns {
             tool_support: Mutex::new(HashMap::new()),
             vision: Mutex::new(HashMap::new()),
             seen: Mutex::new(Seen::default()),
+            suggestions: AtomicBool::new(false),
+            suggesting: Mutex::new(HashMap::new()),
+            last_suggestion: AtomicU64::new(0),
         }
     }
 
@@ -459,6 +469,7 @@ impl Turns {
     /// when called; the returned future then waits, up to `limit`, until the answers are saved and the operations
     /// under way have ended, and tells whether all have.
     pub(super) fn stop_all(&self, limit: Duration) -> impl Future<Output = bool> + use<> {
+        self.stop_all_suggestions();
         let ends: Vec<CancellationToken> = {
             let mut answers = lock(&self.answers);
             answers.stopping = true;
@@ -501,6 +512,7 @@ impl Turns {
             return Err(AgentError::Deleting);
         }
         lock(&self.seen).forget(session_id);
+        self.stop_suggesting(session_id);
         let operations: Vec<CancellationToken> = answers
             .operations
             .values()
@@ -561,7 +573,6 @@ impl Turns {
         let (started, start) = oneshot::channel();
         let turns = Arc::clone(self);
         self.tasks.spawn(async move {
-            let _guard = guard;
             let prepared = tokio::select! {
                 biased;
                 () = stop.cancelled() => Err(turns.why_stopped(session_id)),
@@ -580,6 +591,7 @@ impl Turns {
                 images,
             } = outgoing;
             let model = settings.model.clone();
+            let suggesting = settings.clone();
             let turn = match turns
                 .store
                 .call(move |store| store.start_turn(session_id, &text, &title, &model))
@@ -627,6 +639,7 @@ impl Turns {
             // Freed first: an interface told that the answer ended may send the next message at once.
             drop(registered);
             let ended = answer.borrow().clone();
+            let (after, completed) = (ended.message.id, ended.error.is_none());
             turns.events.publish(Event::AnswerEnded {
                 session_id,
                 message: ended.message,
@@ -634,6 +647,12 @@ impl Turns {
                 summarised_through: ended.summarised_through,
                 context: ended.context,
             });
+            // Only after an answer that completed: one stopped or failed is followed by the administrator's own call.
+            // The answer is over for whoever waits on `guard`, such as the idle stop: the suggestion is not work.
+            drop(guard);
+            if completed {
+                turns.suggest(suggesting, session_id, after).await;
+            }
         });
         start.await.unwrap_or(Err(AgentError::NotStarted))
     }
@@ -667,6 +686,7 @@ impl Turns {
         if answers.running.contains_key(&session_id) {
             return Err(AgentError::Busy);
         }
+        self.stop_suggesting(session_id);
         let running = Running::default();
         let registered = Registered {
             turns: Arc::clone(self),

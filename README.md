@@ -82,7 +82,7 @@ account Kelpy runs as. In an interactive terminal they head the terminal UI, whi
 the Web UI; without a terminal Kelpy prints them:
 
 ```text
-Kelpy v0.5.4
+Kelpy v0.6.0
 
 Agent runtime started.
 Web UI:   http://127.0.0.1:54321/#code=K7QM-4ZP2
@@ -125,20 +125,21 @@ kept as incomplete. Kelpy never runs in the background: it lives in the terminal
 
 The terminal UI shows the same conversations as the Web UI: each action as one line, what waits for a decision
 whole, and from 120 columns a side panel with the conversation's state. Enter sends, Ctrl+Y and Ctrl+N approve or
-deny an action, Shift+Tab, F2 and F4 change the conversation's modes, and Ctrl+C quits, stopping Kelpy if that
-terminal UI started it. Over SSH it draws inline: the conversation goes into the terminal's own history and only a
-footer is redrawn. See [Terminal UI](https://github.com/Ryadel/Kelpy/wiki/Terminal-UI).
+deny an action, Shift+Tab, F2 and F4 change the conversation's modes, Ctrl+P sets up how Kelpy connects to AI, and
+Ctrl+C quits, stopping Kelpy if that terminal UI started it. Over SSH it draws inline: the conversation goes into
+the terminal's own history and only a footer is redrawn. See [Terminal UI](https://github.com/Ryadel/Kelpy/wiki/Terminal-UI).
 
 ### AI provider
 
-Choose the provider and model in the Web UI (it asks on the first visit), or run `kelpy provider`:
+Choose the provider and model in the Web UI or the terminal UI (Ctrl+P), which ask when Kelpy has no AI yet, or run
+`kelpy provider`:
 
 | Way | Services |
 |---|---|
 | ChatGPT plan | sign in as Codex CLI, with a code, or as an agent |
 | Free online service | Google Gemini, Groq, OpenRouter, Mistral, within their limits |
 | API key | Anthropic (`ANTHROPIC_API_KEY`), OpenAI (`OPENAI_API_KEY`), any OpenAI-compatible service |
-| Local model | Ollama (models listed, suggested and downloaded from the Web UI), any OpenAI-compatible server |
+| Local model | Ollama (installed, models listed, suggested and downloaded by Kelpy), any OpenAI-compatible server |
 
 Models are listed by the service. The choice is saved in `config.toml`. An API key entered in the Web UI or the
 terminal is kept in memory only, until Kelpy stops; a ChatGPT sign-in too, unless you save it on
@@ -152,6 +153,9 @@ model* above the first message the model still reads in full. Answers are concis
 explained in plain words: what it does and why, what to expect, and how to check it worked. The answer stays concise,
 and each explanation shows in a panel under its step; *Close explanations* under the answer folds them all. Every
 code block and panel has its own *Copy*, and *Copy* under an answer takes it whole, in Markdown.
+When an answer ends, the message you would likely send next shows in grey in the empty message box: Tab puts it in
+the box, sending stays with you. It is one more request to the model; *Suggest the next message* in the Web UI menu,
+or F5 in the terminal UI, turns it off.
 
 Options:
 

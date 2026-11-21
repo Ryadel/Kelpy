@@ -3,6 +3,40 @@
 Each release is on the [releases page](https://github.com/Ryadel/Kelpy/releases), with one executable per platform,
 the install scripts and the signed checksums. Versions follow [Semantic Versioning](https://semver.org).
 
+## 0.6.0 (2026-11-21)
+
+AI set up inside the terminal UI, the suggested next message, side panels you can resize, and Web UI tabs that no
+longer wait on "Connecting…".
+
+- **AI set up inside the terminal UI**: Ctrl+P opens the setup of how Kelpy connects to AI, with the questions of the
+  Web UI and of `kelpy provider` in the same order: a ChatGPT plan, with the code to approve and its QR code drawn
+  in the terminal; a free service or an API key, the key shown as dots and never kept in the message history; a
+  local model, with Ollama installed and a model downloaded if needed. It opens by itself when Kelpy has no AI yet,
+  and when a ChatGPT sign-in has ended or a key is missing. Over Kelpy's own SSH server, which has no shell for
+  `kelpy provider`, the Web UI is no longer needed to sign in or enter a key. Inline, the setup takes the footer and
+  writes what each step explains, the QR code included, into the terminal's history.
+
+- **The suggested next message**: when an answer ends, Kelpy asks the model for the message you would likely send
+  next and shows it in grey in the empty message box. Tab puts it in the box; sending stays with you. Typing drops
+  it. It never suggests deleting, stopping or overwriting something unless the conversation was already heading
+  there. It is one more request to the model after each answer: turn it off with *Suggest the next message* in the
+  Web UI menu, F5 in the terminal UI, or `[suggestions] enabled = false` in `config.toml`. The setting applies to
+  every conversation and interface.
+- **Resizable side panels**: in the Web UI, drag the edge of the conversations list or of the Command log to
+  resize it. A line shows when the pointer is over the edge; a double click gives back the usual width, and with
+  the edge focused the arrow keys move it. Each browser keeps its widths.
+- **Many Web UI tabs at once**: the tabs of a browser now share one connection for what happens in Kelpy, so
+  duplicating a tab or opening several no longer leaves the new ones on "Connecting…". Previously each tab kept one
+  open, and a browser allows six to the same address.
+- **The Web UI through Kelpy's SSH server**: a page closed no longer keeps its forwarded connection's place, and
+  forwarded connections have their own limit, 16 per SSH session, beside the 8 terminal UIs and SFTP sessions.
+  Previously, after a few pages opened and closed through the same tunnel, new connections were refused.
+- **Settings changed at once are all kept**: the provider, the memory and the suggestions, changed at the same moment
+  from two interfaces, no longer overwrite each other in `config.toml`.
+
+Updating from 0.5.4: Kelpy offers the update at its next start, or run `kelpy update`. The shared records are not
+upgraded.
+
 ## 0.5.4 (2026-11-17)
 
 Changes to files that may hold secrets, and the lore steps aside for approvals.

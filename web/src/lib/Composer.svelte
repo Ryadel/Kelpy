@@ -55,6 +55,8 @@
     onStop?: () => void;
     /** The messages sent in this conversation, oldest first: Up and Down bring them back. */
     history?: readonly string[];
+    /** The administrator's likely next message, after the answer `after`: in grey in the empty box, Tab takes it. */
+    suggestion?: { after: number; text: string } | null;
   }
 
   let {
@@ -71,9 +73,15 @@
     onSend,
     onStop,
     history = [],
+    suggestion = null,
   }: Props = $props();
 
   let field = $state<HTMLTextAreaElement | null>(null);
+  /** The answer whose suggestion the administrator typed over: it does not come back when the box is emptied. */
+  let dismissed = $state<number | null>(null);
+  const suggested = $derived(
+    suggestion && suggestion.after !== dismissed && value === '' ? suggestion.text : null,
+  );
   let picker = $state<HTMLInputElement | null>(null);
   /** The uploads under way: the conversation each is for, and whether it is an image, holding a place among them. */
   let uploading = $state.raw<{ owner: number | undefined; image: boolean }[]>([]);
@@ -178,6 +186,13 @@
   });
 
   function onKeydown(event: KeyboardEvent) {
+    const plain = !(event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing);
+    // Tab takes the suggestion only while it shows: otherwise it moves the focus, as everywhere.
+    if (suggested !== null && plain && (event.key === 'Tab' || event.key === 'ArrowRight')) {
+      event.preventDefault();
+      value = suggested;
+      return;
+    }
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       if (!running && usable() && sendable) {
@@ -321,9 +336,13 @@
     bind:value
     onkeydown={onKeydown}
     onpaste={onPaste}
-    oninput={() => recall.reset()}
+    oninput={() => {
+      recall.reset();
+      if (suggestion) dismissed = suggestion.after;
+    }}
     rows="1"
-    placeholder="Write a message"
+    placeholder={suggested ?? 'Write a message'}
+    title={suggested === null ? undefined : 'Tab: use the suggestion'}
     aria-label="Message"
     class="placeholder:text-muted-foreground block field-sizing-content max-h-48 min-h-7 w-full resize-none bg-transparent py-0.5 leading-relaxed outline-none"
   ></textarea>

@@ -36,9 +36,10 @@ use tokio_util::task::TaskTracker;
 
 /// How many sessions may be allowed at once.
 const MAX_SESSIONS: usize = 8;
-/// How many channels a session may have open at once, each a terminal UI, an SFTP session or a forward: with
-/// [`MAX_SESSIONS`], what the whole server runs is bounded.
+/// How many terminal and SFTP channels a session may have open at once.
 const MAX_CHANNELS: usize = 8;
+/// Web forwards have their own limit so browser sockets cannot take the terminal or SFTP slots.
+const MAX_FORWARDS: usize = 16;
 /// How many connections may be not yet allowed at once, apart from the sessions: a client that never logs in
 /// cannot keep an allowed one out.
 const MAX_WAITING: usize = 16;
@@ -202,6 +203,8 @@ async fn session(
         return;
     };
     let (allowed, mut allowing) = watch::channel(false);
+    let forwards_stop = server.stop.child_token();
+    let _stop_forwards = forwards_stop.clone().drop_guard();
     let connection = Connection {
         server: Arc::clone(&server),
         address,
@@ -211,6 +214,8 @@ async fn session(
         open: None,
         refused: false,
         running: HashMap::new(),
+        forwards: HashMap::new(),
+        forwards_stop,
         channels: HashMap::new(),
         sizes: HashMap::new(),
         inputs: HashMap::new(),
@@ -299,8 +304,11 @@ struct Connection {
     open: Option<Open>,
     /// Refused once: no other key of the same connection is asked for.
     refused: bool,
-    /// The channels open, at most [`MAX_CHANNELS`], each with whether something runs on it: one thing per channel.
+    /// The terminal and SFTP channels open, at most [`MAX_CHANNELS`], each with whether something runs on it.
     running: HashMap<ChannelId, bool>,
+    /// The forwards waiting for the peer's SSH close, at most [`MAX_FORWARDS`].
+    forwards: HashMap<ChannelId, CancellationToken>,
+    forwards_stop: CancellationToken,
     /// The session channels not yet given to SFTP.
     channels: HashMap<ChannelId, Channel<Msg>>,
     /// The terminals asked for: their size in columns and rows, and their name (`TERM`).
@@ -533,6 +541,9 @@ impl Handler for Connection {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.running.remove(&channel);
+        if let Some(stop) = self.forwards.remove(&channel) {
+            stop.cancel();
+        }
         self.inputs.remove(&channel);
         self.channels.remove(&channel);
         self.sizes.remove(&channel);
@@ -563,26 +574,37 @@ impl Handler for Connection {
             return Ok(());
         }
         let id = channel.id();
-        if !self.admit(id) {
+        if self.forwards.len() >= MAX_FORWARDS {
             reply.reject(ChannelOpenFailure::ResourceShortage).await;
             return Ok(());
         }
         let web = match TcpStream::connect((Ipv4Addr::LOCALHOST, web_port)).await {
             Ok(web) => web,
             Err(_) => {
-                self.running.remove(&id);
                 reply.reject(ChannelOpenFailure::ConnectFailed).await;
                 return Ok(());
             }
         };
-        self.start(id);
+        let stop = self.forwards_stop.child_token();
+        self.forwards.insert(id, stop.clone());
         reply.accept().await;
-        let stop = self.server.stop.clone();
         self.server.tasks.spawn(async move {
-            let (mut forwarded, mut web) = (channel.into_stream(), web);
-            // Ends when either side closes, or the server stops.
+            // Relay both half-closes. OpenSSH sends CLOSE once both sides have sent EOF. A ChannelStream sends
+            // CLOSE on drop instead, so russh removes the channel before the peer's CLOSE can reach our handler.
+            let (mut read, write) = channel.split();
+            let forwarded = tokio::io::join(read.make_reader(), write.make_writer());
+            tokio::pin!(forwarded);
+            let mut web = web;
             tokio::select! {
-                _ = tokio::io::copy_bidirectional(&mut forwarded, &mut web) => {}
+                result = tokio::io::copy_bidirectional(&mut forwarded, &mut web) => {
+                    if result.is_err() {
+                        // The normal copy shuts down both writers; a failed copy still needs to tell the peer.
+                        tokio::select! {
+                            _ = write.eof() => {}
+                            () = stop.cancelled() => {}
+                        }
+                    }
+                }
                 () = stop.cancelled() => {}
             }
         });

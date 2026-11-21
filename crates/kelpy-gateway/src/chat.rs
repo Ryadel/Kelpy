@@ -4,6 +4,7 @@
 //! |---|---|
 //! | `GET /api/provider`, `PUT /api/provider` | provider settings; the API key is accepted but never returned |
 //! | `POST /api/provider/models` | the models a service offers, for the setup; takes the key being entered |
+//! | `GET /api/suggestions`, `PUT /api/suggestions` | whether the next message is suggested after each answer |
 //! | `GET /api/sessions`, `POST /api/sessions` | list (each with whether an answer is being written), create |
 //! | `PATCH /api/sessions/{id}`, `DELETE /api/sessions/{id}` | change the title, explanations, access or approval mode; delete |
 //! | `GET /api/sessions/{id}/messages` | the messages with their actions, and whether an answer is being written |
@@ -50,6 +51,7 @@ pub fn routes() -> Router<ChatState> {
     Router::new()
         .route("/api/provider", get(provider).put(configure_provider))
         .route("/api/provider/models", post(provider_models))
+        .route("/api/suggestions", get(suggestions).put(set_suggestions))
         .route("/api/sessions", get(sessions).post(create_session))
         .route(
             "/api/sessions/{id}",
@@ -88,6 +90,29 @@ async fn configure_provider(
 ) -> Response {
     match state.agent.configure_provider(update) {
         Ok(info) => Json(info).into_response(),
+        Err(error) => failure(&error),
+    }
+}
+
+/// Whether the administrator's next message is suggested after each answer.
+#[derive(Serialize, Deserialize)]
+struct Suggestions {
+    enabled: bool,
+}
+
+async fn suggestions(State(state): State<ChatState>) -> Response {
+    Json(Suggestions {
+        enabled: state.agent.suggestions(),
+    })
+    .into_response()
+}
+
+async fn set_suggestions(
+    State(state): State<ChatState>,
+    Json(Suggestions { enabled }): Json<Suggestions>,
+) -> Response {
+    match state.agent.set_suggestions(enabled) {
+        Ok(()) => Json(Suggestions { enabled }).into_response(),
         Err(error) => failure(&error),
     }
 }
