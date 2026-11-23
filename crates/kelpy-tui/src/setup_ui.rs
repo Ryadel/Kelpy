@@ -166,6 +166,27 @@ fn body(view: &View, width: usize, theme: Theme, full: bool, qr: bool) -> Drawn 
 }
 
 fn para_lines(para: &Para, width: usize, theme: Theme, margin: &str) -> Vec<Line<'static>> {
+    if para.tone == Tone::Qr {
+        // The code's blocks are its light parts. A line of upper halves only is the margin's last half row: under
+        // it is the terminal, not the code.
+        let (light, dark) = theme.qr();
+        return para
+            .text
+            .lines()
+            .map(|line| {
+                let style = Style::new().fg(light);
+                let style = if line.chars().all(|char| char == '▀') {
+                    style
+                } else {
+                    style.bg(dark)
+                };
+                Line::from(vec![
+                    Span::raw(margin.to_owned()),
+                    Span::styled(line.to_owned(), style),
+                ])
+            })
+            .collect();
+    }
     let style = Style::new().fg(match para.tone {
         Tone::Text => theme.text(),
         Tone::Dim => theme.dim(),
@@ -180,13 +201,6 @@ fn para_lines(para: &Para, width: usize, theme: Theme, margin: &str) -> Vec<Line
         Tone::Link => style.underlined(),
         _ => style,
     };
-    if para.tone == Tone::Qr {
-        return para
-            .text
-            .lines()
-            .map(|line| Line::styled(format!("{margin}{line}"), style))
-            .collect();
-    }
     let lead = para.lead.width();
     let mut lines = Vec::new();
     for (index, line) in para

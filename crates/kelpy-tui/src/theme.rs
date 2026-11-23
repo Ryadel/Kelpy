@@ -119,6 +119,16 @@ impl Theme {
         self.pick([0x0B, 0x11, 0x12], [0xFF, 0xFF, 0xFF], Color::Black)
     }
 
+    /// A QR code's light and dark parts: white and black on any terminal, as scanners read them; in the terminal's
+    /// own colours a light terminal would invert it.
+    pub fn qr(self) -> (Color, Color) {
+        match self.colours {
+            Colours::True => (rgb([0xFF, 0xFF, 0xFF]), rgb([0x00, 0x00, 0x00])),
+            Colours::Indexed => (Color::Indexed(231), Color::Indexed(16)),
+            Colours::Basic => (Color::White, Color::Black),
+        }
+    }
+
     /// Behind the message box and the administrator's messages.
     pub fn surface(self) -> Color {
         self.pick([0x18, 0x23, 0x26], [0xEE, 0xF3, 0xF4], Color::Reset)

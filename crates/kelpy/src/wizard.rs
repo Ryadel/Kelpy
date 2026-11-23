@@ -25,6 +25,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::prompt;
 
+/// A QR code in white and black where the terminal shows colours: in its own colours, a light terminal would
+/// invert it, and some scanners would not read it. A line of upper halves only is the margin's last half row, with
+/// the terminal under it.
+fn in_black_and_white(code: &str) -> String {
+    if !crate::platform::colors() {
+        return code.to_owned();
+    }
+    code.lines()
+        .map(|line| {
+            let background = if line.chars().all(|char| char == '▀') {
+                ""
+            } else {
+                ";40"
+            };
+            format!("\x1b[97{background}m{line}\x1b[0m")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// How long a sign-in as an agent may take in the browser, as the runtime allows.
 const SIGN_IN_TIME: Duration = Duration::from_secs(SIGN_IN_MINUTES * 60);
 
@@ -343,7 +363,7 @@ impl Setup {
                              the code."
                         );
                         println!();
-                        println!("{}", qr_code(&verification_url));
+                        println!("{}", in_black_and_white(&qr_code(&verification_url)));
                         println!("  {verification_url}");
                         println!();
                         println!("  Code: {user_code}");

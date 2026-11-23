@@ -424,6 +424,15 @@ fn the_code_to_approve_shows_with_its_qr_code_where_it_fits() {
             "▀▀▀▀▀▀▀",
         ],
     );
+    // White and black on a light terminal too, as scanners read it.
+    let light = drawn(&app, (100, 48), Theme::new(Colours::True, false));
+    let block = light
+        .content()
+        .iter()
+        .find(|cell| cell.symbol() == "▀")
+        .unwrap();
+    assert_eq!((block.fg, block.bg), Theme::new(Colours::True, false).qr());
+    assert_eq!(block.fg, Color::Rgb(0xFF, 0xFF, 0xFF));
     // Too few rows for the QR code: the address and the code stay.
     let short = drawn(&app, (100, 24), DARK);
     shows(

@@ -3,6 +3,17 @@
 Each release is on the [releases page](https://github.com/Ryadel/Kelpy/releases), with one executable per platform,
 the install scripts and the signed checksums. Versions follow [Semantic Versioning](https://semver.org).
 
+## 0.6.1 (2026-11-23)
+
+The sign-in's QR code in white and black on light terminals too.
+
+- **QR code on a light terminal**: the QR code of the ChatGPT sign-in, in the terminal UI's setup (Ctrl+P) and in
+  `kelpy provider`, was drawn in the terminal's own colours, so on a light background it came out inverted and some
+  phones did not read it. It is now white and black on any terminal.
+
+Updating from 0.6.0: Kelpy offers the update at its next start, or run `kelpy update`. The shared records are not
+upgraded.
+
 ## 0.6.0 (2026-11-21)
 
 AI set up inside the terminal UI, the suggested next message, side panels you can resize, and Web UI tabs that no
